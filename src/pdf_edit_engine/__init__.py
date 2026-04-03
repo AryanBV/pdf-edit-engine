@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from pdf_edit_engine.errors import (
+    EncodingError,
+    FontNotFoundError,
+    OperatorError,
+    PDFEditError,
+    ReflowError,
+)
 from pdf_edit_engine.fonts import analyze_subset, can_render, extend_subset
 from pdf_edit_engine.locator import find, get_fonts, get_text
 from pdf_edit_engine.models import (
@@ -74,4 +81,10 @@ __all__ = [
     "Edit",
     "ContentElement",
     "GraphicsStateSnapshot",
+    # errors
+    "PDFEditError",
+    "FontNotFoundError",
+    "EncodingError",
+    "OperatorError",
+    "ReflowError",
 ]
