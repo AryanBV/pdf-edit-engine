@@ -193,12 +193,13 @@ class TestContentStreamInterpreter:
         assert len(elements) > 100
 
 
-# ── TestFindStillNotImplemented ───────────────────────────────────────
+# ── TestFindBasicSmoke ────────────────────────────────────────────────
 
 
-class TestFindStillNotImplemented:
-    """Verify find() remains a stub for now."""
+class TestFindBasicSmoke:
+    """Basic smoke test for find() — detailed tests in test_find.py."""
 
-    def test_find_raises_not_implemented(self) -> None:
-        with pytest.raises(NotImplementedError):
-            find("test.pdf", "hello")
+    def test_find_returns_match(self) -> None:
+        matches = find(RESUME_PDF, "Aryan")
+        assert len(matches) >= 1
+        assert matches[0].matched_text == "Aryan"

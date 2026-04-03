@@ -6,22 +6,19 @@ import io as _io
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import pikepdf
 
-from pdf_edit_engine.encoding import FontResolverCache
+from pdf_edit_engine.encoding import FontResolver, FontResolverCache
 from pdf_edit_engine.fragments import TJReconstructor
 from pdf_edit_engine.models import (
     ContentElement,
     FontInfo,
     TextCharacter,
+    TextMatch,
 )
 from pdf_edit_engine.state import GraphicsStateTracker
-
-if TYPE_CHECKING:
-    from pdf_edit_engine.encoding import FontResolver
-    from pdf_edit_engine.models import TextMatch
 
 logger = logging.getLogger(__name__)
 
@@ -321,27 +318,11 @@ class ContentStreamInterpreter:
                 # Apply pending TJ displacement before this fragment
                 if pending_tj != 0.0:
                     self._tracker.apply_tj_displacement(pending_tj)
-                for ci, ch in enumerate(decoded):
-                    pos = self._tracker.get_text_position()
-                    char_code = self._char_code(raw, ci, byte_width)
-                    w = self._width_cache.get_width(
-                        self._page, font_name, char_code,
-                    )
-                    width_ts = w / 1000.0
-                    chars.append(TextCharacter(
-                        unicode_char=ch,
-                        page_x=pos[0],
-                        page_y=pos[1],
-                        width=width_ts * font_size,
-                        height=font_size,
-                        font_name=font_name,
-                        font_size=font_size,
-                        color=fill_color,
-                        operator_index=idx,
-                        byte_position=ci * byte_width,
-                        tj_fragment_index=frag_idx,
-                    ))
-                    self._tracker.advance_by_glyph(width_ts, char_code)
+                # Iterate by CID (byte_width chunks) to handle ligatures
+                self._walk_cids(
+                    raw, byte_width, resolver, font_name, font_size,
+                    fill_color, idx, frag_idx, chars,
+                )
                 pending_tj = 0.0
                 frag_idx += 1
 
@@ -382,26 +363,68 @@ class ContentStreamInterpreter:
         fill_color = self._tracker.fill_color or (0.0,)
         byte_width = resolver.byte_width
 
-        for ci, ch in enumerate(decoded):
-            pos = self._tracker.get_text_position()
-            char_code = self._char_code(raw, ci, byte_width)
+        self._walk_cids(
+            raw, byte_width, resolver, font_name, font_size,
+            fill_color, op_idx, tj_fragment_index, chars,
+        )
+        return chars
+
+    def _walk_cids(
+        self,
+        raw: bytes,
+        byte_width: int,
+        resolver: FontResolver,
+        font_name: str,
+        font_size: float,
+        fill_color: tuple[float, ...],
+        op_idx: int,
+        frag_idx: int | None,
+        chars: list[TextCharacter],
+    ) -> None:
+        """Iterate by CID over *raw* bytes and emit TextCharacters.
+
+        For CID fonts a single CID may decode to multiple Unicode
+        characters (ligatures like ``fi``, ``ft``).  This method uses
+        the **CID's** width from the /W table and distributes it evenly
+        among the ligature sub-characters, keeping glyph advance correct.
+        """
+        num_cids = len(raw) // byte_width if byte_width > 0 else 0
+        for cid_idx in range(num_cids):
+            offset = cid_idx * byte_width
+            char_code = self._char_code(raw, cid_idx, byte_width)
             w = self._width_cache.get_width(self._page, font_name, char_code)
             width_ts = w / 1000.0
-            chars.append(TextCharacter(
-                unicode_char=ch,
-                page_x=pos[0],
-                page_y=pos[1],
-                width=width_ts * font_size,
-                height=font_size,
-                font_name=font_name,
-                font_size=font_size,
-                color=fill_color,
-                operator_index=op_idx,
-                byte_position=ci * byte_width,
-                tj_fragment_index=tj_fragment_index,
-            ))
-            self._tracker.advance_by_glyph(width_ts, char_code)
-        return chars
+
+            # Decode just this CID
+            cid_bytes = raw[offset : offset + byte_width]
+            try:
+                cid_text = resolver.decode(cid_bytes)
+            except KeyError:
+                # Advance position even for unmappable CIDs
+                self._tracker.advance_by_glyph(width_ts, char_code)
+                continue
+
+            n_sub = len(cid_text) if cid_text else 1
+            sub_width = width_ts / n_sub
+
+            for sub_ci, ch in enumerate(cid_text):
+                pos = self._tracker.get_text_position()
+                chars.append(TextCharacter(
+                    unicode_char=ch,
+                    page_x=pos[0],
+                    page_y=pos[1],
+                    width=sub_width * font_size,
+                    height=font_size,
+                    font_name=font_name,
+                    font_size=font_size,
+                    color=fill_color,
+                    operator_index=op_idx,
+                    byte_position=offset,
+                    tj_fragment_index=frag_idx,
+                ))
+                # Advance only on the last sub-character of the ligature
+                if sub_ci == n_sub - 1:
+                    self._tracker.advance_by_glyph(width_ts, char_code)
 
     @staticmethod
     def _char_code(raw: bytes, char_index: int, byte_width: int) -> int:
@@ -534,17 +557,40 @@ class ContentStreamInterpreter:
 
 
 # ── Index cache ────────────────────────────────────────────────────────
+#
+# Single-PDF cache: the MCP use case processes one PDF at a time.
+# Switching to a different path clears the entire cache.
 
-
-_index_cache: dict[tuple[str, int], list[ContentElement]] = {}
+_cached_path: str | None = None
+_cached_elements: dict[int, list[ContentElement]] = {}
 
 
 def _build_index(
-    page: pikepdf.Page, page_number: int,
+    page: pikepdf.Page, page_number: int, pdf_path: str | None = None,
 ) -> list[ContentElement]:
-    """Build (or retrieve cached) content element index for a page."""
+    """Build (or retrieve cached) content element index for a page.
+
+    Args:
+        page: The pikepdf page object.
+        page_number: 0-indexed page number.
+        pdf_path: Resolved file path for caching.  When provided, results
+                  are cached and reused across calls for the same PDF.
+    """
+    global _cached_path, _cached_elements  # noqa: PLW0603
+
+    if pdf_path is not None:
+        if pdf_path != _cached_path:
+            _cached_path = pdf_path
+            _cached_elements = {}
+        if page_number in _cached_elements:
+            return _cached_elements[page_number]
+
     interpreter = ContentStreamInterpreter(page, page_number)
-    return interpreter.interpret()
+    elements = interpreter.interpret()
+
+    if pdf_path is not None:
+        _cached_elements[page_number] = elements
+    return elements
 
 
 # ── Page resolution ────────────────────────────────────────────────────
@@ -750,6 +796,69 @@ def _get_font_descriptor(
     return None
 
 
+# ── Flat-string builder for find() ────────────────────────────────────
+
+
+def _build_flat_string(
+    text_elements: list[ContentElement],
+) -> tuple[str, list[TextCharacter | None]]:
+    """Build a flat string and parallel char_map from sorted text elements.
+
+    Between elements on the same line with a horizontal gap, a space is
+    inserted (mapped to ``None`` in *char_map*).  Between elements on
+    different lines, a newline is inserted.
+
+    Args:
+        text_elements: Text ContentElements sorted by reading order
+                       (y descending, x ascending).
+
+    Returns:
+        Tuple of *(flat_string, char_map)* where each position in
+        *flat_string* has a corresponding entry in *char_map* — either
+        a :class:`TextCharacter` or ``None`` for inserted separators.
+    """
+    parts: list[str] = []
+    char_map: list[TextCharacter | None] = []
+
+    prev_y: float | None = None
+    prev_end_x: float = 0.0
+    prev_font_size: float = 12.0
+
+    for elem in text_elements:
+        chars = elem.characters
+        if not chars:
+            continue
+
+        elem_y = elem.bbox[3]  # top of bbox
+        elem_x = chars[0].page_x
+        font_size = chars[0].font_size
+        threshold = max(font_size * 0.5, 2.0)
+
+        if prev_y is not None:
+            if abs(prev_y - elem_y) <= threshold:
+                # Same line — insert space if there is a horizontal gap
+                gap = elem_x - prev_end_x
+                avg_w = prev_font_size * 0.3
+                if gap > avg_w:
+                    parts.append(" ")
+                    char_map.append(None)
+            else:
+                # Different line
+                parts.append("\n")
+                char_map.append(None)
+
+        for ch in chars:
+            parts.append(ch.unicode_char)
+            char_map.append(ch)
+
+        last_char = chars[-1]
+        prev_end_x = last_char.page_x + last_char.width
+        prev_y = elem_y
+        prev_font_size = font_size
+
+    return "".join(parts), char_map
+
+
 # ── Public API ─────────────────────────────────────────────────────────
 
 
@@ -762,16 +871,98 @@ def find(
 ) -> list[TextMatch]:
     """Locate text in a PDF, returning matches with operator references.
 
+    Builds a flat string from the page's text elements with inferred space
+    and newline separators, then performs literal substring search.  Each
+    match is mapped back to the underlying :class:`TextCharacter` objects
+    and content-stream operator indices.
+
     Args:
         pdf_path: Path to the PDF file.
-        search_text: Text to search for.
-        page: Restrict search to a specific page (0-indexed). None searches all pages.
+        search_text: Text to search for (literal, not regex).
+        page: Restrict search to a specific page (0-indexed).
+              ``None`` searches all pages.
         case_sensitive: Whether the search is case-sensitive.
 
     Returns:
-        List of TextMatch objects with character positions and operator references.
+        List of :class:`TextMatch` objects.  Empty list when *search_text*
+        is empty or no matches are found.
     """
-    raise NotImplementedError
+    if not search_text:
+        return []
+
+    path = Path(pdf_path)
+    resolved = str(path.resolve())
+    matches: list[TextMatch] = []
+
+    with pikepdf.open(path) as pdf:
+        pages = _resolve_pages(pdf, page)
+
+        for page_num, page_obj in pages:
+            elements = _build_index(page_obj, page_num, resolved)
+            text_elements = [
+                e for e in elements if e.type == "text" and e.text_content
+            ]
+            text_elements.sort(key=lambda e: (-e.bbox[3], e.bbox[0]))
+
+            flat, char_map = _build_flat_string(text_elements)
+
+            # Literal substring search
+            haystack = flat if case_sensitive else flat.lower()
+            needle = search_text if case_sensitive else search_text.lower()
+            start = 0
+            while True:
+                idx = haystack.find(needle, start)
+                if idx == -1:
+                    break
+                end = idx + len(needle)
+                start = idx + 1  # allow overlapping matches
+
+                matched_chars = [
+                    char_map[i] for i in range(idx, end)
+                    if char_map[i] is not None
+                ]
+                # Narrow type for mypy
+                real_chars: list[TextCharacter] = [
+                    c for c in matched_chars if c is not None
+                ]
+                if not real_chars:
+                    continue
+
+                # Bounding box
+                fs = real_chars[0].font_size
+                x0 = min(c.page_x for c in real_chars)
+                y0 = min(c.page_y for c in real_chars) - fs * 0.25
+                x1 = max(c.page_x + c.width for c in real_chars)
+                y1 = max(c.page_y for c in real_chars) + fs * 0.75
+
+                # FontInfo from first character
+                first_font = real_chars[0].font_name
+                font_key = first_font if first_font.startswith("/") else f"/{first_font}"
+                try:
+                    font_obj = page_obj["/Resources"]["/Font"][font_key]
+                    font_info = _build_font_info(font_obj, first_font)
+                except (KeyError, TypeError):
+                    font_info = FontInfo(
+                        name=first_font,
+                        postscript_name=first_font,
+                        encoding_type="WinAnsi",
+                        is_subset=False,
+                        glyph_count=0,
+                        embedded_type="TrueType",
+                    )
+
+                operator_refs = sorted({c.operator_index for c in real_chars})
+
+                matches.append(TextMatch(
+                    matched_text=flat[idx:end],
+                    page_number=page_num,
+                    bounding_box=(x0, y0, x1, y1),
+                    characters=real_chars,
+                    font_info=font_info,
+                    operator_refs=operator_refs,
+                ))
+
+    return matches
 
 
 def get_text(pdf_path: str, *, page: int | None = None) -> str:
@@ -785,11 +976,12 @@ def get_text(pdf_path: str, *, page: int | None = None) -> str:
         Extracted text content.
     """
     path = Path(pdf_path)
+    resolved = str(path.resolve())
     with pikepdf.open(path) as pdf:
         pages = _resolve_pages(pdf, page)
         all_text: list[str] = []
         for page_num, page_obj in pages:
-            elements = _build_index(page_obj, page_num)
+            elements = _build_index(page_obj, page_num, resolved)
             text_elements = [
                 e for e in elements
                 if e.type == "text" and e.text_content
