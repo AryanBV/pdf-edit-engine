@@ -102,7 +102,7 @@ class GraphicsStateSnapshot:
 class ContentElement:
     """Wide index element covering all content stream elements on a page."""
 
-    type: Literal["text", "image", "path", "state_change"]
+    type: Literal["text", "image", "path", "state_change", "xobject"]
     page: int
     operator_range: tuple[int, int]
     bbox: tuple[float, float, float, float]
@@ -110,3 +110,4 @@ class ContentElement:
     text_content: str | None = None
     xobject_name: str | None = None
     path_data: list[object] | None = None
+    characters: list[TextCharacter] | None = None

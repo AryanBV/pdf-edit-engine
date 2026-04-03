@@ -1,31 +1,204 @@
-"""Tests for the TextLocator module."""
+"""Tests for the TextLocator module — get_text, get_fonts, and content stream interpreter."""
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import pikepdf
 import pytest
 
-from pdf_edit_engine.locator import find, get_fonts, get_text
+from pdf_edit_engine.locator import (
+    ContentStreamInterpreter,
+    find,
+    get_fonts,
+    get_text,
+)
+
+if TYPE_CHECKING:
+    from pdf_edit_engine.models import ContentElement
+
+CORPUS_DIR = Path(__file__).parent / "corpus"
+RESUME_PDF = str(CORPUS_DIR / "resume_aryan.pdf")
 
 
-class TestFind:
-    """Tests for locator.find()."""
+# ── TestGetText ───────────────────────────────────────────────────────
+
+
+class TestGetText:
+    """Tests for get_text() public API."""
+
+    def test_returns_nonempty_string(self) -> None:
+        text = get_text(RESUME_PDF)
+        assert len(text) > 0
+
+    def test_contains_known_name(self) -> None:
+        text = get_text(RESUME_PDF)
+        assert "Aryan" in text
+
+    def test_contains_known_section(self) -> None:
+        text = get_text(RESUME_PDF)
+        assert "Software Developer" in text or "Full" in text
+
+    def test_contains_email(self) -> None:
+        text = get_text(RESUME_PDF)
+        assert "aryansalian5678@gmail.com" in text
+
+    def test_page_zero_works(self) -> None:
+        text = get_text(RESUME_PDF, page=0)
+        assert len(text) > 0
+        assert "Aryan" in text
+
+    def test_invalid_page_raises(self) -> None:
+        with pytest.raises(IndexError):
+            get_text(RESUME_PDF, page=99)
+
+    def test_text_is_unicode_not_cid_bytes(self) -> None:
+        text = get_text(RESUME_PDF)
+        assert "\x00" not in text
+
+    def test_contains_multiple_lines(self) -> None:
+        text = get_text(RESUME_PDF)
+        lines = text.strip().split("\n")
+        assert len(lines) > 5
+
+
+# ── TestGetFonts ──────────────────────────────────────────────────────
+
+
+class TestGetFonts:
+    """Tests for get_fonts() public API."""
+
+    def test_returns_font_list(self) -> None:
+        fonts = get_fonts(RESUME_PDF)
+        assert len(fonts) > 0
+
+    def test_has_identity_h_font(self) -> None:
+        fonts = get_fonts(RESUME_PDF)
+        encodings = {f.encoding_type for f in fonts}
+        assert "Identity-H" in encodings
+
+    def test_font_count(self) -> None:
+        fonts = get_fonts(RESUME_PDF)
+        assert len(fonts) == 6
+
+    def test_font_has_postscript_name(self) -> None:
+        fonts = get_fonts(RESUME_PDF)
+        for f in fonts:
+            assert f.postscript_name, f"Font {f.name} has empty postscript_name"
+
+    def test_font_embedded_type_truetype(self) -> None:
+        fonts = get_fonts(RESUME_PDF)
+        for f in fonts:
+            assert f.embedded_type == "TrueType"
+
+    def test_fonts_are_subsetted(self) -> None:
+        fonts = get_fonts(RESUME_PDF)
+        assert all(f.is_subset for f in fonts)
+
+    def test_cid_font_has_glyph_count(self) -> None:
+        fonts = get_fonts(RESUME_PDF)
+        cid_fonts = [f for f in fonts if f.encoding_type == "Identity-H"]
+        for f in cid_fonts:
+            assert f.glyph_count > 0, f"CID font {f.name} has 0 glyphs"
+
+    def test_page_zero_fonts(self) -> None:
+        fonts = get_fonts(RESUME_PDF, page=0)
+        assert len(fonts) == 6
+
+
+# ── TestContentStreamInterpreter ──────────────────────────────────────
+
+
+class TestContentStreamInterpreter:
+    """Tests for ContentStreamInterpreter directly."""
+
+    @pytest.fixture()
+    def elements(self) -> list[ContentElement]:
+        pdf = pikepdf.open(RESUME_PDF)
+        page = pdf.pages[0]
+        interp = ContentStreamInterpreter(page, 0)
+        result = interp.interpret()
+        pdf.close()
+        return result
+
+    def test_elements_contain_text_type(
+        self, elements: list[ContentElement],
+    ) -> None:
+        types = {e.type for e in elements}
+        assert "text" in types
+
+    def test_text_elements_have_valid_bbox(
+        self, elements: list[ContentElement],
+    ) -> None:
+        text_elems = [e for e in elements if e.type == "text"]
+        for elem in text_elems:
+            x0, y0, x1, y1 = elem.bbox
+            assert x0 < x1, f"bbox x0 >= x1: {elem.bbox}"
+            assert y0 < y1, f"bbox y0 >= y1: {elem.bbox}"
+
+    def test_text_elements_have_operator_index(
+        self, elements: list[ContentElement],
+    ) -> None:
+        text_elems = [e for e in elements if e.type == "text"]
+        for elem in text_elems:
+            start, end = elem.operator_range
+            assert start >= 0
+            assert end > start
+
+    def test_text_characters_have_matching_font(
+        self, elements: list[ContentElement],
+    ) -> None:
+        fonts = get_fonts(RESUME_PDF)
+        font_names = {f.name for f in fonts}
+        text_elems = [e for e in elements if e.type == "text"]
+        for elem in text_elems:
+            if elem.characters:
+                for ch in elem.characters:
+                    assert ch.font_name in font_names, (
+                        f"Character font {ch.font_name!r} not in {font_names}"
+                    )
+
+    def test_text_content_is_decoded_unicode(
+        self, elements: list[ContentElement],
+    ) -> None:
+        text_elems = [e for e in elements if e.type == "text"]
+        for elem in text_elems:
+            if elem.text_content:
+                assert "\x00" not in elem.text_content
+
+    def test_text_elements_have_characters(
+        self, elements: list[ContentElement],
+    ) -> None:
+        text_elems = [e for e in elements if e.type == "text"]
+        for elem in text_elems:
+            assert elem.characters is not None
+            assert len(elem.characters) > 0
+
+    def test_path_elements_exist(
+        self, elements: list[ContentElement],
+    ) -> None:
+        types = {e.type for e in elements}
+        assert "path" in types
+
+    def test_state_change_elements_exist(
+        self, elements: list[ContentElement],
+    ) -> None:
+        types = {e.type for e in elements}
+        assert "state_change" in types
+
+    def test_element_count_reasonable(
+        self, elements: list[ContentElement],
+    ) -> None:
+        assert len(elements) > 100
+
+
+# ── TestFindStillNotImplemented ───────────────────────────────────────
+
+
+class TestFindStillNotImplemented:
+    """Verify find() remains a stub for now."""
 
     def test_find_raises_not_implemented(self) -> None:
         with pytest.raises(NotImplementedError):
             find("test.pdf", "hello")
-
-
-class TestGetText:
-    """Tests for locator.get_text()."""
-
-    def test_get_text_raises_not_implemented(self) -> None:
-        with pytest.raises(NotImplementedError):
-            get_text("test.pdf")
-
-
-class TestGetFonts:
-    """Tests for locator.get_fonts()."""
-
-    def test_get_fonts_raises_not_implemented(self) -> None:
-        with pytest.raises(NotImplementedError):
-            get_fonts("test.pdf")
