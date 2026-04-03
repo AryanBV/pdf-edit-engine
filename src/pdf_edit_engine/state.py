@@ -167,22 +167,36 @@ class GraphicsStateTracker:
         y = tm[4] * ctm[1] + tm[5] * ctm[3] + ctm[5]
         return (x, y)
 
-    def advance_by_glyph(
-        self, glyph_width: float, char_code: int, tj_adjustment: float = 0,
-    ) -> None:
+    def apply_tj_displacement(self, value: float) -> None:
+        """Apply a TJ numeric adjustment as a pure text matrix translation.
+
+        Separates TJ kerning from glyph advance so that character spacing (Tc)
+        is not erroneously applied to kerning values.
+
+        Args:
+            value: TJ positioning value in thousandths of a text space unit.
+                   Negative values move right (tighten), positive move left.
+        """
+        tx = -value / 1000.0 * self._font_size
+        a, b, c, d, e, f = self._text_matrix
+        self._text_matrix = (a, b, c, d, tx * a + e, tx * b + f)
+
+    def advance_by_glyph(self, glyph_width: float, char_code: int) -> None:
         """Advance the text position after rendering a glyph.
 
-        Uses ISO 32000 section 9.4.4 displacement formula:
-        tx = ((w0 - Tj/1000) * Tfs + Tc + Tw_if_space) * Th
+        Uses ISO 32000 section 9.4.4 displacement formula (without TJ component):
+        tx = (w0 * Tfs + Tc + Tw_if_space) * Th
+
+        TJ adjustments should be applied separately via apply_tj_displacement()
+        before calling this method, to avoid Tc being applied to kerning values.
 
         Args:
             glyph_width: Glyph width in text space (font units / 1000).
             char_code: The character code (word spacing applied if 0x0020).
-            tj_adjustment: TJ array positioning value (thousandths of text space unit).
         """
         tw = self._word_spacing if char_code == 0x0020 else 0.0
         tx = (
-            (glyph_width - tj_adjustment / 1000.0) * self._font_size
+            glyph_width * self._font_size
             + self._char_spacing
             + tw
         ) * self._horiz_scaling

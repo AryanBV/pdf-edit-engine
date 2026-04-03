@@ -176,14 +176,17 @@ class TestGlyphAdvance:
         t.advance_by_glyph(0.5, 0x0041)
         assert t.get_text_position() == pytest.approx((10.0, 0.0))
 
-    def test_advance_with_tj_adjustment(self) -> None:
+    def test_advance_with_separate_tj_displacement(self) -> None:
         t = GraphicsStateTracker()
         t.process_operator("BT", [])
         t.process_operator("Tf", ["/F1", 10.0])
         t.process_operator("Tm", [1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
 
-        # w0=0.5, Tj=100 → (0.5 - 100/1000)*10 = (0.5-0.1)*10 = 4.0
-        t.advance_by_glyph(0.5, 0x0041, tj_adjustment=100.0)
+        # TJ=100 → displacement = -(100)/1000 * 10 = -1.0
+        # Then glyph w0=0.5 → (0.5*10 + 0 + 0)*1.0 = 5.0
+        # Total: -1.0 + 5.0 = 4.0 (same result as old combined formula when Tc=0)
+        t.apply_tj_displacement(100.0)
+        t.advance_by_glyph(0.5, 0x0041)
         assert t.get_text_position() == pytest.approx((4.0, 0.0))
 
 
@@ -284,6 +287,52 @@ class TestTstar:
         # Subsequent T* should use the leading set by TD
         t.process_operator("T*", [])
         assert t.get_text_position() == pytest.approx((72.0, 672.0))
+
+
+class TestTJDisplacement:
+    """Tests for apply_tj_displacement — pure TJ kerning translation."""
+
+    def test_negative_value_moves_right(self) -> None:
+        t = GraphicsStateTracker()
+        t.process_operator("BT", [])
+        t.process_operator("Tf", ["/F1", 10.0])
+        t.process_operator("Tm", [1.0, 0.0, 0.0, 1.0, 100.0, 700.0])
+
+        # TJ value -120 → tx = -(-120)/1000 * 10 = +1.2
+        t.apply_tj_displacement(-120.0)
+        assert t.get_text_position() == pytest.approx((101.2, 700.0))
+
+    def test_positive_value_moves_left(self) -> None:
+        t = GraphicsStateTracker()
+        t.process_operator("BT", [])
+        t.process_operator("Tf", ["/F1", 12.0])
+        t.process_operator("Tm", [1.0, 0.0, 0.0, 1.0, 50.0, 500.0])
+
+        # TJ value 200 → tx = -(200)/1000 * 12 = -2.4
+        t.apply_tj_displacement(200.0)
+        assert t.get_text_position() == pytest.approx((47.6, 500.0))
+
+    def test_tj_displacement_independent_of_Tc(self) -> None:
+        """TJ displacement must NOT be affected by character spacing (Tc).
+
+        This is the key behavioral difference from the old combined formula.
+        """
+        t1 = GraphicsStateTracker()
+        t1.process_operator("BT", [])
+        t1.process_operator("Tf", ["/F1", 10.0])
+        t1.process_operator("Tc", [5.0])  # Large Tc
+        t1.process_operator("Tm", [1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+        t1.apply_tj_displacement(-100.0)
+
+        t2 = GraphicsStateTracker()
+        t2.process_operator("BT", [])
+        t2.process_operator("Tf", ["/F1", 10.0])
+        t2.process_operator("Tc", [0.0])  # Zero Tc
+        t2.process_operator("Tm", [1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+        t2.apply_tj_displacement(-100.0)
+
+        # Same displacement regardless of Tc
+        assert t1.get_text_position() == pytest.approx(t2.get_text_position())
 
 
 class TestProperties:

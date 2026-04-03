@@ -318,6 +318,9 @@ class ContentStreamInterpreter:
                 if not decoded:
                     continue
                 byte_width = resolver.byte_width
+                # Apply pending TJ displacement before this fragment
+                if pending_tj != 0.0:
+                    self._tracker.apply_tj_displacement(pending_tj)
                 for ci, ch in enumerate(decoded):
                     pos = self._tracker.get_text_position()
                     char_code = self._char_code(raw, ci, byte_width)
@@ -325,7 +328,6 @@ class ContentStreamInterpreter:
                         self._page, font_name, char_code,
                     )
                     width_ts = w / 1000.0
-                    tj_adj = pending_tj if ci == 0 else 0.0
                     chars.append(TextCharacter(
                         unicode_char=ch,
                         page_x=pos[0],
@@ -339,7 +341,7 @@ class ContentStreamInterpreter:
                         byte_position=ci * byte_width,
                         tj_fragment_index=frag_idx,
                     ))
-                    self._tracker.advance_by_glyph(width_ts, char_code, tj_adj)
+                    self._tracker.advance_by_glyph(width_ts, char_code)
                 pending_tj = 0.0
                 frag_idx += 1
 
