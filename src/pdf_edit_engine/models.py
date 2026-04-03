@@ -21,6 +21,7 @@ class TextCharacter:
     operator_index: int
     byte_position: int
     tj_fragment_index: int | None
+    rendering_mode: int = 0
 
 
 @dataclass

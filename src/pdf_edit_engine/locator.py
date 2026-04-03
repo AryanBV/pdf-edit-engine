@@ -421,6 +421,7 @@ class ContentStreamInterpreter:
                     operator_index=op_idx,
                     byte_position=offset,
                     tj_fragment_index=frag_idx,
+                    rendering_mode=self._tracker.text_rendering_mode,
                 ))
                 # Advance only on the last sub-character of the ligature
                 if sub_ci == n_sub - 1:

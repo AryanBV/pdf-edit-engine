@@ -208,3 +208,7 @@ __marimo__/
 
 # Claude Code
 .claude/
+
+# Generated test corpus PDFs (real-world test PDFs stay tracked)
+tests/corpus/*.pdf
+!tests/corpus/resume_aryan.pdf

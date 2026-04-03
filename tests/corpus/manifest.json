@@ -1,0 +1,63 @@
+[
+  {
+    "filename": "resume_aryan.pdf",
+    "generator": "real-world",
+    "encoding": "Identity-H",
+    "features": [
+      "CIDFont",
+      "subsetted fonts",
+      "ligatures"
+    ],
+    "expected_text": "Aryan B V"
+  },
+  {
+    "filename": "reportlab_simple.pdf",
+    "generator": "reportlab",
+    "encoding": "WinAnsi",
+    "features": [
+      "standard fonts",
+      "non-ASCII",
+      "horizontal rule"
+    ],
+    "expected_text": "Test Document"
+  },
+  {
+    "filename": "reportlab_table.pdf",
+    "generator": "reportlab",
+    "encoding": "WinAnsi",
+    "features": [
+      "table with grid",
+      "paths"
+    ],
+    "expected_text": "Quarterly Report"
+  },
+  {
+    "filename": "reportlab_multipage.pdf",
+    "generator": "reportlab",
+    "encoding": "WinAnsi",
+    "features": [
+      "multi-page"
+    ],
+    "expected_text": "Page One Content"
+  },
+  {
+    "filename": "pikepdf_synthetic.pdf",
+    "generator": "reportlab+pikepdf",
+    "encoding": "WinAnsi",
+    "features": [
+      "invisible text",
+      "Tr mode 3",
+      "path rect"
+    ],
+    "expected_text": "Visible text here"
+  },
+  {
+    "filename": "reportlab_forms.pdf",
+    "generator": "reportlab",
+    "encoding": "WinAnsi",
+    "features": [
+      "AcroForm fields"
+    ],
+    "expected_text": "Please fill out this form"
+  }
+]
