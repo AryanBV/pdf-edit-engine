@@ -11,6 +11,7 @@ from typing import Literal
 import pikepdf
 
 from pdf_edit_engine.encoding import FontResolver, FontResolverCache
+from pdf_edit_engine.errors import OperatorError
 from pdf_edit_engine.fragments import TJReconstructor
 from pdf_edit_engine.models import (
     ContentElement,
@@ -552,7 +553,12 @@ def _build_index(
             return _cached_elements[page_number]
 
     interpreter = ContentStreamInterpreter(page, page_number)
-    elements = interpreter.interpret()
+    try:
+        elements = interpreter.interpret()
+    except (UnicodeDecodeError, ValueError, TypeError, KeyError) as exc:
+        raise OperatorError(
+            f"Failed to parse content stream on page {page_number}: {exc}"
+        ) from exc
 
     if pdf_path is not None:
         _cached_elements[page_number] = elements
@@ -624,11 +630,30 @@ def _group_into_lines(elements: list[ContentElement]) -> list[str]:
     for line_elems in lines:
         # Sort by x within the line
         line_elems.sort(key=lambda e: e.bbox[0])
-        parts: list[str] = []
+        line_parts: list[str] = []
+        prev_end_x: float | None = None
+        prev_chars: list[TextCharacter] | None = None
+        prev_font_size: float = 12.0
         for elem in line_elems:
-            if elem.text_content:
-                parts.append(elem.text_content)
-        result.append(" ".join(parts))
+            if not elem.text_content:
+                continue
+            chars = elem.characters
+            if prev_end_x is not None and chars:
+                gap = chars[0].page_x - prev_end_x
+                if prev_chars:
+                    total_w = sum(c.width for c in prev_chars)
+                    avg_w = (total_w / len(prev_chars)) * 0.5
+                else:
+                    avg_w = prev_font_size * 0.25
+                if gap > avg_w:
+                    line_parts.append(" ")
+            line_parts.append(elem.text_content)
+            if chars:
+                last_c = chars[-1]
+                prev_end_x = last_c.page_x + last_c.width
+                prev_font_size = chars[0].font_size
+                prev_chars = chars
+        result.append("".join(line_parts))
     return result
 
 
@@ -791,6 +816,7 @@ def _build_flat_string(
     prev_y: float | None = None
     prev_end_x: float = 0.0
     prev_font_size: float = 12.0
+    prev_chars: list[TextCharacter] | None = None
 
     for elem in text_elements:
         chars = elem.characters
@@ -806,7 +832,11 @@ def _build_flat_string(
             if abs(prev_y - elem_y) <= threshold:
                 # Same line — insert space if there is a horizontal gap
                 gap = elem_x - prev_end_x
-                avg_w = prev_font_size * 0.3
+                if prev_chars:
+                    total_w = sum(c.width for c in prev_chars)
+                    avg_w = (total_w / len(prev_chars)) * 0.5
+                else:
+                    avg_w = prev_font_size * 0.25
                 if gap > avg_w:
                     parts.append(" ")
                     char_map.append(None)
@@ -823,6 +853,7 @@ def _build_flat_string(
         prev_end_x = last_char.page_x + last_char.width
         prev_y = elem_y
         prev_font_size = font_size
+        prev_chars = chars
 
     return "".join(parts), char_map
 

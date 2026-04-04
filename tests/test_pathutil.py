@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from pdf_edit_engine._pathutil import validate_output_dir, validate_output_path
 from pdf_edit_engine.errors import PDFEditError

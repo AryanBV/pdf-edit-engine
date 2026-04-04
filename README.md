@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/pdf-edit-engine)](https://pypi.org/project/pdf-edit-engine/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-384%20passed-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-400%20passed-brightgreen)]()
 
 Format-preserving PDF text editing — edit text in existing PDFs while preserving fonts, layout, and visual fidelity.
 
@@ -264,6 +264,10 @@ make typecheck   # mypy strict
 make test        # pytest with coverage
 make all         # lint + typecheck + test
 ```
+
+## Known Limitations
+
+See [LIMITATIONS.md](LIMITATIONS.md) for a full list including text editing constraints, font handling caveats, encoding support, performance characteristics, and PDF compatibility notes.
 
 ## Contributing
 

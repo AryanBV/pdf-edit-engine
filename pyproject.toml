@@ -58,3 +58,7 @@ packages = ["pdf_edit_engine"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "benchmark: performance benchmark tests",
+    "slow: slow tests (clean install, etc.)",
+]
