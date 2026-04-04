@@ -347,7 +347,18 @@ def _apply_single_replacement(
             raise OperatorError(msg)
 
     byte_width = resolver.byte_width
-    same_length = len(new_text) == len(match.matched_text)
+
+    # Detect ligature CIDs: when a single CID decodes to multiple Unicode
+    # characters (e.g., "tf" ligature), the sub-characters share the same
+    # (operator_index, tj_fragment_index, byte_position).  The splice path
+    # assumes 1 char = 1 CID slot and would overwrite the same position
+    # twice, losing a character.  Force the rebuild path in that case.
+    cid_slots = len({
+        (ch.operator_index, ch.tj_fragment_index, ch.byte_position)
+        for ch in match.characters
+    })
+    has_ligatures = cid_slots != len(match.matched_text)
+    same_length = (not has_ligatures) and len(new_text) == len(match.matched_text)
 
     # Group match characters by operator_index
     chars_by_op: dict[int, list[TextCharacter]] = defaultdict(list)
