@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Format-preserving PDF text editing — edit text in existing PDFs while preserving fonts, layout, and visual fidelity"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [{ name = "Aryan B V", email = "aryansalian5678@gmail.com" }]
 classifiers = [
     "Development Status :: 4 - Beta",
