@@ -71,5 +71,64 @@
       "multiple font families"
     ],
     "expected_text": "EXPERIENCE"
+  },
+  {
+    "filename": "complex_multifont.pdf",
+    "generator": "reportlab",
+    "encoding": "WinAnsi",
+    "features": [
+      "3 fonts",
+      "mixed fonts same line",
+      "dollar amounts"
+    ],
+    "expected_text": "Contact us at"
+  },
+  {
+    "filename": "complex_transformed.pdf",
+    "generator": "reportlab",
+    "encoding": "WinAnsi",
+    "features": [
+      "horizontal scaling",
+      "rotation",
+      "small text",
+      "char spacing"
+    ],
+    "expected_text": "Normal text here"
+  },
+  {
+    "filename": "complex_contract.pdf",
+    "generator": "reportlab",
+    "encoding": "WinAnsi",
+    "features": [
+      "3 pages",
+      "headings",
+      "numbered clauses",
+      "table",
+      "signatures"
+    ],
+    "expected_text": "SERVICE AGREEMENT"
+  },
+  {
+    "filename": "complex_pymupdf_edited.pdf",
+    "generator": "reportlab+PyMuPDF",
+    "encoding": "WinAnsi",
+    "features": [
+      "previously edited",
+      "mixed font origins",
+      "redact+replace"
+    ],
+    "expected_text": "PyMuPDF Edited Author"
+  },
+  {
+    "filename": "cidfont_synthetic.pdf",
+    "generator": "reportlab+TTFont",
+    "encoding": "Identity-H",
+    "features": [
+      "CIDFont",
+      "Type0",
+      "TrueType subset",
+      "synthetic"
+    ],
+    "expected_text": "Software Engineer"
   }
 ]

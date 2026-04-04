@@ -20,6 +20,7 @@ from pdf_edit_engine import (
 
 CORPUS_DIR = Path(__file__).parent / "corpus"
 RESUME_PDF = CORPUS_DIR / "resume_aryan.pdf"
+CIDFONT_PDF = CORPUS_DIR / "cidfont_synthetic.pdf"
 SIMPLE_PDF = str(CORPUS_DIR / "reportlab_simple.pdf")
 
 try:
@@ -100,6 +101,52 @@ class TestFontPreservation:
         print(f"\n  Original fonts: {sorted(original_fonts)}")
         print(f"  Our output:     {sorted(our_fonts)}  <- SAME")
         print(f"  PyMuPDF output: {sorted(pymupdf_fonts)}  <- DIFFERENT")
+
+    @pytest.mark.skipif(
+        not CIDFONT_PDF.exists(), reason="cidfont_synthetic.pdf not in corpus"
+    )
+    def test_cidfont_synthetic_font_preservation(self, tmp_path: Path) -> None:
+        """Synthetic Identity-H CIDFont: our edit preserves font, PyMuPDF does not."""
+        cidfont = str(CIDFONT_PDF)
+        original_fonts = _get_font_names(cidfont)
+
+        # Our edit
+        matches = find(cidfont, "Software Engineer")
+        assert len(matches) >= 1, "'Software Engineer' not found in cidfont_synthetic"
+        our_output = str(tmp_path / "ours.pdf")
+        replace(cidfont, matches[0], "Senior Engineer", our_output, reflow=False)
+        our_fonts = _get_font_names(our_output)
+
+        assert original_fonts == our_fonts, (
+            f"Font mismatch:\n  Original: {original_fonts}\n  Ours: {our_fonts}"
+        )
+
+        if _has_fitz:
+            pymupdf_output = str(tmp_path / "pymupdf.pdf")
+            doc = fitz.open(cidfont)
+            page = doc[0]
+            areas = page.search_for("Software Engineer")
+            if areas:
+                for area in areas:
+                    page.add_redact_annot(area, text="Senior Engineer")
+                page.apply_redactions()
+                doc.save(pymupdf_output)
+                doc.close()
+                pymupdf_fonts = _get_font_names(pymupdf_output)
+                assert pymupdf_fonts != original_fonts, (
+                    "Expected PyMuPDF to alter font set, but it didn't"
+                )
+                print(f"\n  Original fonts: {sorted(original_fonts)}")
+                print(f"  Our output:     {sorted(our_fonts)}  <- SAME")
+                print(f"  PyMuPDF output: {sorted(pymupdf_fonts)}  <- DIFFERENT")
+            else:
+                doc.close()
+                print(f"\n  Original fonts: {sorted(original_fonts)}")
+                print(f"  Our output:     {sorted(our_fonts)}  <- SAME")
+                print("  PyMuPDF: could not find text to edit")
+        else:
+            print(f"\n  Original fonts: {sorted(original_fonts)}")
+            print(f"  Our output:     {sorted(our_fonts)}  <- SAME")
 
     def test_reportlab_font_preservation(self, tmp_path: Path) -> None:
         """WinAnsi: our edit preserves exact font objects."""
@@ -219,6 +266,33 @@ class TestRoundTrip:
         with pikepdf.Pdf.open(output) as pdf:
             pdf.save(resave)
         pikepdf.Pdf.open(resave).close()
+
+    @pytest.mark.skipif(
+        not CIDFONT_PDF.exists(), reason="cidfont_synthetic.pdf not in corpus"
+    )
+    def test_round_trip_cidfont(self, tmp_path: Path) -> None:
+        """Edit cidfont_synthetic.pdf 3 times sequentially."""
+        cidfont = str(CIDFONT_PDF)
+        replacements = [
+            ("Software Engineer", "Senior Engineer"),
+            ("Senior Engineer", "Staff Engineer"),
+            ("Staff Engineer", "Principal Engineer"),
+        ]
+
+        current_pdf = cidfont
+        for i, (old, new) in enumerate(replacements):
+            output = str(tmp_path / f"cidfont_round_{i}.pdf")
+            matches = find(str(current_pdf), old)
+            assert len(matches) >= 1, f"Round {i}: '{old}' not found"
+            result = replace(str(current_pdf), matches[0], new, output, reflow=False)
+            assert result.success, f"Round {i}: replace failed"
+            pikepdf.Pdf.open(output).close()
+            text = get_text(output)
+            assert new in text, f"Round {i}: '{new}' not in output"
+            current_pdf = output
+
+        final_text = get_text(str(current_pdf))
+        assert "Principal Engineer" in final_text
 
     def test_batch_then_verify(self, tmp_path: Path) -> None:
         """batch_replace with multiple edits, all appear in output."""

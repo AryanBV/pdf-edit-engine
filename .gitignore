@@ -209,5 +209,9 @@ __marimo__/
 # Claude Code
 .claude/
 
+# Demo output (for manual inspection, not committed)
+demo_output/
+
 # Test corpus PDFs (auto-generated and manually placed)
 tests/corpus/*.pdf
+!tests/corpus/cidfont_synthetic.pdf

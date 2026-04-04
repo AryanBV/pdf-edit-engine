@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 CORPUS_DIR = Path(__file__).parent / "corpus"
+DEMO_OUTPUT = Path(__file__).parent.parent / "demo_output"
 
 _GENERATED_PDFS = [
     "reportlab_simple.pdf",
@@ -16,6 +17,12 @@ _GENERATED_PDFS = [
     "reportlab_multipage.pdf",
     "pikepdf_synthetic.pdf",
     "reportlab_forms.pdf",
+]
+
+_COMPLEX_PDFS = [
+    "complex_multifont.pdf",
+    "complex_transformed.pdf",
+    "complex_contract.pdf",
 ]
 
 
@@ -29,7 +36,27 @@ def ensure_corpus() -> None:
         )
 
 
+@pytest.fixture(scope="session", autouse=True)
+def ensure_complex_corpus() -> None:
+    """Auto-generate complex corpus PDFs if any are missing."""
+    import contextlib
+
+    missing = [name for name in _COMPLEX_PDFS if not (CORPUS_DIR / name).exists()]
+    if missing:
+        with contextlib.suppress(subprocess.CalledProcessError, FileNotFoundError):
+            subprocess.check_call(
+                [sys.executable, str(Path(__file__).parent / "generate_complex_corpus.py")],
+            )
+
+
 @pytest.fixture
 def corpus_dir() -> Path:
     """Return the path to the test corpus directory."""
     return CORPUS_DIR
+
+
+@pytest.fixture
+def demo_output_dir() -> Path:
+    """Return the persistent demo_output/ directory (not cleaned up)."""
+    DEMO_OUTPUT.mkdir(parents=True, exist_ok=True)
+    return DEMO_OUTPUT

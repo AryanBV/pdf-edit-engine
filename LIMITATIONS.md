@@ -8,6 +8,17 @@
 - Justified text may lose justification after reflow (replaced with left-aligned)
 - Empty string replacement removes the text visually but leaves the operator structure intact
 
+## Transformed text
+
+- Rotated text (non-zero CTM rotation) is extracted correctly and `find()` returns matches for small angles (tested up to 5 degrees). Replacement positioning under rotation has not been extensively tested.
+- Horizontally scaled text (CTM Tz) is found and replaceable — the engine correctly handles width changes.
+- Very small text (6pt) is found and replaceable.
+- Character spacing (`Tc` operator) is handled correctly — text is stored as a single string in the content stream, not as individual characters with spaces.
+
+## Cross-tool compatibility
+
+- PDFs previously edited by PyMuPDF (redact + re-insert) can be read, searched, and edited by pdf-edit-engine. The mixed font origins (original + PyMuPDF-added) do not cause issues.
+
 ## Font handling
 
 - Tier 2 font extension (full re-embed) requires the matching system font to be installed
