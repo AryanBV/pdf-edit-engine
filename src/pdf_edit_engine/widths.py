@@ -104,7 +104,9 @@ class GlyphWidthCache:
         return self._cache[font_name].get(char_code, DEFAULT_WIDTH)
 
     def _load_widths(
-        self, page: pikepdf.Page, font_name: str,
+        self,
+        page: pikepdf.Page,
+        font_name: str,
     ) -> dict[int, float]:
         font_key = font_name if font_name.startswith("/") else f"/{font_name}"
         try:

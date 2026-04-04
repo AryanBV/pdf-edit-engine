@@ -123,13 +123,15 @@ class TestContentStreamInterpreter:
         return result
 
     def test_elements_contain_text_type(
-        self, elements: list[ContentElement],
+        self,
+        elements: list[ContentElement],
     ) -> None:
         types = {e.type for e in elements}
         assert "text" in types
 
     def test_text_elements_have_valid_bbox(
-        self, elements: list[ContentElement],
+        self,
+        elements: list[ContentElement],
     ) -> None:
         text_elems = [e for e in elements if e.type == "text"]
         for elem in text_elems:
@@ -138,7 +140,8 @@ class TestContentStreamInterpreter:
             assert y0 < y1, f"bbox y0 >= y1: {elem.bbox}"
 
     def test_text_elements_have_operator_index(
-        self, elements: list[ContentElement],
+        self,
+        elements: list[ContentElement],
     ) -> None:
         text_elems = [e for e in elements if e.type == "text"]
         for elem in text_elems:
@@ -147,7 +150,8 @@ class TestContentStreamInterpreter:
             assert end > start
 
     def test_text_characters_have_matching_font(
-        self, elements: list[ContentElement],
+        self,
+        elements: list[ContentElement],
     ) -> None:
         fonts = get_fonts(RESUME_PDF)
         font_names = {f.name for f in fonts}
@@ -160,7 +164,8 @@ class TestContentStreamInterpreter:
                     )
 
     def test_text_content_is_decoded_unicode(
-        self, elements: list[ContentElement],
+        self,
+        elements: list[ContentElement],
     ) -> None:
         text_elems = [e for e in elements if e.type == "text"]
         for elem in text_elems:
@@ -168,7 +173,8 @@ class TestContentStreamInterpreter:
                 assert "\x00" not in elem.text_content
 
     def test_text_elements_have_characters(
-        self, elements: list[ContentElement],
+        self,
+        elements: list[ContentElement],
     ) -> None:
         text_elems = [e for e in elements if e.type == "text"]
         for elem in text_elems:
@@ -176,19 +182,22 @@ class TestContentStreamInterpreter:
             assert len(elem.characters) > 0
 
     def test_path_elements_exist(
-        self, elements: list[ContentElement],
+        self,
+        elements: list[ContentElement],
     ) -> None:
         types = {e.type for e in elements}
         assert "path" in types
 
     def test_state_change_elements_exist(
-        self, elements: list[ContentElement],
+        self,
+        elements: list[ContentElement],
     ) -> None:
         types = {e.type for e in elements}
         assert "state_change" in types
 
     def test_element_count_reasonable(
-        self, elements: list[ContentElement],
+        self,
+        elements: list[ContentElement],
     ) -> None:
         assert len(elements) > 100
 

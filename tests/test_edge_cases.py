@@ -36,17 +36,13 @@ class TestInvisibleText:
         matches = find(self.PDF, "Invisible hidden text")
         assert len(matches) >= 1
         for ch in matches[0].characters:
-            assert ch.rendering_mode == 3, (
-                f"Expected rendering_mode 3, got {ch.rendering_mode}"
-            )
+            assert ch.rendering_mode == 3, f"Expected rendering_mode 3, got {ch.rendering_mode}"
 
     def test_visible_text_rendering_mode_zero(self) -> None:
         matches = find(self.PDF, "Visible text here")
         assert len(matches) >= 1
         for ch in matches[0].characters:
-            assert ch.rendering_mode == 0, (
-                f"Expected rendering_mode 0, got {ch.rendering_mode}"
-            )
+            assert ch.rendering_mode == 0, f"Expected rendering_mode 0, got {ch.rendering_mode}"
 
     def test_invisible_text_indexed_as_element(self) -> None:
         with pikepdf.open(self.PDF) as pdf:

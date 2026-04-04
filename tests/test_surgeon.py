@@ -41,9 +41,7 @@ def _validate_output(
 
     # Contains replacement text
     text = get_text(output_path)
-    assert expected_text in text, (
-        f"Expected {expected_text!r} in output text"
-    )
+    assert expected_text in text, f"Expected {expected_text!r} in output text"
 
     # Fonts preserved
     if original_pdf is not None:

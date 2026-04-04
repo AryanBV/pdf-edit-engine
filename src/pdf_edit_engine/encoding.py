@@ -155,9 +155,7 @@ class FontResolver:
                 result.append(self._cid_to_unicode[cid])
             return "".join(result)
         else:
-            return "".join(
-                self._byte_to_unicode[b] for b in raw_bytes
-            )
+            return "".join(self._byte_to_unicode[b] for b in raw_bytes)
 
     def encode(self, text: str) -> bytes:
         """Convert a Unicode string to content stream bytes for this font.
@@ -190,9 +188,7 @@ class FontResolver:
                         matched = True
                         break
                 if not matched:
-                    raise KeyError(
-                        f"Cannot encode character: {text[i]!r}"
-                    )
+                    raise KeyError(f"Cannot encode character: {text[i]!r}")
             return bytes(result)
         else:
             return bytes(self._unicode_to_byte[ch] for ch in text)
@@ -245,7 +241,9 @@ class FontResolverCache:
         self._cache: dict[tuple[int, int, str], FontResolver] = {}
 
     def get_resolver(
-        self, page: pikepdf.Page, font_name: str,
+        self,
+        page: pikepdf.Page,
+        font_name: str,
     ) -> FontResolver:
         """Get or create a FontResolver for a font on a page.
 
@@ -287,10 +285,15 @@ def _glyph_name_to_unicode(name: str) -> str | None:
     # Try pdfminer's glyph name database
     try:
         from pdfminer.glyphlist import glyphname2unicode
+
         return glyphname2unicode.get(name)
     except ImportError:
         _COMMON: dict[str, str] = {
-            "space": " ", "period": ".", "comma": ",",
-            "hyphen": "-", "colon": ":", "semicolon": ";",
+            "space": " ",
+            "period": ".",
+            "comma": ",",
+            "hyphen": "-",
+            "colon": ":",
+            "semicolon": ";",
         }
         return _COMMON.get(name)

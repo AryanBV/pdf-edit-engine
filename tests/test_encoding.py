@@ -105,7 +105,8 @@ class TestRoundTrip:
             assert f1_resolver.decode(f1_resolver.encode(text)) == text
 
     def test_roundtrip_identity_h_ligature(
-        self, f1_resolver: FontResolver,
+        self,
+        f1_resolver: FontResolver,
     ) -> None:
         assert f1_resolver.decode(f1_resolver.encode("fi")) == "fi"
 
@@ -118,14 +119,16 @@ class TestCanEncode:
     """Tests for can_encode() checking."""
 
     def test_can_encode_present_chars(
-        self, f1_resolver: FontResolver,
+        self,
+        f1_resolver: FontResolver,
     ) -> None:
         ok, missing = f1_resolver.can_encode("A")
         assert ok is True
         assert missing == []
 
     def test_can_encode_missing_char(
-        self, f1_resolver: FontResolver,
+        self,
+        f1_resolver: FontResolver,
     ) -> None:
         ok, missing = f1_resolver.can_encode("\u4e2d")
         assert ok is False
@@ -162,7 +165,8 @@ class TestEncodingType:
     """Tests for encoding type properties."""
 
     def test_identity_h_properties(
-        self, f1_resolver: FontResolver,
+        self,
+        f1_resolver: FontResolver,
     ) -> None:
         assert f1_resolver.encoding_type == "Identity-H"
         assert f1_resolver.is_cid_font is True
@@ -182,7 +186,8 @@ class TestFontResolverCache:
     """Tests for FontResolverCache caching behavior."""
 
     def test_cache_returns_same_instance(
-        self, resume_pdf: pikepdf.Pdf,
+        self,
+        resume_pdf: pikepdf.Pdf,
     ) -> None:
         cache = FontResolverCache()
         page = resume_pdf.pages[0]
@@ -191,7 +196,8 @@ class TestFontResolverCache:
         assert r1 is r2
 
     def test_cache_different_fonts(
-        self, resume_pdf: pikepdf.Pdf,
+        self,
+        resume_pdf: pikepdf.Pdf,
     ) -> None:
         cache = FontResolverCache()
         page = resume_pdf.pages[0]
@@ -200,7 +206,8 @@ class TestFontResolverCache:
         assert r1 is not r3
 
     def test_cache_resolver_works(
-        self, resume_pdf: pikepdf.Pdf,
+        self,
+        resume_pdf: pikepdf.Pdf,
     ) -> None:
         cache = FontResolverCache()
         page = resume_pdf.pages[0]

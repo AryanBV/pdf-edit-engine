@@ -34,6 +34,7 @@ class FontInfo:
     is_subset: bool
     glyph_count: int
     embedded_type: Literal["TrueType", "CFF", "Type1"]
+    font_cmap: dict[int, str] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -112,3 +113,20 @@ class ContentElement:
     xobject_name: str | None = None
     path_data: list[object] | None = None
     characters: list[TextCharacter] | None = None
+
+
+@dataclass
+class Paragraph:
+    """A detected paragraph of related text elements on a PDF page."""
+
+    elements: list[ContentElement]
+    full_text: str
+    left_margin: float
+    right_margin: float
+    paragraph_width: float
+    line_height: float
+    font_name: str
+    font_size: float
+    first_line_y: float
+    line_count: int
+    operator_indices: list[int]

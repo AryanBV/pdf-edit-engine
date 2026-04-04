@@ -22,10 +22,7 @@ _GENERATED_PDFS = [
 @pytest.fixture(scope="session", autouse=True)
 def ensure_corpus() -> None:
     """Auto-generate corpus PDFs if any are missing."""
-    missing = [
-        name for name in _GENERATED_PDFS
-        if not (CORPUS_DIR / name).exists()
-    ]
+    missing = [name for name in _GENERATED_PDFS if not (CORPUS_DIR / name).exists()]
     if missing:
         subprocess.check_call(
             [sys.executable, str(Path(__file__).parent / "generate_corpus.py")],

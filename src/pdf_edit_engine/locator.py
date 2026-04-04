@@ -28,20 +28,57 @@ logger = logging.getLogger(__name__)
 
 
 # Operators handled by GraphicsStateTracker
-_STATE_OPS: frozenset[str] = frozenset({
-    "q", "Q", "cm", "BT", "ET", "Tm", "Td", "TD", "T*",
-    "Tf", "Tc", "Tw", "Tz", "TL", "Tr", "Ts",
-    "g", "G", "rg", "RG", "k", "K",
-    "cs", "CS", "sc", "SC", "scn", "SCN",
-})
+_STATE_OPS: frozenset[str] = frozenset(
+    {
+        "q",
+        "Q",
+        "cm",
+        "BT",
+        "ET",
+        "Tm",
+        "Td",
+        "TD",
+        "T*",
+        "Tf",
+        "Tc",
+        "Tw",
+        "Tz",
+        "TL",
+        "Tr",
+        "Ts",
+        "g",
+        "G",
+        "rg",
+        "RG",
+        "k",
+        "K",
+        "cs",
+        "CS",
+        "sc",
+        "SC",
+        "scn",
+        "SCN",
+    }
+)
 
 # Path construction operators
 _PATH_CONSTRUCT_OPS: frozenset[str] = frozenset({"m", "l", "c", "v", "y", "re", "h"})
 
 # Path painting / termination operators
-_PATH_PAINT_OPS: frozenset[str] = frozenset({
-    "S", "s", "f", "F", "f*", "B", "b", "B*", "b*", "n",
-})
+_PATH_PAINT_OPS: frozenset[str] = frozenset(
+    {
+        "S",
+        "s",
+        "f",
+        "F",
+        "f*",
+        "B",
+        "b",
+        "B*",
+        "b*",
+        "n",
+    }
+)
 
 # Color operators that emit state_change elements
 _COLOR_OPS: frozenset[str] = frozenset({"g", "G", "rg", "RG", "k", "K"})
@@ -83,7 +120,10 @@ class ContentStreamInterpreter:
         return self._elements
 
     def _dispatch(
-        self, idx: int, op: str, operands: list[object],
+        self,
+        idx: int,
+        op: str,
+        operands: list[object],
     ) -> None:
         """Route an operator to the appropriate handler."""
         # State operators
@@ -145,7 +185,9 @@ class ContentStreamInterpreter:
     # ── Text handling ─────────────────────────────────────────────────
 
     def _handle_tj_single(
-        self, idx: int, operands: list[object],
+        self,
+        idx: int,
+        operands: list[object],
     ) -> None:
         """Handle Tj operator (single string)."""
         if self._current_resolver is None:
@@ -164,7 +206,9 @@ class ContentStreamInterpreter:
             self._emit_text_element(idx, idx, chars, decoded)
 
     def _handle_tj_array(
-        self, idx: int, operands: list[object],
+        self,
+        idx: int,
+        operands: list[object],
     ) -> None:
         """Handle TJ operator (array of strings and kerning values)."""
         if self._reconstructor is None or self._current_resolver is None:
@@ -202,8 +246,15 @@ class ContentStreamInterpreter:
                     self._tracker.apply_tj_displacement(pending_tj)
                 # Iterate by CID (byte_width chunks) to handle ligatures
                 self._walk_cids(
-                    raw, byte_width, resolver, font_name, font_size,
-                    fill_color, idx, frag_idx, chars,
+                    raw,
+                    byte_width,
+                    resolver,
+                    font_name,
+                    font_size,
+                    fill_color,
+                    idx,
+                    frag_idx,
+                    chars,
                 )
                 pending_tj = 0.0
                 frag_idx += 1
@@ -212,14 +263,18 @@ class ContentStreamInterpreter:
             self._emit_text_element(idx, idx, chars, reconstructed.full_text)
 
     def _handle_quote(
-        self, idx: int, operands: list[object],
+        self,
+        idx: int,
+        operands: list[object],
     ) -> None:
         """Handle ' operator (T* then Tj)."""
         self._tracker.process_operator("T*", [])
         self._handle_tj_single(idx, operands)
 
     def _handle_double_quote(
-        self, idx: int, operands: list[object],
+        self,
+        idx: int,
+        operands: list[object],
     ) -> None:
         """Handle " operator (set Tw, Tc, then ' with string)."""
         if len(operands) >= 3:
@@ -246,8 +301,15 @@ class ContentStreamInterpreter:
         byte_width = resolver.byte_width
 
         self._walk_cids(
-            raw, byte_width, resolver, font_name, font_size,
-            fill_color, op_idx, tj_fragment_index, chars,
+            raw,
+            byte_width,
+            resolver,
+            font_name,
+            font_size,
+            fill_color,
+            op_idx,
+            tj_fragment_index,
+            chars,
         )
         return chars
 
@@ -291,20 +353,22 @@ class ContentStreamInterpreter:
 
             for sub_ci, ch in enumerate(cid_text):
                 pos = self._tracker.get_text_position()
-                chars.append(TextCharacter(
-                    unicode_char=ch,
-                    page_x=pos[0],
-                    page_y=pos[1],
-                    width=sub_width * font_size,
-                    height=font_size,
-                    font_name=font_name,
-                    font_size=font_size,
-                    color=fill_color,
-                    operator_index=op_idx,
-                    byte_position=offset,
-                    tj_fragment_index=frag_idx,
-                    rendering_mode=self._tracker.text_rendering_mode,
-                ))
+                chars.append(
+                    TextCharacter(
+                        unicode_char=ch,
+                        page_x=pos[0],
+                        page_y=pos[1],
+                        width=sub_width * font_size,
+                        height=font_size,
+                        font_name=font_name,
+                        font_size=font_size,
+                        color=fill_color,
+                        operator_index=op_idx,
+                        byte_position=offset,
+                        tj_fragment_index=frag_idx,
+                        rendering_mode=self._tracker.text_rendering_mode,
+                    )
+                )
                 # Advance only on the last sub-character of the ligature
                 if sub_ci == n_sub - 1:
                     self._tracker.advance_by_glyph(width_ts, char_code)
@@ -332,32 +396,39 @@ class ContentStreamInterpreter:
         y0 = min(c.page_y for c in chars) - font_size * 0.25
         x1 = max(c.page_x + c.width for c in chars)
         y1 = max(c.page_y for c in chars) + font_size * 0.75
-        self._elements.append(ContentElement(
-            type="text",
-            page=self._page_number,
-            operator_range=(start_idx, end_idx + 1),
-            bbox=(x0, y0, x1, y1),
-            graphics_state=self._tracker.snapshot(),
-            text_content=text_content,
-            characters=chars,
-        ))
+        self._elements.append(
+            ContentElement(
+                type="text",
+                page=self._page_number,
+                operator_range=(start_idx, end_idx + 1),
+                bbox=(x0, y0, x1, y1),
+                graphics_state=self._tracker.snapshot(),
+                text_content=text_content,
+                characters=chars,
+            )
+        )
 
     # ── State change ──────────────────────────────────────────────────
 
     def _emit_state_change(self, idx: int) -> None:
         """Emit a state_change ContentElement for color operators."""
-        self._elements.append(ContentElement(
-            type="state_change",
-            page=self._page_number,
-            operator_range=(idx, idx + 1),
-            bbox=(0.0, 0.0, 0.0, 0.0),
-            graphics_state=self._tracker.snapshot(),
-        ))
+        self._elements.append(
+            ContentElement(
+                type="state_change",
+                page=self._page_number,
+                operator_range=(idx, idx + 1),
+                bbox=(0.0, 0.0, 0.0, 0.0),
+                graphics_state=self._tracker.snapshot(),
+            )
+        )
 
     # ── Path handling ─────────────────────────────────────────────────
 
     def _accumulate_path(
-        self, idx: int, op: str, operands: list[object],
+        self,
+        idx: int,
+        op: str,
+        operands: list[object],
     ) -> None:
         """Accumulate path construction coordinates."""
         if not self._path_points:
@@ -369,16 +440,20 @@ class ContentStreamInterpreter:
         elif op in {"m", "l"} and len(floats) >= 2:
             self._path_points.append((floats[0], floats[1]))
         elif op == "c" and len(floats) >= 6:
-            self._path_points.extend([
-                (floats[0], floats[1]),
-                (floats[2], floats[3]),
-                (floats[4], floats[5]),
-            ])
+            self._path_points.extend(
+                [
+                    (floats[0], floats[1]),
+                    (floats[2], floats[3]),
+                    (floats[4], floats[5]),
+                ]
+            )
         elif op in {"v", "y"} and len(floats) >= 4:
-            self._path_points.extend([
-                (floats[0], floats[1]),
-                (floats[2], floats[3]),
-            ])
+            self._path_points.extend(
+                [
+                    (floats[0], floats[1]),
+                    (floats[2], floats[3]),
+                ]
+            )
 
     def _emit_path(self, idx: int) -> None:
         """Emit a path ContentElement from accumulated points."""
@@ -388,13 +463,15 @@ class ContentStreamInterpreter:
             bbox = (min(xs), min(ys), max(xs), max(ys))
         else:
             bbox = (0.0, 0.0, 0.0, 0.0)
-        self._elements.append(ContentElement(
-            type="path",
-            page=self._page_number,
-            operator_range=(self._path_start_index, idx + 1),
-            bbox=bbox,
-            graphics_state=self._tracker.snapshot(),
-        ))
+        self._elements.append(
+            ContentElement(
+                type="path",
+                page=self._page_number,
+                operator_range=(self._path_start_index, idx + 1),
+                bbox=bbox,
+                graphics_state=self._tracker.snapshot(),
+            )
+        )
         self._path_points.clear()
 
     # ── XObject handling ──────────────────────────────────────────────
@@ -419,24 +496,28 @@ class ContentStreamInterpreter:
         bbox = (x, y, x + w, y + h)
 
         if subtype == "/Image":
-            self._elements.append(ContentElement(
-                type="image",
-                page=self._page_number,
-                operator_range=(idx, idx + 1),
-                bbox=bbox,
-                graphics_state=self._tracker.snapshot(),
-                xobject_name=xobj_name,
-            ))
+            self._elements.append(
+                ContentElement(
+                    type="image",
+                    page=self._page_number,
+                    operator_range=(idx, idx + 1),
+                    bbox=bbox,
+                    graphics_state=self._tracker.snapshot(),
+                    xobject_name=xobj_name,
+                )
+            )
         else:
             # Form XObject or other — record without recursion
-            self._elements.append(ContentElement(
-                type="xobject",
-                page=self._page_number,
-                operator_range=(idx, idx + 1),
-                bbox=bbox,
-                graphics_state=self._tracker.snapshot(),
-                xobject_name=xobj_name,
-            ))
+            self._elements.append(
+                ContentElement(
+                    type="xobject",
+                    page=self._page_number,
+                    operator_range=(idx, idx + 1),
+                    bbox=bbox,
+                    graphics_state=self._tracker.snapshot(),
+                    xobject_name=xobj_name,
+                )
+            )
 
 
 # ── Index cache ────────────────────────────────────────────────────────
@@ -449,7 +530,9 @@ _cached_elements: dict[int, list[ContentElement]] = {}
 
 
 def _build_index(
-    page: pikepdf.Page, page_number: int, pdf_path: str | None = None,
+    page: pikepdf.Page,
+    page_number: int,
+    pdf_path: str | None = None,
 ) -> list[ContentElement]:
     """Build (or retrieve cached) content element index for a page.
 
@@ -480,7 +563,8 @@ def _build_index(
 
 
 def _resolve_pages(
-    pdf: pikepdf.Pdf, page: int | None,
+    pdf: pikepdf.Pdf,
+    page: int | None,
 ) -> list[tuple[int, pikepdf.Page]]:
     """Resolve page parameter to list of (page_number, page_object) pairs.
 
@@ -496,9 +580,7 @@ def _resolve_pages(
     """
     if page is not None:
         if page < 0 or page >= len(pdf.pages):
-            raise IndexError(
-                f"Page {page} out of range (PDF has {len(pdf.pages)} pages)"
-            )
+            raise IndexError(f"Page {page} out of range (PDF has {len(pdf.pages)} pages)")
         return [(page, pdf.pages[page])]
     return list(enumerate(pdf.pages))
 
@@ -557,7 +639,8 @@ _SUBSET_PREFIX = re.compile(r"^[A-Z]{6}\+")
 
 
 def _build_font_info(
-    font_obj: pikepdf.Object, font_name: str,
+    font_obj: pikepdf.Object,
+    font_name: str,
 ) -> FontInfo:
     """Extract FontInfo metadata from a font dictionary.
 
@@ -639,7 +722,8 @@ def _build_font_info(
 
 
 def _detect_embedded_type(
-    font_dict: pikepdf.Dictionary, subtype: str,
+    font_dict: pikepdf.Dictionary,
+    subtype: str,
 ) -> Literal["TrueType", "CFF", "Type1"]:
     """Detect the embedded font type from FontDescriptor.
 
@@ -663,7 +747,8 @@ def _detect_embedded_type(
 
 
 def _get_font_descriptor(
-    font_dict: pikepdf.Dictionary, subtype: str,
+    font_dict: pikepdf.Dictionary,
+    subtype: str,
 ) -> pikepdf.Object | None:
     """Get the FontDescriptor from a font dict, handling CIDFonts."""
     if "/FontDescriptor" in font_dict:
@@ -782,9 +867,7 @@ def find(
 
         for page_num, page_obj in pages:
             elements = _build_index(page_obj, page_num, resolved)
-            text_elements = [
-                e for e in elements if e.type == "text" and e.text_content
-            ]
+            text_elements = [e for e in elements if e.type == "text" and e.text_content]
             text_elements.sort(key=lambda e: (-e.bbox[3], e.bbox[0]))
 
             flat, char_map = _build_flat_string(text_elements)
@@ -800,14 +883,9 @@ def find(
                 end = idx + len(needle)
                 start = idx + 1  # allow overlapping matches
 
-                matched_chars = [
-                    char_map[i] for i in range(idx, end)
-                    if char_map[i] is not None
-                ]
+                matched_chars = [char_map[i] for i in range(idx, end) if char_map[i] is not None]
                 # Narrow type for mypy
-                real_chars: list[TextCharacter] = [
-                    c for c in matched_chars if c is not None
-                ]
+                real_chars: list[TextCharacter] = [c for c in matched_chars if c is not None]
                 if not real_chars:
                     continue
 
@@ -836,14 +914,16 @@ def find(
 
                 operator_refs = sorted({c.operator_index for c in real_chars})
 
-                matches.append(TextMatch(
-                    matched_text=flat[idx:end],
-                    page_number=page_num,
-                    bounding_box=(x0, y0, x1, y1),
-                    characters=real_chars,
-                    font_info=font_info,
-                    operator_refs=operator_refs,
-                ))
+                matches.append(
+                    TextMatch(
+                        matched_text=flat[idx:end],
+                        page_number=page_num,
+                        bounding_box=(x0, y0, x1, y1),
+                        characters=real_chars,
+                        font_info=font_info,
+                        operator_refs=operator_refs,
+                    )
+                )
 
     return matches
 
@@ -865,10 +945,7 @@ def get_text(pdf_path: str, *, page: int | None = None) -> str:
         all_text: list[str] = []
         for page_num, page_obj in pages:
             elements = _build_index(page_obj, page_num, resolved)
-            text_elements = [
-                e for e in elements
-                if e.type == "text" and e.text_content
-            ]
+            text_elements = [e for e in elements if e.type == "text" and e.text_content]
             # Sort by y descending (top of page first), then x ascending
             text_elements.sort(key=lambda e: (-e.bbox[3], e.bbox[0]))
             lines = _group_into_lines(text_elements)

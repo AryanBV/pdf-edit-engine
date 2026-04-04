@@ -31,9 +31,7 @@ def test_get_text_contains_expected(entry: dict[str, object]) -> None:
     pdf_path = str(CORPUS_DIR / str(entry["filename"]))
     text = get_text(pdf_path)
     expected = str(entry["expected_text"])
-    assert expected in text, (
-        f"Expected {expected!r} in get_text output for {entry['filename']}"
-    )
+    assert expected in text, f"Expected {expected!r} in get_text output for {entry['filename']}"
 
 
 @pytest.mark.parametrize("entry", MANIFEST, ids=lambda e: str(e["filename"]))
@@ -48,9 +46,7 @@ def test_find_expected_text(entry: dict[str, object]) -> None:
     pdf_path = str(CORPUS_DIR / str(entry["filename"]))
     expected = str(entry["expected_text"])
     matches = find(pdf_path, expected)
-    assert len(matches) >= 1, (
-        f"Expected at least 1 match for {expected!r} in {entry['filename']}"
-    )
+    assert len(matches) >= 1, f"Expected at least 1 match for {expected!r} in {entry['filename']}"
     for m in matches:
         assert m.bounding_box[0] < m.bounding_box[2], "x0 should be < x1"
         assert m.bounding_box[1] < m.bounding_box[3], "y0 should be < y1"
@@ -61,7 +57,11 @@ def test_no_garbled_output(entry: dict[str, object]) -> None:
     pdf_path = str(CORPUS_DIR / str(entry["filename"]))
     text = get_text(pdf_path)
     for ch in text:
-        assert ch.isprintable() or ch in "\n\t\r", f"Non-printable char: {ch!r}"
+        assert (
+            ch.isprintable()
+            or ch in "\n\t\r\xa0"
+            or "\ue000" <= ch <= "\uf8ff"  # Private Use Area (icons/symbols)
+        ), f"Non-printable char: {ch!r}"
 
 
 # ── Non-parametrized tests ─────────────────────────────────────────────
@@ -112,4 +112,8 @@ class TestFormsPdf:
         assert "Please fill out this form" in text
         # Verify no garbled output from AcroForm presence
         for ch in text:
-            assert ch.isprintable() or ch in "\n\t\r", f"Non-printable char: {ch!r}"
+            assert (
+                ch.isprintable()
+                or ch in "\n\t\r\xa0"
+                or "\ue000" <= ch <= "\uf8ff"  # Private Use Area (icons/symbols)
+            ), f"Non-printable char: {ch!r}"

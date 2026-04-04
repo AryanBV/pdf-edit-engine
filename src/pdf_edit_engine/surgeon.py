@@ -9,7 +9,7 @@ from typing import Any
 import pikepdf
 
 from pdf_edit_engine.encoding import FontResolver, FontResolverCache
-from pdf_edit_engine.errors import OperatorError, PDFEditError
+from pdf_edit_engine.errors import FontNotFoundError, OperatorError, PDFEditError
 from pdf_edit_engine.models import (
     Edit,
     EditResult,
@@ -57,7 +57,9 @@ def _nth_string_index(tj_items: list[object], frag_idx: int) -> int:
 
 
 def _splice_bytes(
-    raw: bytes, replacements: list[tuple[int, bytes]], byte_width: int,
+    raw: bytes,
+    replacements: list[tuple[int, bytes]],
+    byte_width: int,
 ) -> bytes:
     """Splice replacement bytes into raw string data at given positions.
 
@@ -265,10 +267,11 @@ def _apply_single_replacement(
     resolver: FontResolver,
     width_cache: GlyphWidthCache,
     dry_run: bool,
-) -> EditResult:
+) -> tuple[EditResult, FontResolver]:
     """Core replacement logic shared by replace() and replace_all().
 
-    Modifies ops in-place when not dry_run.
+    Modifies ops in-place when not dry_run. If encoding fails, attempts
+    automatic font extension before returning failure.
 
     Args:
         pdf: The open PDF document.
@@ -281,32 +284,65 @@ def _apply_single_replacement(
         dry_run: If True, skip actual modifications.
 
     Returns:
-        EditResult describing the operation.
+        Tuple of (EditResult, FontResolver). The resolver may be refreshed
+        after font extension — callers should use the returned resolver
+        for subsequent operations.
     """
+    from typing import Literal as Lit
+
     # Check encodability
-    can_encode, missing = resolver.can_encode(new_text)
-    if not can_encode:
-        return EditResult(
-            success=False,
-            original_text=match.matched_text,
-            new_text=new_text,
-            font_action="failed",
-            fidelity_report=FidelityReport(
-                font_preserved=True,
-                font_substituted=None,
-                overflow_detected=False,
-                reflow_applied=False,
-                glyphs_missing=missing,
-            ),
-        )
+    can_enc, missing = resolver.can_encode(new_text)
+    font_action: Lit["kept", "extended", "substituted", "failed"] = "kept"
+
+    if not can_enc:
+        # Attempt automatic font extension
+        try:
+            from pdf_edit_engine.fonts import extend_subset
+
+            font_name = match.characters[0].font_name
+            tier = extend_subset(pdf, page, font_name, "".join(missing))
+            # Get fresh resolver from updated font dicts
+            resolver = _get_font_resolver(page, font_name)
+            can_enc_after, still_missing = resolver.can_encode(new_text)
+            if not can_enc_after:
+                return EditResult(
+                    success=False,
+                    original_text=match.matched_text,
+                    new_text=new_text,
+                    font_action="failed",
+                    fidelity_report=FidelityReport(
+                        font_preserved=True,
+                        font_substituted=None,
+                        overflow_detected=False,
+                        reflow_applied=False,
+                        glyphs_missing=still_missing,
+                    ),
+                ), resolver
+            font_action = "extended"
+            logger.info(
+                "Font extension (%s) succeeded for %d missing chars",
+                tier,
+                len(missing),
+            )
+        except (FontNotFoundError, PDFEditError):
+            return EditResult(
+                success=False,
+                original_text=match.matched_text,
+                new_text=new_text,
+                font_action="failed",
+                fidelity_report=FidelityReport(
+                    font_preserved=True,
+                    font_substituted=None,
+                    overflow_detected=False,
+                    reflow_applied=False,
+                    glyphs_missing=missing,
+                ),
+            ), resolver
 
     # Validate operator refs
     for ref in match.operator_refs:
         if ref >= len(ops):
-            msg = (
-                f"Operator index {ref} out of bounds "
-                f"(content stream has {len(ops)} operators)"
-            )
+            msg = f"Operator index {ref} out of bounds (content stream has {len(ops)} operators)"
             raise OperatorError(msg)
 
     byte_width = resolver.byte_width
@@ -344,20 +380,34 @@ def _apply_single_replacement(
 
             if op_str in ("TJ",):
                 _modify_tj_operator(
-                    ops, op_idx, op_chars, replacement_text, resolver,
-                    byte_width, same_length,
+                    ops,
+                    op_idx,
+                    op_chars,
+                    replacement_text,
+                    resolver,
+                    byte_width,
+                    same_length,
                 )
             elif op_str in ("Tj", "'"):
                 _modify_tj_single_operator(
-                    ops, op_idx, op_chars, replacement_text, resolver,
-                    byte_width, same_length,
+                    ops,
+                    op_idx,
+                    op_chars,
+                    replacement_text,
+                    resolver,
+                    byte_width,
+                    same_length,
                 )
 
     # Calculate widths
     old_width = sum(ch.width for ch in match.characters)
     new_width = _calculate_new_width(
-        new_text, page, match.characters[0].font_name,
-        match.characters[0].font_size, resolver, width_cache,
+        new_text,
+        page,
+        match.characters[0].font_name,
+        match.characters[0].font_size,
+        resolver,
+        width_cache,
     )
     width_delta = new_width - old_width
 
@@ -366,7 +416,10 @@ def _apply_single_replacement(
         last_op_idx = max(match.operator_refs)
         match_y = match.characters[0].page_y
         _adjust_subsequent_positioning(
-            ops, last_op_idx, width_delta, match_y,
+            ops,
+            last_op_idx,
+            width_delta,
+            match_y,
             match.characters[0].font_size,
         )
 
@@ -378,7 +431,7 @@ def _apply_single_replacement(
         success=True,
         original_text=match.matched_text,
         new_text=new_text,
-        font_action="kept",
+        font_action=font_action,
         fidelity_report=FidelityReport(
             font_preserved=True,
             font_substituted=None,
@@ -386,7 +439,7 @@ def _apply_single_replacement(
             reflow_applied=False,
             glyphs_missing=[],
         ),
-    )
+    ), resolver
 
 
 def _modify_tj_operator(
@@ -476,6 +529,7 @@ def replace(
     output_path: str,
     *,
     dry_run: bool = False,
+    reflow: bool = True,
 ) -> EditResult:
     """Replace a single text match in a PDF.
 
@@ -485,6 +539,7 @@ def replace(
         new_text: Replacement text.
         output_path: Path for the output PDF.
         dry_run: If True, simulate the edit without writing output.
+        reflow: If True and replacement is wider, reflow the paragraph.
 
     Returns:
         EditResult with fidelity report.
@@ -499,17 +554,82 @@ def replace(
 
     if match.page_number >= len(pdf.pages):
         raise OperatorError(
-            f"Page {match.page_number} out of range "
-            f"(PDF has {len(pdf.pages)} pages)"
+            f"Page {match.page_number} out of range (PDF has {len(pdf.pages)} pages)"
         )
 
     page = pdf.pages[match.page_number]
-    resolver = _get_font_resolver(page, match.characters[0].font_name)
+    font_name = match.characters[0].font_name
+    resolver = _get_font_resolver(page, font_name)
     width_cache = GlyphWidthCache()
+
+    # Check if reflow is needed: replacement wider than original
+    if reflow:
+        try:
+            old_width = sum(ch.width for ch in match.characters)
+            new_width = _calculate_new_width(
+                new_text,
+                page,
+                font_name,
+                match.characters[0].font_size,
+                resolver,
+                width_cache,
+            )
+            # Only reflow if meaningfully wider (>1pt avoids trivial diffs)
+            needs_reflow = new_width > old_width + 1.0
+        except (KeyError, Exception):
+            # Encoding failure — skip reflow, let simple replacement handle it
+            needs_reflow = False
+        if needs_reflow:
+            try:
+                from pdf_edit_engine.locator import _build_index
+                from pdf_edit_engine.reflow import (
+                    _detect_paragraphs_from_index,
+                    find_paragraph_for_match,
+                    reflow_paragraph,
+                )
+
+                elements = _build_index(page, match.page_number)
+                page_width = float(page.MediaBox[2]) if page.MediaBox else 612.0
+                paragraphs = _detect_paragraphs_from_index(
+                    elements,
+                    page_width,
+                )
+                para = find_paragraph_for_match(paragraphs, match)
+
+                if para is not None:
+                    font_key = font_name if font_name.startswith("/") else f"/{font_name}"
+                    font_ref = page["/Resources"]["/Font"][font_key]
+                    result = reflow_paragraph(
+                        pdf,
+                        page,
+                        para,
+                        match,
+                        new_text,
+                        resolver,
+                        font_ref,
+                    )
+                    if result.success and not dry_run:
+                        pdf.save(output_path)
+                    pdf.close()
+                    _invalidate_locator_cache()
+                    return result
+            except Exception:
+                logger.warning(
+                    "Reflow failed, falling back to simple replacement",
+                    exc_info=True,
+                )
+
     ops = list(pikepdf.parse_content_stream(page))
 
-    result = _apply_single_replacement(
-        pdf, page, ops, match, new_text, resolver, width_cache, dry_run,
+    result, _ = _apply_single_replacement(
+        pdf,
+        page,
+        ops,
+        match,
+        new_text,
+        resolver,
+        width_cache,
+        dry_run,
     )
 
     if result.success and not dry_run:
@@ -567,7 +687,8 @@ def replace_all(
         page = pdf.pages[page_num]
         ops = list(pikepdf.parse_content_stream(page))
         resolver = _get_font_resolver(
-            page, matches_by_page[page_num][0].characters[0].font_name,
+            page,
+            matches_by_page[page_num][0].characters[0].font_name,
         )
 
         # Sort matches in reverse operator order to preserve indices
@@ -579,8 +700,15 @@ def replace_all(
 
         page_results: list[EditResult] = []
         for m in page_matches:
-            result = _apply_single_replacement(
-                pdf, page, ops, m, replacement, resolver, width_cache, dry_run,
+            result, resolver = _apply_single_replacement(
+                pdf,
+                page,
+                ops,
+                m,
+                replacement,
+                resolver,
+                width_cache,
+                dry_run,
             )
             page_results.append(result)
             if result.success:
@@ -662,18 +790,27 @@ def batch_replace(
             # Skip if operators overlap with already-processed match on same page
             op_set = set(m.operator_refs)
             if op_set & used_ops_by_page[page_num]:
-                edit_results[edit_idx].append(EditResult(
-                    success=False,
-                    original_text=m.matched_text,
-                    new_text=repl,
-                    font_action="kept",
-                    warnings=["Skipped: overlapping with previous edit"],
-                ))
+                edit_results[edit_idx].append(
+                    EditResult(
+                        success=False,
+                        original_text=m.matched_text,
+                        new_text=repl,
+                        font_action="kept",
+                        warnings=["Skipped: overlapping with previous edit"],
+                    )
+                )
                 continue
 
             resolver = _get_font_resolver(page, m.characters[0].font_name)
-            result = _apply_single_replacement(
-                pdf, page, ops, m, repl, resolver, width_cache, dry_run,
+            result, resolver = _apply_single_replacement(
+                pdf,
+                page,
+                ops,
+                m,
+                repl,
+                resolver,
+                width_cache,
+                dry_run,
             )
             edit_results[edit_idx].append(result)
             if result.success:
@@ -697,13 +834,15 @@ def batch_replace(
             # Use the first result for this edit
             results.append(edit_results[edit_idx][0])
         else:
-            results.append(EditResult(
-                success=False,
-                original_text=edits[edit_idx].find,
-                new_text=edits[edit_idx].replace,
-                font_action="kept",
-                warnings=["No matches found"],
-            ))
+            results.append(
+                EditResult(
+                    success=False,
+                    original_text=edits[edit_idx].find,
+                    new_text=edits[edit_idx].replace,
+                    font_action="kept",
+                    warnings=["No matches found"],
+                )
+            )
 
     return results
 
@@ -711,5 +850,6 @@ def batch_replace(
 def _invalidate_locator_cache() -> None:
     """Clear the locator module's content element cache."""
     from pdf_edit_engine import locator
+
     locator._cached_path = None  # noqa: SLF001
     locator._cached_elements = {}  # noqa: SLF001

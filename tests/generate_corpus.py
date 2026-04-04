@@ -67,6 +67,28 @@ MANIFEST: list[dict[str, object]] = [
         "features": ["AcroForm fields"],
         "expected_text": "Please fill out this form",
     },
+    # Manual corpus PDFs (not auto-generated, placed by user)
+    {
+        "filename": "chrome_webpage.pdf",
+        "generator": "Chrome",
+        "encoding": "Identity-H",
+        "features": ["CIDFont", "real-world", "multi-page", "multiple font families"],
+        "expected_text": "Quarterly Report",
+    },
+    {
+        "filename": "word_document.pdf",
+        "generator": "Microsoft Word",
+        "encoding": "Identity-H",
+        "features": ["CIDFont", "real-world", "subsetted fonts"],
+        "expected_text": "Software Developer",
+    },
+    {
+        "filename": "gdocs_document.pdf",
+        "generator": "Google Docs",
+        "encoding": "Identity-H",
+        "features": ["CIDFont", "real-world", "multiple font families"],
+        "expected_text": "EXPERIENCE",
+    },
 ]
 
 
@@ -125,20 +147,26 @@ def generate_reportlab_table(output: Path) -> None:
     ]
 
     table = Table(data, colWidths=[2 * inch, 2 * inch, 2 * inch])
-    table.setStyle(TableStyle([
-        ("GRID", (0, 0), (-1, -1), 1, colors.black),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
-    ]))
+    table.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 1, colors.black),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+            ]
+        )
+    )
     elements.append(table)
     elements.append(Spacer(1, 20))
 
     # Paragraph below table
-    elements.append(Paragraph(
-        "Total revenue exceeded expectations.",
-        styles["Normal"],
-    ))
+    elements.append(
+        Paragraph(
+            "Total revenue exceeded expectations.",
+            styles["Normal"],
+        )
+    )
 
     doc.build(elements)
 

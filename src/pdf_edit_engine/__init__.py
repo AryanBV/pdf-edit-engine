@@ -18,10 +18,11 @@ from pdf_edit_engine.models import (
     FidelityReport,
     FontInfo,
     GraphicsStateSnapshot,
+    Paragraph,
     TextCharacter,
     TextMatch,
 )
-from pdf_edit_engine.reflow import reflow_paragraph
+from pdf_edit_engine.reflow import detect_paragraphs, reflow_paragraph
 from pdf_edit_engine.surgeon import batch_replace, replace, replace_all
 from pdf_edit_engine.wrapper import (
     add_bookmark,
@@ -55,7 +56,9 @@ __all__ = [
     "can_render",
     "extend_subset",
     # reflow
+    "detect_paragraphs",
     "reflow_paragraph",
+    "Paragraph",
     # wrapper
     "merge_pdfs",
     "split_pdf",

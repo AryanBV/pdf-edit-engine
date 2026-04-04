@@ -43,7 +43,9 @@ class TJReconstructed:
     fragments: list[TJFragment]
 
     def locate_in_fragments(
-        self, start: int, end: int,
+        self,
+        start: int,
+        end: int,
     ) -> list[tuple[TJFragment, int, int]]:
         """Map a character range in full_text back to specific fragments.
 
@@ -107,13 +109,15 @@ class TJReconstructor:
                     continue
                 if not decoded:
                     continue
-                fragments.append(TJFragment(
-                    text=decoded,
-                    raw_bytes=raw,
-                    array_index=array_index,
-                    char_offset=char_offset,
-                    kerning_before=pending_kerning,
-                ))
+                fragments.append(
+                    TJFragment(
+                        text=decoded,
+                        raw_bytes=raw,
+                        array_index=array_index,
+                        char_offset=char_offset,
+                        kerning_before=pending_kerning,
+                    )
+                )
                 char_offset += len(decoded)
                 pending_kerning = 0.0
             elif isinstance(item, (int, float)):

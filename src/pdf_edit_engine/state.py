@@ -123,19 +123,21 @@ class GraphicsStateTracker:
 
     def save(self) -> None:
         """Push current state onto the graphics state stack (q operator)."""
-        self._state_stack.append({
-            "ctm": self._ctm,
-            "fill_color": self._fill_color,
-            "stroke_color": self._stroke_color,
-            "font_name": self._font_name,
-            "font_size": self._font_size,
-            "char_spacing": self._char_spacing,
-            "word_spacing": self._word_spacing,
-            "horiz_scaling": self._horiz_scaling,
-            "leading": self._leading,
-            "text_render_mode": self._text_render_mode,
-            "text_rise": self._text_rise,
-        })
+        self._state_stack.append(
+            {
+                "ctm": self._ctm,
+                "fill_color": self._fill_color,
+                "stroke_color": self._stroke_color,
+                "font_name": self._font_name,
+                "font_size": self._font_size,
+                "char_spacing": self._char_spacing,
+                "word_spacing": self._word_spacing,
+                "horiz_scaling": self._horiz_scaling,
+                "leading": self._leading,
+                "text_render_mode": self._text_render_mode,
+                "text_rise": self._text_rise,
+            }
+        )
 
     def restore(self) -> None:
         """Pop state from the graphics state stack (Q operator)."""
@@ -195,11 +197,7 @@ class GraphicsStateTracker:
             char_code: The character code (word spacing applied if 0x0020).
         """
         tw = self._word_spacing if char_code == 0x0020 else 0.0
-        tx = (
-            glyph_width * self._font_size
-            + self._char_spacing
-            + tw
-        ) * self._horiz_scaling
+        tx = (glyph_width * self._font_size + self._char_spacing + tw) * self._horiz_scaling
 
         a, b, c, d, e, f = self._text_matrix
         self._text_matrix = (a, b, c, d, tx * a + e, tx * b + f)
@@ -254,8 +252,14 @@ class GraphicsStateTracker:
     # ── Operator handlers ───────────────────────────────────────────────
 
     def _handle_cm(self, operands: list[object]) -> None:
-        m = (_f(operands[0]), _f(operands[1]), _f(operands[2]),
-             _f(operands[3]), _f(operands[4]), _f(operands[5]))
+        m = (
+            _f(operands[0]),
+            _f(operands[1]),
+            _f(operands[2]),
+            _f(operands[3]),
+            _f(operands[4]),
+            _f(operands[5]),
+        )
         self._ctm = _mat_mult(m, self._ctm)
 
     def _handle_bt(self, operands: list[object]) -> None:
@@ -266,15 +270,26 @@ class GraphicsStateTracker:
         pass
 
     def _handle_tm(self, operands: list[object]) -> None:
-        m = (_f(operands[0]), _f(operands[1]), _f(operands[2]),
-             _f(operands[3]), _f(operands[4]), _f(operands[5]))
+        m = (
+            _f(operands[0]),
+            _f(operands[1]),
+            _f(operands[2]),
+            _f(operands[3]),
+            _f(operands[4]),
+            _f(operands[5]),
+        )
         self._text_matrix = m
         self._text_line_matrix = m
 
     def _handle_td(self, operands: list[object]) -> None:
         tx, ty = _f(operands[0]), _f(operands[1])
         translation: tuple[float, float, float, float, float, float] = (
-            1.0, 0.0, 0.0, 1.0, tx, ty,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            tx,
+            ty,
         )
         new_matrix = _mat_mult(translation, self._text_line_matrix)
         self._text_matrix = new_matrix
@@ -326,12 +341,18 @@ class GraphicsStateTracker:
 
     def _handle_k(self, operands: list[object]) -> None:
         self._fill_color = (
-            _f(operands[0]), _f(operands[1]), _f(operands[2]), _f(operands[3]),
+            _f(operands[0]),
+            _f(operands[1]),
+            _f(operands[2]),
+            _f(operands[3]),
         )
 
     def _handle_k_upper(self, operands: list[object]) -> None:
         self._stroke_color = (
-            _f(operands[0]), _f(operands[1]), _f(operands[2]), _f(operands[3]),
+            _f(operands[0]),
+            _f(operands[1]),
+            _f(operands[2]),
+            _f(operands[3]),
         )
 
     def _handle_cs(self, operands: list[object]) -> None:

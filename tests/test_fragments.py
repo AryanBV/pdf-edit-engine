@@ -61,9 +61,12 @@ class TestTJReconstructor:
     def test_kerned_fragments_join(self) -> None:
         r = _make_reconstructor()
         tj: list[object] = [
-            _make_string("Do"), -29,
-            _make_string("c"), -1,
-            _make_string("umen"), 30,
+            _make_string("Do"),
+            -29,
+            _make_string("c"),
+            -1,
+            _make_string("umen"),
+            30,
             _make_string("tation"),
         ]
         result = r.reconstruct(tj)
@@ -72,8 +75,10 @@ class TestTJReconstructor:
     def test_kerning_values_preserved(self) -> None:
         r = _make_reconstructor()
         tj: list[object] = [
-            _make_string("Do"), -29,
-            _make_string("c"), -1,
+            _make_string("Do"),
+            -29,
+            _make_string("c"),
+            -1,
             _make_string("umen"),
         ]
         result = r.reconstruct(tj)
@@ -84,8 +89,10 @@ class TestTJReconstructor:
     def test_char_offsets_sequential(self) -> None:
         r = _make_reconstructor()
         tj: list[object] = [
-            _make_string("AB"), -10,
-            _make_string("CD"), -5,
+            _make_string("AB"),
+            -10,
+            _make_string("CD"),
+            -5,
             _make_string("EF"),
         ]
         result = r.reconstruct(tj)
@@ -97,7 +104,8 @@ class TestTJReconstructor:
     def test_empty_fragment_skipped(self) -> None:
         r = _make_reconstructor()
         tj: list[object] = [
-            _make_string(""), -50,
+            _make_string(""),
+            -50,
             _make_string("text"),
         ]
         result = r.reconstruct(tj)
@@ -114,10 +122,14 @@ class TestTJReconstructor:
     def test_single_char_fragments(self) -> None:
         r = _make_reconstructor()
         tj: list[object] = [
-            _make_string("H"), -5,
-            _make_string("e"), -3,
-            _make_string("l"), -2,
-            _make_string("l"), -1,
+            _make_string("H"),
+            -5,
+            _make_string("e"),
+            -3,
+            _make_string("l"),
+            -2,
+            _make_string("l"),
+            -1,
             _make_string("o"),
         ]
         result = r.reconstruct(tj)
@@ -154,9 +166,12 @@ class TestLocateInFragments:
     def doc_result(self) -> TJReconstructed:
         r = _make_reconstructor()
         tj: list[object] = [
-            _make_string("Do"), -29,
-            _make_string("c"), -1,
-            _make_string("umen"), 30,
+            _make_string("Do"),
+            -29,
+            _make_string("c"),
+            -1,
+            _make_string("umen"),
+            30,
             _make_string("tation"),
         ]
         return r.reconstruct(tj)
