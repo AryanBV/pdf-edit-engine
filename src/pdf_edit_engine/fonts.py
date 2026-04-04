@@ -235,6 +235,41 @@ def _rebuild_w_array(all_widths: dict[int, float]) -> pikepdf.Array:
     return pikepdf.Array(items)
 
 
+def _update_cid_to_gid_map(
+    cid_font: pikepdf.Object,
+    new_mappings: dict[int, int],
+    pdf: pikepdf.Pdf,
+) -> None:
+    """Update CIDToGIDMap stream with new CID→GID entries.
+
+    For Identity-H fonts with CIDToGIDMap = /Identity (a Name), no update is
+    needed. Only updates when CIDToGIDMap is an explicit binary stream.
+
+    Args:
+        cid_font: The CIDFont dictionary containing /CIDToGIDMap.
+        new_mappings: Dict of {CID: GID} to add.
+        pdf: The open PDF for creating the updated stream.
+    """
+    if not new_mappings:
+        return
+    cidtogidmap = cid_font.get("/CIDToGIDMap")
+    if cidtogidmap is None or isinstance(cidtogidmap, pikepdf.Name):
+        return  # /Identity or absent — implicit identity mapping
+
+    # Explicit stream — update the binary CID→GID table
+    data = bytearray(cidtogidmap.read_bytes())
+
+    for cid, gid in new_mappings.items():
+        offset = cid * 2
+        if offset + 2 > len(data):
+            data.extend(b"\x00" * (offset + 2 - len(data)))
+        data[offset] = (gid >> 8) & 0xFF
+        data[offset + 1] = gid & 0xFF
+
+    cid_font[pikepdf.Name("/CIDToGIDMap")] = pdf.make_stream(bytes(data))
+    logger.info("Updated CIDToGIDMap stream with %d new entries", len(new_mappings))
+
+
 def _detect_postscript_name(fd: pikepdf.Object) -> str:
     """Extract PostScript name from a font descriptor."""
     name_obj = fd.get("/FontName")
@@ -483,6 +518,7 @@ def _extend_tier1(
 
     _append_to_unicode_cmap(font_dict, new_cmap_entries, pdf)
     _append_w_entries(cid_font, new_w_entries)
+    _update_cid_to_gid_map(cid_font, {cid: cid for cid in new_cmap_entries}, pdf)
 
     logger.info(
         "Tier 1 (CMap-only) extension: added %d characters",
@@ -546,6 +582,8 @@ def _extend_tier2(
     all_widths: dict[int, float] = {}
     units_per_em = system_font["head"].unitsPerEm
 
+    glyph_order = system_font.getGlyphOrder()
+
     for cp in sorted(all_unicodes):
         ch = chr(cp)
         if cp in new_cmap:
@@ -560,11 +598,33 @@ def _extend_tier2(
             else:
                 all_widths[gid] = 600.0
 
+    # Preserve ligature entries from original ToUnicode CMap.
+    # Ligatures map one CID to multiple Unicode chars (e.g., CID 302 → "fi").
+    # The single-char rebuild above only creates 1:1 mappings, losing ligatures.
+    for cid, ustr in existing_mappings.items():
+        if (
+            len(ustr) > 1
+            and cid not in all_mappings
+            and cid < len(glyph_order)
+            and glyph_order[cid] != ".notdef"
+        ):
+            gn = glyph_order[cid]
+            all_mappings[cid] = ustr
+            # Get width from hmtx for this glyph
+            if "hmtx" in system_font and gn in system_font["hmtx"].metrics:
+                raw_w = float(system_font["hmtx"].metrics[gn][0])
+                all_widths[cid] = raw_w * 1000.0 / units_per_em
+
     # Rebuild ToUnicode CMap from scratch
     font_dict["/ToUnicode"] = pdf.make_stream(_rebuild_to_unicode_cmap(all_mappings))
 
     # Rebuild /W array from scratch
     cid_font["/W"] = _rebuild_w_array(all_widths)
+
+    # Update CIDToGIDMap if it's an explicit stream (not /Identity)
+    _update_cid_to_gid_map(
+        cid_font, {gid: gid for gid in all_mappings}, pdf,
+    )
 
     # Update font descriptor metrics from system font's OS/2 table
     # Normalize to PDF 1/1000-em scale (same as /W widths)
