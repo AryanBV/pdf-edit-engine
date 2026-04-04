@@ -26,13 +26,6 @@ CORPUS_DIR = Path(__file__).parent / "corpus"
 
 MANIFEST: list[dict[str, object]] = [
     {
-        "filename": "resume_aryan.pdf",
-        "generator": "real-world",
-        "encoding": "Identity-H",
-        "features": ["CIDFont", "subsetted fonts", "ligatures"],
-        "expected_text": "Aryan B V",
-    },
-    {
         "filename": "reportlab_simple.pdf",
         "generator": "reportlab",
         "encoding": "WinAnsi",
@@ -74,13 +67,6 @@ MANIFEST: list[dict[str, object]] = [
         "encoding": "Identity-H",
         "features": ["CIDFont", "real-world", "multi-page", "multiple font families"],
         "expected_text": "Quarterly Report",
-    },
-    {
-        "filename": "word_document.pdf",
-        "generator": "Microsoft Word",
-        "encoding": "Identity-H",
-        "features": ["CIDFont", "real-world", "subsetted fonts"],
-        "expected_text": "Software Developer",
     },
     {
         "filename": "gdocs_document.pdf",

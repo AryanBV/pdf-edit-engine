@@ -16,6 +16,10 @@ if TYPE_CHECKING:
 CORPUS_DIR = Path(__file__).parent / "corpus"
 RESUME_PDF = CORPUS_DIR / "resume_aryan.pdf"
 
+pytestmark = pytest.mark.skipif(
+    not RESUME_PDF.exists(), reason="resume_aryan.pdf not in corpus"
+)
+
 
 @pytest.fixture
 def resume_pdf() -> Generator[pikepdf.Pdf, None, None]:

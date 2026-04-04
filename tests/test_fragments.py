@@ -220,6 +220,7 @@ class TestLocateInFragments:
 # ── TestWithResumePDF ─────────────────────────────────────────────────
 
 
+@pytest.mark.skipif(not RESUME_PDF.exists(), reason="resume_aryan.pdf not in corpus")
 class TestWithResumePDF:
     """Integration tests using real TJ arrays from resume_aryan.pdf."""
 

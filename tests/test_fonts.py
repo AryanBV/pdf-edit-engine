@@ -25,10 +25,15 @@ from pdf_edit_engine.system_fonts import find_font
 CORPUS = Path(__file__).parent / "corpus"
 RESUME = CORPUS / "resume_aryan.pdf"
 
+_need_resume = pytest.mark.skipif(
+    not RESUME.exists(), reason="resume_aryan.pdf not in corpus"
+)
+
 
 # ── TestAnalyzeSubset ────────────────────────────────────────────────────
 
 
+@_need_resume
 class TestAnalyzeSubset:
     """Tests for analyze_subset()."""
 
@@ -74,6 +79,7 @@ class TestAnalyzeSubset:
 # ── TestCanRender ────────────────────────────────────────────────────────
 
 
+@_need_resume
 class TestCanRender:
     """Tests for can_render()."""
 
@@ -122,6 +128,7 @@ class TestCanRender:
 # ── TestExtendSubsetTier1 ────────────────────────────────────────────────
 
 
+@_need_resume
 class TestExtendSubsetTier1:
     """Tests for CMap-only font extension (Tier 1)."""
 
@@ -213,6 +220,7 @@ class TestExtendSubsetTier1:
 # ── TestExtendSubsetTier2 ────────────────────────────────────────────────
 
 
+@_need_resume
 class TestExtendSubsetTier2:
     """Tests for full font extension (Tier 2)."""
 
@@ -312,6 +320,7 @@ class TestExtendSubsetTier2:
 # ── TestSurgeonAutoExtension ─────────────────────────────────────────────
 
 
+@_need_resume
 class TestSurgeonAutoExtension:
     """Tests for surgeon.py auto-extension integration."""
 

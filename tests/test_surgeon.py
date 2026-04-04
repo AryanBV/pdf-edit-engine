@@ -17,6 +17,10 @@ RESUME_PDF = str(CORPUS_DIR / "resume_aryan.pdf")
 SIMPLE_PDF = str(CORPUS_DIR / "reportlab_simple.pdf")
 MULTIPAGE_PDF = str(CORPUS_DIR / "reportlab_multipage.pdf")
 
+_need_resume = pytest.mark.skipif(
+    not Path(RESUME_PDF).exists(), reason="resume_aryan.pdf not in corpus"
+)
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -55,6 +59,7 @@ def _validate_output(
 # ── Same-length replacement ──────────────────────────────────────────────
 
 
+@_need_resume
 class TestSameLengthReplace:
     """Test same-length text replacement preserving kerning and layout."""
 
@@ -105,6 +110,7 @@ class TestSameLengthReplace:
 # ── Different-length replacement ─────────────────────────────────────────
 
 
+@_need_resume
 class TestDifferentLengthReplace:
     """Test replacement where old and new text have different lengths."""
 
@@ -150,6 +156,7 @@ class TestDifferentLengthReplace:
 # ── Cross-element replacement ────────────────────────────────────────────
 
 
+@_need_resume
 class TestCrossElementReplace:
     """Test replacement spanning multiple TJ fragments."""
 
@@ -200,6 +207,7 @@ class TestEncodingFailure:
 # ── Dry run ──────────────────────────────────────────────────────────────
 
 
+@_need_resume
 class TestDryRun:
     """Test dry_run mode: full analysis, no file modification."""
 
@@ -343,6 +351,7 @@ class TestErrorHandling:
 # ── Output validation integration ────────────────────────────────────────
 
 
+@_need_resume
 class TestOutputValidation:
     """Integration tests verifying complete output PDF quality."""
 

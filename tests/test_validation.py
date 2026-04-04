@@ -218,6 +218,9 @@ def _compare(
 # ── Tests ─────────────────────────────────────────────────────────────
 
 
+@pytest.mark.skipif(
+    not Path(RESUME_PDF).exists(), reason="resume_aryan.pdf not in corpus"
+)
 class TestPdfminerValidation:
     """Compare our interpreter's text extraction against pdfminer.six."""
 

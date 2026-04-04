@@ -224,12 +224,11 @@ The test suite validates against PDFs from multiple generators:
 | Generator | Encoding | Character Agreement |
 |-----------|----------|-------------------|
 | Chrome (Print to PDF) | Identity-H | 100% |
-| Microsoft Word | Identity-H | 100% |
 | Google Docs | Identity-H | 100% |
-| reportlab | WinAnsi | 100% |
+| reportlab (4 variants) | WinAnsi | 100% |
 | pikepdf (synthetic) | WinAnsi | 100% |
 
-384 tests, 85% code coverage.
+85% code coverage.
 
 ## Comparison with PyMuPDF
 

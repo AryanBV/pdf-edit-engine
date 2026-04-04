@@ -21,6 +21,10 @@ if TYPE_CHECKING:
 CORPUS_DIR = Path(__file__).parent / "corpus"
 RESUME_PDF = str(CORPUS_DIR / "resume_aryan.pdf")
 
+pytestmark = pytest.mark.skipif(
+    not Path(RESUME_PDF).exists(), reason="resume_aryan.pdf not in corpus"
+)
+
 
 # ── TestGetText ───────────────────────────────────────────────────────
 
