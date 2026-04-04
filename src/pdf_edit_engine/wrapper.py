@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pikepdf
 
+from pdf_edit_engine._pathutil import validate_output_dir, validate_output_path
 from pdf_edit_engine.errors import PDFEditError
 
 # --- Page operations ---
@@ -21,6 +22,7 @@ def merge_pdfs(pdf_paths: list[str], output_path: str) -> str:
     Returns:
         Path to the output file.
     """
+    validate_output_path(output_path)
     if not pdf_paths:
         msg = "No PDF paths provided"
         raise PDFEditError(msg)
@@ -42,6 +44,7 @@ def split_pdf(pdf_path: str, output_dir: str) -> list[str]:
     Returns:
         List of paths to the output page PDFs.
     """
+    validate_output_dir(output_dir)
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     pdf = pikepdf.Pdf.open(pdf_path)
@@ -66,6 +69,7 @@ def reorder_pages(pdf_path: str, page_order: list[int], output_path: str) -> str
     Returns:
         Path to the output file.
     """
+    validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
     new_pdf = pikepdf.Pdf.new()
     for i in page_order:
@@ -86,6 +90,7 @@ def rotate_pages(pdf_path: str, pages: list[int], angle: int, output_path: str) 
     Returns:
         Path to the output file.
     """
+    validate_output_path(output_path)
     if angle not in (90, 180, 270):
         msg = f"Angle must be 90, 180, or 270, got {angle}"
         raise PDFEditError(msg)
@@ -110,6 +115,7 @@ def delete_pages(pdf_path: str, pages: list[int], output_path: str) -> str:
     Returns:
         Path to the output file.
     """
+    validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
     for i in sorted(pages, reverse=True):
         del pdf.pages[i]
@@ -132,6 +138,7 @@ def crop_pages(
     Returns:
         Path to the output file.
     """
+    validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
     for page in pdf.pages:
         page["/CropBox"] = pikepdf.Array(
@@ -157,6 +164,7 @@ def edit_metadata(pdf_path: str, metadata: dict[str, str], output_path: str) -> 
     Returns:
         Path to the output file.
     """
+    validate_output_path(output_path)
     _simple_to_xmp = {
         "title": "dc:title",
         "author": "dc:creator",
@@ -184,6 +192,7 @@ def add_bookmark(pdf_path: str, title: str, page: int, output_path: str) -> str:
     Returns:
         Path to the output file.
     """
+    validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
     with pdf.open_outline() as outline:
         outline.root.append(pikepdf.OutlineItem(title, page))
@@ -208,6 +217,7 @@ def encrypt_pdf(
     Returns:
         Path to the output file.
     """
+    validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
     pdf.save(
         output_path,
@@ -227,6 +237,7 @@ def decrypt_pdf(pdf_path: str, password: str, output_path: str) -> str:
     Returns:
         Path to the output file.
     """
+    validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path, password=password)
     pdf.save(output_path)
     return output_path
@@ -254,6 +265,7 @@ def add_hyperlink(
     Returns:
         Path to the output file.
     """
+    validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
     target_page = pdf.pages[page]
     annot = pdf.make_indirect(
@@ -300,6 +312,7 @@ def add_highlight(
     Returns:
         Path to the output file.
     """
+    validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
     target_page = pdf.pages[page]
     # Derive bounding rect from quad points
@@ -343,6 +356,7 @@ def flatten_annotations(pdf_path: str, output_path: str) -> str:
     Returns:
         Path to the output file.
     """
+    validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
     for page in pdf.pages:
         page_obj = page.obj
@@ -370,6 +384,7 @@ def fill_form(pdf_path: str, field_values: dict[str, str], output_path: str) -> 
     Returns:
         Path to the output file.
     """
+    validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
     if "/AcroForm" not in pdf.Root:
         msg = "PDF has no AcroForm"
@@ -405,6 +420,7 @@ def add_watermark(pdf_path: str, watermark_path: str, output_path: str) -> str:
     Returns:
         Path to the output file.
     """
+    validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
     watermark = pikepdf.Pdf.open(watermark_path)
     watermark_page = watermark.pages[0]

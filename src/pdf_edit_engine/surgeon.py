@@ -8,6 +8,7 @@ from typing import Any
 
 import pikepdf
 
+from pdf_edit_engine._pathutil import validate_output_path
 from pdf_edit_engine.encoding import FontResolver, FontResolverCache
 from pdf_edit_engine.errors import FontNotFoundError, OperatorError, PDFEditError
 from pdf_edit_engine.models import (
@@ -548,6 +549,8 @@ def replace(
         PDFEditError: If the PDF is encrypted.
         OperatorError: If operator references are stale or invalid.
     """
+    if not dry_run:
+        validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
     if pdf.is_encrypted:
         raise PDFEditError("Cannot edit encrypted PDF")
@@ -663,6 +666,8 @@ def replace_all(
     Returns:
         List of EditResult objects, one per match.
     """
+    if not dry_run:
+        validate_output_path(output_path)
     from pdf_edit_engine.locator import find
 
     matches = find(pdf_path, search)
@@ -749,6 +754,8 @@ def batch_replace(
     Returns:
         List of EditResult objects, one per edit.
     """
+    if not dry_run:
+        validate_output_path(output_path)
     from pdf_edit_engine.locator import find
 
     pdf = pikepdf.Pdf.open(pdf_path)

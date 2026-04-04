@@ -70,6 +70,7 @@ class TestMultipleContentStreams:
         Strategy: generate a single-page PDF with reportlab, then split
         its content stream into two separate stream objects.
         """
+        pytest.importorskip("reportlab")
         from reportlab.lib.pagesizes import letter
         from reportlab.pdfgen import canvas
 
