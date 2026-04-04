@@ -472,11 +472,13 @@ def _extend_tier1(
 
         new_cmap_entries[cid] = ch
 
-        # Get advance width from hmtx
+        # Get advance width from hmtx, normalized to PDF 1/1000-em scale
         if "hmtx" in embedded_font and glyph_name in embedded_font["hmtx"].metrics:
-            width = float(embedded_font["hmtx"].metrics[glyph_name][0])
+            raw_width = float(embedded_font["hmtx"].metrics[glyph_name][0])
+            units_per_em = embedded_font["head"].unitsPerEm
+            width = raw_width * 1000.0 / units_per_em
         else:
-            width = 600.0  # fallback
+            width = 600.0  # fallback (already in 1/1000-em scale)
         new_w_entries[cid] = width
 
     _append_to_unicode_cmap(font_dict, new_cmap_entries, pdf)
@@ -542,6 +544,7 @@ def _extend_tier2(
     new_cmap = system_font.getBestCmap() or {}
     all_mappings: dict[int, str] = {}
     all_widths: dict[int, float] = {}
+    units_per_em = system_font["head"].unitsPerEm
 
     for cp in sorted(all_unicodes):
         ch = chr(cp)
@@ -550,9 +553,10 @@ def _extend_tier2(
             gid = system_font.getGlyphID(glyph_name)
             # Identity-H: CID = GID
             all_mappings[gid] = ch
-            # Width from hmtx
+            # Width from hmtx, normalized to PDF 1/1000-em scale
             if "hmtx" in system_font and glyph_name in system_font["hmtx"].metrics:
-                all_widths[gid] = float(system_font["hmtx"].metrics[glyph_name][0])
+                raw_w = float(system_font["hmtx"].metrics[glyph_name][0])
+                all_widths[gid] = raw_w * 1000.0 / units_per_em
             else:
                 all_widths[gid] = 600.0
 
@@ -563,12 +567,13 @@ def _extend_tier2(
     cid_font["/W"] = _rebuild_w_array(all_widths)
 
     # Update font descriptor metrics from system font's OS/2 table
+    # Normalize to PDF 1/1000-em scale (same as /W widths)
     if "OS/2" in system_font:
         os2 = system_font["OS/2"]
-        fd["/Ascent"] = int(os2.sTypoAscender)
-        fd["/Descent"] = int(os2.sTypoDescender)
+        fd["/Ascent"] = int(os2.sTypoAscender * 1000 / units_per_em)
+        fd["/Descent"] = int(os2.sTypoDescender * 1000 / units_per_em)
         if hasattr(os2, "sCapHeight"):
-            fd["/CapHeight"] = int(os2.sCapHeight)
+            fd["/CapHeight"] = int(os2.sCapHeight * 1000 / units_per_em)
 
     system_font.close()
 

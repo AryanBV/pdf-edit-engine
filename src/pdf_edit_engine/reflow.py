@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,9 @@ logger = logging.getLogger(__name__)
 _Ops = list[Any]
 
 _TEXT_OPS = frozenset({"Tj", "TJ", "'", '"'})
+
+# Bullet/list-item markers — matches lines starting with •, -, *, or numbered lists (1., 2), etc.)
+_BULLET_RE = re.compile(r"^\s*([•\-\*]|\d+[.\)])\s")
 
 
 # ── Width helpers ─────────────────────────────────────────────────────
@@ -232,11 +236,23 @@ def _build_paragraph(
     else:
         line_height = font_size * 1.2
 
-    # Full text: join line texts
+    # Full text: join elements using position-aware spacing so that
+    # adjacent elements (gap < half a space width) are joined without
+    # extra space, matching pdfminer's extraction output.
+    space_width = font_size * 0.25  # approximate half-space threshold
     line_texts: list[str] = []
     for line in lines:
-        parts = [e.text_content for e in line if e.text_content]
-        line_texts.append(" ".join(parts))
+        text_parts: list[str] = []
+        prev_end_x: float | None = None
+        for e in line:
+            if not e.text_content or not e.characters:
+                continue
+            curr_start_x = e.characters[0].page_x
+            if prev_end_x is not None and (curr_start_x - prev_end_x) > space_width:
+                text_parts.append(" ")
+            text_parts.append(e.text_content)
+            prev_end_x = e.characters[-1].page_x + e.characters[-1].width
+        line_texts.append("".join(text_parts))
     full_text = "\n".join(line_texts)
 
     # Operator indices: specific indices, not a range
@@ -297,7 +313,9 @@ def _detect_paragraphs_from_index(
         prev_y = prev_chars[0].page_y
         curr_y = curr_chars[0].page_y
         curr_x = curr_chars[0].page_x
-        prev_x = prev_chars[0].page_x
+        # Compare x against group start, not last element — avoids false breaks
+        # when multi-element lines end far right of where continuation starts.
+        group_start_x = current_group[0].characters[0].page_x  # type: ignore[index]
 
         should_break = False
 
@@ -311,8 +329,14 @@ def _detect_paragraphs_from_index(
             should_break = True
 
         # X-start jump (only for elements on different lines)
-        if not should_break and y_gap > curr_size * 0.5 and abs(curr_x - prev_x) > 50.0:
+        if not should_break and y_gap > curr_size * 0.5 and abs(curr_x - group_start_x) > 50.0:
             should_break = True
+
+        # Bullet boundary — new bullet on a different line starts a new paragraph
+        if not should_break and y_gap > curr_size * 0.3:
+            curr_text = elem.text_content or ""
+            if _BULLET_RE.match(curr_text):
+                should_break = True
 
         if should_break:
             paragraphs.append(_build_paragraph(current_group))
@@ -638,10 +662,12 @@ def reflow_paragraph(
     """
     from typing import Literal as Lit
 
-    # 1. Substitute text in paragraph
+    # 1. Substitute text in paragraph, then join lines for proper reflow.
+    # The \n in full_text are artifacts of element grouping, not hard breaks.
     new_para_text = paragraph.full_text.replace(match.matched_text, new_text, 1)
+    new_para_text = new_para_text.replace("\n", " ")
 
-    # 2. Break into lines first (removes \n characters that fonts can't encode)
+    # 2. Break into lines (re-wraps the continuous text to paragraph width)
     lines = break_into_lines(
         new_para_text,
         paragraph.paragraph_width,
