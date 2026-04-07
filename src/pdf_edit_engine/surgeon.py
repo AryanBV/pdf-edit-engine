@@ -479,19 +479,20 @@ def _apply_single_replacement(
         for op_idx in sorted_ops[1:]:
             op_replacement_map[op_idx] = ""
 
-    # Merge single-char operators into adjacent multi-char operators.
-    # Single-char operators (em-dashes, spaces, hyphens) have fixed Tm positions
-    # sized for the original character. When replacement text assigns a different
-    # character to that slot, the inter-operator gap causes visible artifacts.
-    # Merging lets the multi-char operator's text flow naturally past its boundary
+    # Merge narrow operators (1-2 chars) into adjacent wide operators.
+    # Narrow operators (em-dashes, spaces, hyphens, "| ") have fixed Tm positions
+    # sized for the original character(s). When replacement text assigns different
+    # characters to that slot, the inter-operator gap causes visible artifacts.
+    # Merging lets the wide operator's text flow naturally past its boundary
     # (PDF does not clip text at operator boundaries).
+    _MERGE_THRESHOLD = 2  # merge operators with <= this many chars
     merged_width_bonus: dict[int, float] = {}
     if len(sorted_ops) > 1:
         last_multi: int | None = None
         deferred: list[int] = []
         for op_idx in sorted_ops:
             n = len(chars_by_op[op_idx])
-            if n > 1:
+            if n > _MERGE_THRESHOLD:
                 # Absorb any deferred leading single-char ops (prepend)
                 if deferred:
                     prefix = "".join(op_replacement_map.get(s, "") for s in deferred)
@@ -502,15 +503,15 @@ def _apply_single_replacement(
                         op_replacement_map[s] = ""
                     deferred = []
                 last_multi = op_idx
-            elif n == 1 and last_multi is not None:
-                # Append to preceding multi-char operator
+            elif n <= _MERGE_THRESHOLD and last_multi is not None:
+                # Append to preceding wide operator
                 op_replacement_map[last_multi] += op_replacement_map.get(op_idx, "")
                 bonus = sum(ch.width for ch in chars_by_op[op_idx])
                 merged_width_bonus[last_multi] = (
                     merged_width_bonus.get(last_multi, 0.0) + bonus
                 )
                 op_replacement_map[op_idx] = ""
-            elif n == 1:
+            elif n <= _MERGE_THRESHOLD:
                 deferred.append(op_idx)
 
     # For merged operators, compute the target width as the Tm gap to the next
