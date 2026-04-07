@@ -143,22 +143,34 @@ def _encode_with_kerning(
             text[:20],
         )
 
-    per_gap = int(total_kern / num_gaps)
-    residual = round(total_kern) - (per_gap * num_gaps)
+    # Distribute kerning PROPORTIONALLY to each glyph's width.
+    # Uniform distribution causes narrow chars (i, l, t) to overlap because
+    # they absorb the same tightening as wide chars (W, M).  Proportional
+    # distribution gives each glyph kerning proportional to its width, so
+    # the advance ratio (width - kern) / width is constant across all glyphs.
+    kern_values: list[int] = []
+    if replacement_fu > 0 and abs(total_kern) > 0.5:
+        accumulated = 0.0
+        for i in range(num_gaps):
+            w_i = glyph_items[i][1]
+            ideal = total_kern * (w_i / replacement_fu)
+            accumulated += ideal
+            kern_int = round(accumulated) - sum(kern_values)
+            kern_values.append(kern_int)
+    else:
+        kern_values = [0] * num_gaps
 
     # If no kerning needed, emit flat string
-    if per_gap == 0 and residual == 0:
+    if all(k == 0 for k in kern_values):
         flat = b"".join(enc for enc, _ in glyph_items)
         return [pikepdf.String(flat)]
 
-    # Build TJ items: [glyph0, kern, glyph1, kern, ..., glyphN-2, kern+residual, glyphN-1]
+    # Build TJ items: [glyph0, kern0, glyph1, kern1, ..., glyphN-1]
     result: list[object] = []
     for i, (encoded, _) in enumerate(glyph_items):
         result.append(pikepdf.String(encoded))
-        if i < num_gaps:
-            kern = per_gap + residual if i == num_gaps - 1 else per_gap
-            if kern != 0:
-                result.append(kern)
+        if i < num_gaps and kern_values[i] != 0:
+            result.append(kern_values[i])
 
     return result
 
