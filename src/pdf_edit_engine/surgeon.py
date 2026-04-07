@@ -501,16 +501,39 @@ def _apply_single_replacement(
             elif n == 1:
                 deferred.append(op_idx)
 
+    # For merged operators, compute the target width as the Tm gap to the next
+    # non-empty operator.  sum(ch.width) misses inter-operator spacing that the
+    # original Tm positions encode.  Using the Tm gap ensures the replacement
+    # text fills exactly the visual space between operators.
+    active_ops = sorted(
+        op_idx for op_idx in chars_by_op if op_replacement_map.get(op_idx, "")
+    )
+
     if not dry_run:
         for op_idx in sorted(chars_by_op.keys()):
             inst = ops[op_idx]
             op_str = str(inst.operator) if hasattr(inst, "operator") else str(inst[1])
             op_chars = chars_by_op[op_idx]
             replacement_text = op_replacement_map.get(op_idx, "")
-            wb = merged_width_bonus.get(op_idx, 0.0)
             # Per-operator same_length: merged operators have more chars than
             # original, so they must use the rebuild path with kerning
             op_same_length = same_length and len(replacement_text) == len(op_chars)
+
+            # Compute width_bonus: use Tm position gap for merged operators
+            wb = 0.0
+            if op_idx in merged_width_bonus and replacement_text:
+                # Find the next non-empty operator's first character position
+                active_pos = active_ops.index(op_idx) if op_idx in active_ops else -1
+                if active_pos >= 0 and active_pos + 1 < len(active_ops):
+                    next_op = active_ops[active_pos + 1]
+                    next_chars = chars_by_op[next_op]
+                    if next_chars and op_chars:
+                        first_x = op_chars[0].page_x
+                        next_x = next_chars[0].page_x
+                        glyph_width = sum(ch.width for ch in op_chars)
+                        wb = max(0.0, (next_x - first_x) - glyph_width)
+                if wb == 0.0:
+                    wb = merged_width_bonus[op_idx]
 
             if op_str in ("TJ",):
                 _modify_tj_operator(
