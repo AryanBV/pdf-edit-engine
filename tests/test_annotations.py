@@ -9,6 +9,7 @@ import pytest
 
 from pdf_edit_engine import (
     Annotation,
+    add_annotation,
     delete_annotation,
     get_annotations,
     move_annotation,
@@ -112,3 +113,42 @@ class TestMoveAnnotation:
 
         moved = get_annotations(out)
         assert moved[link.index].rect == pytest.approx(new_rect, abs=0.1)
+
+
+class TestAddAnnotation:
+    """Tests for add_annotation()."""
+
+    def test_add_annotation_creates_link(self, tmp_pdf: str, tmp_path: Path) -> None:
+        """Add a link annotation, verify it appears in get_annotations."""
+        out = str(tmp_path / "added.pdf")
+        add_annotation(
+            tmp_pdf, page=0, rect=(72, 700, 200, 715),
+            uri="https://example.com", output_path=out,
+        )
+        annots = get_annotations(out)
+        links = [a for a in annots if a.subtype == "Link"]
+        assert len(links) >= 1
+        assert any(a.uri == "https://example.com" for a in links)
+
+    def test_add_annotation_rect_correct(self, tmp_pdf: str, tmp_path: Path) -> None:
+        """Verify the annotation's rect matches what was specified."""
+        out = str(tmp_path / "rect_check.pdf")
+        add_annotation(
+            tmp_pdf, page=0, rect=(100, 500, 250, 515),
+            uri="https://test.com", output_path=out,
+        )
+        annots = get_annotations(out)
+        link = next(a for a in annots if a.uri == "https://test.com")
+        assert abs(link.rect[0] - 100) < 1
+        assert abs(link.rect[2] - 250) < 1
+
+    def test_add_annotation_in_place(self, tmp_pdf: str, tmp_path: Path) -> None:
+        """Verify in-place editing works (input_path == output_path)."""
+        dest = str(tmp_path / "inplace.pdf")
+        shutil.copy2(tmp_pdf, dest)
+        add_annotation(
+            dest, page=0, rect=(72, 600, 200, 615),
+            uri="https://inplace.com", output_path=dest,
+        )
+        annots = get_annotations(dest)
+        assert any(a.uri == "https://inplace.com" for a in annots)

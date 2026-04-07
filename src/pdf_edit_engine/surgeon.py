@@ -111,7 +111,9 @@ def _encode_with_kerning(
     glyph_items: list[tuple[bytes, float]] = []  # (encoded_bytes, width_font_units)
     for char in text:
         encoded = resolver.encode(char)
-        char_code = (encoded[0] << 8) | encoded[1] if bw == 2 and len(encoded) >= 2 else encoded[0]
+        char_code = (
+            (encoded[0] << 8) | encoded[1] if bw == 2 and len(encoded) >= 2 else encoded[0]
+        )
         w = width_cache.get_width(page, font_name, char_code)
         glyph_items.append((encoded, w))
 
@@ -119,30 +121,44 @@ def _encode_with_kerning(
         # Single glyph — no gaps to distribute kerning
         return [pikepdf.String(glyph_items[0][0])] if glyph_items else []
 
-    # Calculate total replacement width in page space
-    replacement_width_page = sum((w / 1000.0) * font_size for _, w in glyph_items)
+    # Fallback: emit flat string when width info is unusable
+    if original_width_page <= 0 or font_size <= 0:
+        flat = b"".join(enc for enc, _ in glyph_items)
+        return [pikepdf.String(flat)]
 
-    # Delta: how much wider the replacement is than the original
-    delta_page = replacement_width_page - original_width_page
+    # Compute everything in font units (/W scale) to avoid page-space round-trip
+    original_fu = original_width_page * 1000.0 / font_size
+    replacement_fu = sum(w for _, w in glyph_items)
 
-    # Convert to TJ kerning units: positive = move left (tighten), negative = move right (expand)
+    # TJ kerning: positive = move left (tighten), negative = move right (widen)
+    # When replacement is wider (repl > orig), total_kern > 0 → tighten to fit
+    # When replacement is narrower (repl < orig), total_kern < 0 → widen to fill
+    total_kern = replacement_fu - original_fu
     num_gaps = len(glyph_items) - 1
-    total_kern = delta_page * 1000.0 / font_size if font_size > 0 else 0.0
-    per_gap = round(total_kern / num_gaps)
 
-    if abs(delta_page) > 0.5 * original_width_page and original_width_page > 0:
+    if abs(total_kern) > 0.5 * original_fu and original_fu > 0:
         logger.warning(
             "Large width delta (%.1f%%) in rebuild kerning for '%s'",
-            abs(delta_page) / original_width_page * 100,
+            abs(total_kern) / original_fu * 100,
             text[:20],
         )
 
-    # Build TJ items: [glyph1, kern, glyph2, kern, ..., glyphN]
+    per_gap = int(total_kern / num_gaps)
+    residual = round(total_kern) - (per_gap * num_gaps)
+
+    # If no kerning needed, emit flat string
+    if per_gap == 0 and residual == 0:
+        flat = b"".join(enc for enc, _ in glyph_items)
+        return [pikepdf.String(flat)]
+
+    # Build TJ items: [glyph0, kern, glyph1, kern, ..., glyphN-2, kern+residual, glyphN-1]
     result: list[object] = []
     for i, (encoded, _) in enumerate(glyph_items):
         result.append(pikepdf.String(encoded))
-        if i < num_gaps and per_gap != 0:
-            result.append(per_gap)
+        if i < num_gaps:
+            kern = per_gap + residual if i == num_gaps - 1 else per_gap
+            if kern != 0:
+                result.append(kern)
 
     return result
 
@@ -435,23 +451,55 @@ def _apply_single_replacement(
     for ch in match.characters:
         chars_by_op[ch.operator_index].append(ch)
 
-    # Determine character mapping for multi-operator same-length
     # Build a map: for each operator, which replacement characters go there
     op_replacement_map: dict[int, str] = {}
-    if same_length:
+    sorted_ops = sorted(chars_by_op.keys())
+    if len(new_text) == len(match.matched_text):
+        # Same char count: distribute by character count per operator
         idx = 0
-        for op_idx in sorted(chars_by_op.keys()):
+        for op_idx in sorted_ops:
             n = len(chars_by_op[op_idx])
             op_replacement_map[op_idx] = new_text[idx : idx + n]
             idx += n
-    else:
-        # Different-length: first operator gets all replacement text,
-        # subsequent operators get empty string
-        sorted_ops = sorted(chars_by_op.keys())
-        if sorted_ops:
-            op_replacement_map[sorted_ops[0]] = new_text
-            for op_idx in sorted_ops[1:]:
+    elif sorted_ops:
+        # Genuinely different length: first operator gets all
+        op_replacement_map[sorted_ops[0]] = new_text
+        for op_idx in sorted_ops[1:]:
+            op_replacement_map[op_idx] = ""
+
+    # Merge single-char operators into adjacent multi-char operators.
+    # Single-char operators (em-dashes, spaces, hyphens) have fixed Tm positions
+    # sized for the original character. When replacement text assigns a different
+    # character to that slot, the inter-operator gap causes visible artifacts.
+    # Merging lets the multi-char operator's text flow naturally past its boundary
+    # (PDF does not clip text at operator boundaries).
+    merged_width_bonus: dict[int, float] = {}
+    if len(sorted_ops) > 1:
+        last_multi: int | None = None
+        deferred: list[int] = []
+        for op_idx in sorted_ops:
+            n = len(chars_by_op[op_idx])
+            if n > 1:
+                # Absorb any deferred leading single-char ops (prepend)
+                if deferred:
+                    prefix = "".join(op_replacement_map.get(s, "") for s in deferred)
+                    op_replacement_map[op_idx] = prefix + op_replacement_map.get(op_idx, "")
+                    for s in deferred:
+                        bonus = sum(ch.width for ch in chars_by_op[s])
+                        merged_width_bonus[op_idx] = merged_width_bonus.get(op_idx, 0.0) + bonus
+                        op_replacement_map[s] = ""
+                    deferred = []
+                last_multi = op_idx
+            elif n == 1 and last_multi is not None:
+                # Append to preceding multi-char operator
+                op_replacement_map[last_multi] += op_replacement_map.get(op_idx, "")
+                bonus = sum(ch.width for ch in chars_by_op[op_idx])
+                merged_width_bonus[last_multi] = (
+                    merged_width_bonus.get(last_multi, 0.0) + bonus
+                )
                 op_replacement_map[op_idx] = ""
+            elif n == 1:
+                deferred.append(op_idx)
 
     if not dry_run:
         for op_idx in sorted(chars_by_op.keys()):
@@ -459,6 +507,10 @@ def _apply_single_replacement(
             op_str = str(inst.operator) if hasattr(inst, "operator") else str(inst[1])
             op_chars = chars_by_op[op_idx]
             replacement_text = op_replacement_map.get(op_idx, "")
+            wb = merged_width_bonus.get(op_idx, 0.0)
+            # Per-operator same_length: merged operators have more chars than
+            # original, so they must use the rebuild path with kerning
+            op_same_length = same_length and len(replacement_text) == len(op_chars)
 
             if op_str in ("TJ",):
                 _modify_tj_operator(
@@ -468,11 +520,12 @@ def _apply_single_replacement(
                     replacement_text,
                     resolver,
                     byte_width,
-                    same_length,
+                    op_same_length,
                     width_cache=width_cache,
                     page=page,
                     font_name=match.characters[0].font_name,
                     font_size=match.characters[0].font_size,
+                    width_bonus=wb,
                 )
             elif op_str in ("Tj", "'"):
                 _modify_tj_single_operator(
@@ -482,11 +535,12 @@ def _apply_single_replacement(
                     replacement_text,
                     resolver,
                     byte_width,
-                    same_length,
+                    op_same_length,
                     width_cache=width_cache,
                     page=page,
                     font_name=match.characters[0].font_name,
                     font_size=match.characters[0].font_size,
+                    width_bonus=wb,
                 )
 
     # Calculate widths
@@ -544,6 +598,7 @@ def _modify_tj_operator(
     page: pikepdf.Page | None = None,
     font_name: str | None = None,
     font_size: float | None = None,
+    width_bonus: float = 0.0,
 ) -> None:
     """Modify a TJ operator's array to apply replacement text."""
     inst = ops[op_idx]
@@ -578,7 +633,7 @@ def _modify_tj_operator(
             and font_name
             and font_size
         ):
-            op_original_width = sum(ch.width for ch in op_chars)
+            op_original_width = sum(ch.width for ch in op_chars) + width_bonus
             replacement_items = _encode_with_kerning(
                 replacement_text, op_original_width, font_size,
                 resolver, width_cache, page, font_name,
@@ -603,6 +658,7 @@ def _modify_tj_single_operator(
     page: pikepdf.Page | None = None,
     font_name: str | None = None,
     font_size: float | None = None,
+    width_bonus: float = 0.0,
 ) -> None:
     """Modify a Tj (or ') operator's string to apply replacement text."""
     inst = ops[op_idx]
@@ -625,7 +681,7 @@ def _modify_tj_single_operator(
             max_pos = max(ch.byte_position for ch in op_chars) + byte_width
             prefix_bytes = raw[:min_pos]
             suffix_bytes = raw[max_pos:]
-            op_original_width = sum(ch.width for ch in op_chars)
+            op_original_width = sum(ch.width for ch in op_chars) + width_bonus
             kerned_items = _encode_with_kerning(
                 replacement_text, op_original_width, font_size,
                 resolver, width_cache, page, font_name,

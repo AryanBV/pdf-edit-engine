@@ -6,6 +6,7 @@ __version__ = "0.1.0"
 
 from pdf_edit_engine.annotations import (
     Annotation,
+    add_annotation,
     delete_annotation,
     get_annotations,
     move_annotation,
@@ -88,6 +89,7 @@ __all__ = [
     "add_watermark",
     # annotations
     "get_annotations",
+    "add_annotation",
     "update_annotation_uri",
     "delete_annotation",
     "move_annotation",

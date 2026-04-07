@@ -168,3 +168,48 @@ def move_annotation(
             target = target.resolve()
         target["/Rect"] = pikepdf.Array([float(v) for v in new_rect])
         pdf.save(out)
+
+
+def add_annotation(
+    pdf_path: str,
+    page: int,
+    rect: tuple[float, float, float, float],
+    uri: str,
+    output_path: str,
+    border_style: str = "none",
+) -> None:
+    """Add a Link annotation to the PDF at the specified position.
+
+    Args:
+        pdf_path: Path to the input PDF file.
+        page: 0-indexed page number.
+        rect: (x0, y0, x1, y1) rectangle in PDF user space units.
+        uri: The URL the link points to.
+        output_path: Path for the output PDF (can be same as pdf_path).
+        border_style: "none" for invisible border, "underline" for blue underline.
+    """
+    validate_output_path(output_path)
+    path = str(Path(pdf_path).resolve())
+    out = str(Path(output_path).resolve())
+    allow_overwrite = path == out
+    with pikepdf.open(path, allow_overwriting_input=allow_overwrite) as pdf:
+        page_obj = pdf.pages[page]
+        annot = pikepdf.Dictionary({
+            "/Type": pikepdf.Name("/Annot"),
+            "/Subtype": pikepdf.Name("/Link"),
+            "/Rect": pikepdf.Array([float(v) for v in rect]),
+            "/A": pikepdf.Dictionary({
+                "/Type": pikepdf.Name("/Action"),
+                "/S": pikepdf.Name("/URI"),
+                "/URI": pikepdf.String(uri),
+            }),
+            "/Border": pikepdf.Array([0, 0, 0]),
+            "/F": 4,
+        })
+        if border_style == "underline":
+            annot["/Border"] = pikepdf.Array([0, 0, 1])
+            annot["/C"] = pikepdf.Array([0.0, 0.0, 1.0])
+        if "/Annots" not in page_obj:
+            page_obj["/Annots"] = pikepdf.Array([])
+        page_obj["/Annots"].append(pdf.make_indirect(annot))
+        pdf.save(out)
