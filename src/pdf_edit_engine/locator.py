@@ -16,6 +16,7 @@ from pdf_edit_engine.fragments import TJReconstructor
 from pdf_edit_engine.models import (
     ContentElement,
     FontInfo,
+    TextBlock,
     TextCharacter,
     TextMatch,
 )
@@ -1012,3 +1013,47 @@ def get_fonts(pdf_path: str, *, page: int | None = None) -> list[FontInfo]:
                 seen.add(name)
                 fonts.append(_build_font_info(font_dict[key], name))
         return fonts
+
+
+def get_text_layout(pdf_path: str, page: int | None = None) -> list[TextBlock]:
+    """Return text blocks with their positions, fonts, and sizes.
+
+    Each TextBlock represents a contiguous text element (one TJ/Tj
+    operator's output) with its rendered position and font info.
+
+    Args:
+        pdf_path: Path to the PDF file.
+        page: Optional page number (0-indexed). If None, returns all pages.
+
+    Returns:
+        List of TextBlock objects sorted by page, then y (top to bottom),
+        then x (left to right).
+    """
+    path = str(Path(pdf_path).resolve())
+    blocks: list[TextBlock] = []
+    with pikepdf.open(path) as pdf:
+        pages = _resolve_pages(pdf, page)
+        for page_num, page_obj in pages:
+            elements = _build_index(page_obj, page_num, pdf_path=path)
+            for elem in elements:
+                if elem.type != "text" or not elem.text_content:
+                    continue
+                x0, y0, x1, _y1 = elem.bbox
+                width = x1 - x0
+                if width <= 0 and elem.characters:
+                    width = sum(ch.width for ch in elem.characters)
+                gs = elem.graphics_state
+                f_name = gs.font_name or ""
+                f_size = gs.font_size or 0.0
+                blocks.append(TextBlock(
+                    text=elem.text_content,
+                    x=x0,
+                    y=y0,
+                    width=width,
+                    height=f_size,
+                    font_name=f_name,
+                    font_size=f_size,
+                    page=elem.page,
+                ))
+    blocks.sort(key=lambda b: (b.page, -b.y, b.x))
+    return blocks

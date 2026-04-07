@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/pdf-edit-engine)](https://pypi.org/project/pdf-edit-engine/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-492%20passed-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-508%20passed-brightgreen)]()
 
 Format-preserving PDF text editing — edit text in existing PDFs while preserving fonts, layout, and visual fidelity.
 
@@ -111,6 +111,39 @@ print(info.glyph_count, info.encoding_type, info.is_subset)
 can_render_all, missing = can_render(info, "Hello World!")
 ```
 
+### Text layout
+
+```python
+from pdf_edit_engine import get_text_layout
+
+# Get positioned text blocks with font info
+blocks = get_text_layout("doc.pdf")
+for b in blocks:
+    print(f"({b.x:.0f}, {b.y:.0f}) {b.font_name} {b.font_size}pt: {b.text[:50]}")
+
+# Filter by page
+blocks = get_text_layout("doc.pdf", page=0)
+```
+
+Each `TextBlock` contains: `text`, `x`, `y`, `width`, `height`, `font_name`, `font_size`, `page`.
+
+### Annotations
+
+```python
+from pdf_edit_engine import get_annotations, update_annotation_uri, delete_annotation
+
+# List all annotations
+annots = get_annotations("doc.pdf")
+for a in annots:
+    print(f"[{a.page}] {a.subtype} at {a.rect} → {a.uri}")
+
+# Change a link's URL
+update_annotation_uri("doc.pdf", annots[0], "https://new-url.com", "out.pdf")
+
+# Remove an annotation
+delete_annotation("doc.pdf", annots[0], "out.pdf")
+```
+
 ### Paragraph reflow
 
 When replacement text is wider than the original, the engine automatically reflows the paragraph using greedy line breaking:
@@ -156,6 +189,8 @@ Thin wrappers around pikepdf for common PDF operations:
 | batch_replace | Stable | Multiple edits in single pass |
 | Font extension | Stable | Tier 1 CMap + Tier 2 full re-embed |
 | Paragraph reflow | Stable | Single-paragraph, greedy line breaking |
+| get_text_layout | Stable | Position, font, size for every text block |
+| Annotations | Stable | get, update URI, delete, move |
 | 15 wrapper ops | Stable | merge, split, rotate, encrypt, etc. |
 | dry_run mode | Stable | Preview edits without writing |
 | Cross-page reflow | Not supported | Planned for v2 |

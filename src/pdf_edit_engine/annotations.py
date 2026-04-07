@@ -1,0 +1,170 @@
+"""Annotations module — read and modify PDF annotations."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import pikepdf
+
+from pdf_edit_engine._pathutil import validate_output_path
+
+
+@dataclass(frozen=True)
+class Annotation:
+    """A PDF annotation with its position and content."""
+
+    index: int
+    page: int
+    subtype: str
+    rect: tuple[float, float, float, float]
+    uri: str | None
+    text: str | None
+
+
+def get_annotations(
+    pdf_path: str,
+    page: int | None = None,
+) -> list[Annotation]:
+    """List all annotations in the PDF.
+
+    Args:
+        pdf_path: Path to the PDF file.
+        page: Optional 0-indexed page number. If None, returns all pages.
+
+    Returns:
+        List of Annotation objects.
+    """
+    path = str(Path(pdf_path).resolve())
+    annotations: list[Annotation] = []
+    with pikepdf.open(path) as pdf:
+        for page_num, page_obj in enumerate(pdf.pages):
+            if page is not None and page_num != page:
+                continue
+            if "/Annots" not in page_obj:
+                continue
+            annots_arr: Any = page_obj["/Annots"]
+            for idx in range(len(annots_arr)):
+                annot_ref: Any = annots_arr[idx]
+                annot: Any = (
+                    annot_ref.resolve() if hasattr(annot_ref, "resolve") else annot_ref
+                )
+                subtype = str(annot.get("/Subtype", "")).lstrip("/")
+                rect_obj: Any = annot.get("/Rect")
+                if rect_obj is None:
+                    continue
+                rect = (
+                    float(rect_obj[0]),
+                    float(rect_obj[1]),
+                    float(rect_obj[2]),
+                    float(rect_obj[3]),
+                )
+                uri: str | None = None
+                if "/A" in annot:
+                    action: Any = annot["/A"]
+                    if "/URI" in action:
+                        uri = str(action["/URI"])
+                text_content: str | None = None
+                if "/Contents" in annot:
+                    text_content = str(annot["/Contents"])
+                annotations.append(Annotation(
+                    index=idx,
+                    page=page_num,
+                    subtype=subtype,
+                    rect=rect,
+                    uri=uri,
+                    text=text_content,
+                ))
+    return annotations
+
+
+def update_annotation_uri(
+    pdf_path: str,
+    annot: Annotation,
+    new_uri: str,
+    output_path: str,
+) -> None:
+    """Change the URI of a Link annotation.
+
+    Args:
+        pdf_path: Path to the input PDF file.
+        annot: The Annotation to modify (from get_annotations).
+        new_uri: New URI string.
+        output_path: Path for the output PDF.
+    """
+    validate_output_path(output_path)
+    path = str(Path(pdf_path).resolve())
+    out = str(Path(output_path).resolve())
+    allow_overwrite = path == out
+    with pikepdf.open(path, allow_overwriting_input=allow_overwrite) as pdf:
+        page_obj = pdf.pages[annot.page]
+        annots_arr: Any = page_obj["/Annots"]
+        target: Any = annots_arr[annot.index]
+        if hasattr(target, "resolve"):
+            target = target.resolve()
+        if "/A" not in target:
+            target["/A"] = pikepdf.Dictionary({"/S": pikepdf.Name("/URI")})
+        target["/A"]["/URI"] = pikepdf.String(new_uri)
+        pdf.save(out)
+
+
+def delete_annotation(
+    pdf_path: str,
+    annot: Annotation,
+    output_path: str,
+) -> None:
+    """Remove an annotation from the PDF.
+
+    Args:
+        pdf_path: Path to the input PDF file.
+        annot: The Annotation to delete (from get_annotations).
+        output_path: Path for the output PDF.
+    """
+    validate_output_path(output_path)
+    path = str(Path(pdf_path).resolve())
+    out = str(Path(output_path).resolve())
+    allow_overwrite = path == out
+    with pikepdf.open(path, allow_overwriting_input=allow_overwrite) as pdf:
+        page_obj = pdf.pages[annot.page]
+        if "/Annots" not in page_obj:
+            pdf.save(out)
+            return
+        annots_list: list[Any] = list(page_obj["/Annots"])  # type: ignore[call-overload]
+        if annot.index < len(annots_list):
+            annots_list.pop(annot.index)
+        if annots_list:
+            page_obj["/Annots"] = pdf.make_indirect(
+                pikepdf.Array(annots_list)
+            )
+        else:
+            del page_obj["/Annots"]  # type: ignore[operator]
+        pdf.save(out)
+
+
+def move_annotation(
+    pdf_path: str,
+    annot: Annotation,
+    new_rect: tuple[float, float, float, float],
+    output_path: str,
+) -> None:
+    """Move an annotation to a new position.
+
+    Args:
+        pdf_path: Path to the input PDF file.
+        annot: The Annotation to move (from get_annotations).
+        new_rect: New (x0, y0, x1, y1) rectangle in PDF points.
+        output_path: Path for the output PDF.
+    """
+    validate_output_path(output_path)
+    path = str(Path(pdf_path).resolve())
+    out = str(Path(output_path).resolve())
+    allow_overwrite = path == out
+    with pikepdf.open(path, allow_overwriting_input=allow_overwrite) as pdf:
+        page_obj = pdf.pages[annot.page]
+        annots_arr: Any = page_obj["/Annots"]
+        target: Any = annots_arr[annot.index]
+        if hasattr(target, "resolve"):
+            target = target.resolve()
+        target["/Rect"] = pikepdf.Array([float(v) for v in new_rect])
+        pdf.save(out)

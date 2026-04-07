@@ -4,6 +4,13 @@ from __future__ import annotations
 
 __version__ = "0.1.0"
 
+from pdf_edit_engine.annotations import (
+    Annotation,
+    delete_annotation,
+    get_annotations,
+    move_annotation,
+    update_annotation_uri,
+)
 from pdf_edit_engine.errors import (
     EncodingError,
     FontNotFoundError,
@@ -12,7 +19,7 @@ from pdf_edit_engine.errors import (
     ReflowError,
 )
 from pdf_edit_engine.fonts import analyze_subset, can_render, extend_subset
-from pdf_edit_engine.locator import find, get_fonts, get_text
+from pdf_edit_engine.locator import find, get_fonts, get_text, get_text_layout
 from pdf_edit_engine.models import (
     ContentElement,
     Edit,
@@ -21,6 +28,7 @@ from pdf_edit_engine.models import (
     FontInfo,
     GraphicsStateSnapshot,
     Paragraph,
+    TextBlock,
     TextCharacter,
     TextMatch,
 )
@@ -48,6 +56,7 @@ __all__ = [
     # locator
     "find",
     "get_text",
+    "get_text_layout",
     "get_fonts",
     # surgeon
     "replace",
@@ -77,9 +86,16 @@ __all__ = [
     "flatten_annotations",
     "fill_form",
     "add_watermark",
+    # annotations
+    "get_annotations",
+    "update_annotation_uri",
+    "delete_annotation",
+    "move_annotation",
+    "Annotation",
     # models
     "TextMatch",
     "TextCharacter",
+    "TextBlock",
     "EditResult",
     "FidelityReport",
     "FontInfo",

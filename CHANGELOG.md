@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.1.0] — 2026-04-04
+## [0.1.0] — 2026-04-07
 
 ### Added
 
@@ -16,6 +16,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - **dry_run mode**: Preview any edit without writing to disk
 - **15 PDF wrapper operations**: merge, split, reorder, rotate, delete, crop, metadata, bookmarks, encrypt, decrypt, hyperlinks, highlights, flatten annotations, fill forms, watermarks
 - **Text extraction**: `get_text()` and `get_fonts()` for inspecting PDF content
+- **Text layout**: `get_text_layout()` returns positioned text blocks with font, size, and coordinates
+- **Annotations module**: `get_annotations()`, `update_annotation_uri()`, `delete_annotation()`, `move_annotation()` for reading and modifying PDF link annotations
+- **Rebuild path kerning**: Different-length replacements now distribute micro-kerning across glyphs to match original text width, eliminating visible spacing gaps
 - **Paragraph detection**: `detect_paragraphs()` for analyzing page layout
 - **Output path validation**: All file-writing functions validate paths before I/O
 - **Identity-H and WinAnsi encoding**: Full support for CIDFont (modern PDFs) and WinAnsi (legacy PDFs)
@@ -23,7 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ### Technical
 
 - Python 3.10+, pikepdf + fonttools + pdfminer.six (all MIT/MPL-2.0)
-- 400 tests, 85% coverage, mypy strict
+- 508 tests, 85% coverage, mypy strict
 - Tested against 7 PDF generators: Chrome, Google Docs, reportlab (4 variants), pikepdf synthetic
 - 100% character agreement across all tested generators
 - Zero external binaries, zero API keys, zero network calls

@@ -115,6 +115,20 @@ class ContentElement:
     characters: list[TextCharacter] | None = None
 
 
+@dataclass(frozen=True)
+class TextBlock:
+    """A text element with its rendered position, font, and size."""
+
+    text: str
+    x: float
+    y: float
+    width: float
+    height: float
+    font_name: str
+    font_size: float
+    page: int
+
+
 @dataclass
 class Paragraph:
     """A detected paragraph of related text elements on a PDF page."""

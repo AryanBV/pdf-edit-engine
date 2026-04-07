@@ -78,21 +78,91 @@ def _splice_bytes(
     return bytes(buf)
 
 
+def _encode_with_kerning(
+    text: str,
+    original_width_page: float,
+    font_size: float,
+    resolver: FontResolver,
+    width_cache: GlyphWidthCache,
+    page: pikepdf.Page,
+    font_name: str,
+) -> list[object]:
+    """Encode text into TJ items with kerning to match original width.
+
+    Produces a list of pikepdf.String and numeric kerning values that,
+    when rendered, occupy the same total width as the original match.
+
+    Args:
+        text: Replacement text to encode.
+        original_width_page: Original match width in page-space units.
+        font_size: Font size in points.
+        resolver: FontResolver for encoding characters.
+        width_cache: Glyph width cache.
+        page: PDF page for width lookup.
+        font_name: Font resource name.
+
+    Returns:
+        List of TJ array items (pikepdf.String and int kerning values).
+    """
+    if not text:
+        return []
+
+    bw = resolver.byte_width
+    glyph_items: list[tuple[bytes, float]] = []  # (encoded_bytes, width_font_units)
+    for char in text:
+        encoded = resolver.encode(char)
+        char_code = (encoded[0] << 8) | encoded[1] if bw == 2 and len(encoded) >= 2 else encoded[0]
+        w = width_cache.get_width(page, font_name, char_code)
+        glyph_items.append((encoded, w))
+
+    if len(glyph_items) <= 1:
+        # Single glyph — no gaps to distribute kerning
+        return [pikepdf.String(glyph_items[0][0])] if glyph_items else []
+
+    # Calculate total replacement width in page space
+    replacement_width_page = sum((w / 1000.0) * font_size for _, w in glyph_items)
+
+    # Delta: how much wider the replacement is than the original
+    delta_page = replacement_width_page - original_width_page
+
+    # Convert to TJ kerning units: positive = move left (tighten), negative = move right (expand)
+    num_gaps = len(glyph_items) - 1
+    total_kern = delta_page * 1000.0 / font_size if font_size > 0 else 0.0
+    per_gap = round(total_kern / num_gaps)
+
+    if abs(delta_page) > 0.5 * original_width_page and original_width_page > 0:
+        logger.warning(
+            "Large width delta (%.1f%%) in rebuild kerning for '%s'",
+            abs(delta_page) / original_width_page * 100,
+            text[:20],
+        )
+
+    # Build TJ items: [glyph1, kern, glyph2, kern, ..., glyphN]
+    result: list[object] = []
+    for i, (encoded, _) in enumerate(glyph_items):
+        result.append(pikepdf.String(encoded))
+        if i < num_gaps and per_gap != 0:
+            result.append(per_gap)
+
+    return result
+
+
 def _rebuild_tj_array(
     tj_items: list[object],
     match_chars: list[TextCharacter],
-    encoded_replacement: bytes,
+    replacement_items: list[object],
 ) -> pikepdf.Array:
-    """Rebuild a TJ array replacing the matched span with new encoded bytes.
+    """Rebuild a TJ array replacing the matched span with new items.
 
-    Fragments before the match are preserved. The matched span becomes a
-    single new string element. Fragments after the match are preserved.
-    Kerning within the match is dropped; kerning outside is kept.
+    Fragments before the match are preserved. The matched span is replaced
+    by the provided items (strings + optional kerning values). Fragments
+    after the match are preserved.
 
     Args:
         tj_items: Original TJ array items.
         match_chars: Characters from the match that fall in this operator.
-        encoded_replacement: Pre-encoded replacement bytes.
+        replacement_items: Pre-built TJ items (pikepdf.String and/or numeric
+            kerning values) to insert in place of the matched span.
 
     Returns:
         New pikepdf.Array for the TJ operand.
@@ -141,9 +211,9 @@ def _rebuild_tj_array(
     if prefix_bytes:
         new_items.append(pikepdf.String(prefix_bytes))
 
-    # Add the replacement string
-    if encoded_replacement:
-        new_items.append(pikepdf.String(encoded_replacement))
+    # Add the replacement items (strings + optional kerning values)
+    for item in replacement_items:
+        new_items.append(item)
 
     # Add suffix if present
     if suffix_bytes:
@@ -399,6 +469,10 @@ def _apply_single_replacement(
                     resolver,
                     byte_width,
                     same_length,
+                    width_cache=width_cache,
+                    page=page,
+                    font_name=match.characters[0].font_name,
+                    font_size=match.characters[0].font_size,
                 )
             elif op_str in ("Tj", "'"):
                 _modify_tj_single_operator(
@@ -409,6 +483,10 @@ def _apply_single_replacement(
                     resolver,
                     byte_width,
                     same_length,
+                    width_cache=width_cache,
+                    page=page,
+                    font_name=match.characters[0].font_name,
+                    font_size=match.characters[0].font_size,
                 )
 
     # Calculate widths
@@ -462,6 +540,10 @@ def _modify_tj_operator(
     resolver: FontResolver,
     byte_width: int,
     same_length: bool,
+    width_cache: GlyphWidthCache | None = None,
+    page: pikepdf.Page | None = None,
+    font_name: str | None = None,
+    font_size: float | None = None,
 ) -> None:
     """Modify a TJ operator's array to apply replacement text."""
     inst = ops[op_idx]
@@ -488,9 +570,24 @@ def _modify_tj_operator(
 
         ops[op_idx] = ([pikepdf.Array(tj_items)], operator)
     else:
-        # Different-length or empty: rebuild the TJ array
-        encoded = resolver.encode(replacement_text) if replacement_text else b""
-        new_array = _rebuild_tj_array(tj_items, op_chars, encoded)
+        # Different-length or empty: rebuild the TJ array with kerning
+        if (
+            replacement_text
+            and width_cache is not None
+            and page is not None
+            and font_name
+            and font_size
+        ):
+            op_original_width = sum(ch.width for ch in op_chars)
+            replacement_items = _encode_with_kerning(
+                replacement_text, op_original_width, font_size,
+                resolver, width_cache, page, font_name,
+            )
+        elif replacement_text:
+            replacement_items = [pikepdf.String(resolver.encode(replacement_text))]
+        else:
+            replacement_items = []
+        new_array = _rebuild_tj_array(tj_items, op_chars, replacement_items)
         ops[op_idx] = ([new_array], operator)
 
 
@@ -502,6 +599,10 @@ def _modify_tj_single_operator(
     resolver: FontResolver,
     byte_width: int,
     same_length: bool,
+    width_cache: GlyphWidthCache | None = None,
+    page: pikepdf.Page | None = None,
+    font_name: str | None = None,
+    font_size: float | None = None,
 ) -> None:
     """Modify a Tj (or ') operator's string to apply replacement text."""
     inst = ops[op_idx]
@@ -516,19 +617,38 @@ def _modify_tj_single_operator(
             encoded_char = resolver.encode(replacement_text[i])
             replacements.append((ch.byte_position, encoded_char))
         new_raw = _splice_bytes(raw, replacements, byte_width)
+        ops[op_idx] = ([pikepdf.String(new_raw)], operator)
     elif replacement_text:
-        # Different-length: replace the matched byte range
-        min_pos = min(ch.byte_position for ch in op_chars)
-        max_pos = max(ch.byte_position for ch in op_chars) + byte_width
-        encoded = resolver.encode(replacement_text)
-        new_raw = raw[:min_pos] + encoded + raw[max_pos:]
+        # Different-length: use kerning if available, convert to TJ
+        if width_cache is not None and page is not None and font_name and font_size:
+            min_pos = min(ch.byte_position for ch in op_chars)
+            max_pos = max(ch.byte_position for ch in op_chars) + byte_width
+            prefix_bytes = raw[:min_pos]
+            suffix_bytes = raw[max_pos:]
+            op_original_width = sum(ch.width for ch in op_chars)
+            kerned_items = _encode_with_kerning(
+                replacement_text, op_original_width, font_size,
+                resolver, width_cache, page, font_name,
+            )
+            tj_items: list[object] = []
+            if prefix_bytes:
+                tj_items.append(pikepdf.String(prefix_bytes))
+            tj_items.extend(kerned_items)
+            if suffix_bytes:
+                tj_items.append(pikepdf.String(suffix_bytes))
+            ops[op_idx] = ([pikepdf.Array(tj_items)], pikepdf.Operator("TJ"))
+        else:
+            min_pos = min(ch.byte_position for ch in op_chars)
+            max_pos = max(ch.byte_position for ch in op_chars) + byte_width
+            encoded = resolver.encode(replacement_text)
+            new_raw = raw[:min_pos] + encoded + raw[max_pos:]
+            ops[op_idx] = ([pikepdf.String(new_raw)], operator)
     else:
         # Empty replacement: remove matched bytes
         min_pos = min(ch.byte_position for ch in op_chars)
         max_pos = max(ch.byte_position for ch in op_chars) + byte_width
         new_raw = raw[:min_pos] + raw[max_pos:]
-
-    ops[op_idx] = ([pikepdf.String(new_raw)], operator)
+        ops[op_idx] = ([pikepdf.String(new_raw)], operator)
 
 
 # ── Public API ──────────────────────────────────────────────────────────
