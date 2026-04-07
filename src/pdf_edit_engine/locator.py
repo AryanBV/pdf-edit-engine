@@ -526,6 +526,11 @@ class ContentStreamInterpreter:
 #
 # Single-PDF cache: the MCP use case processes one PDF at a time.
 # Switching to a different path clears the entire cache.
+#
+# WARNING: Thread-unsafe global cache. This library is single-threaded.
+# The planned MCP wrapper (pdf-edit-mcp) must serialize all calls to the
+# Python engine. Do not use concurrent.futures or multiprocessing to call
+# find()/replace() in parallel.
 
 _cached_path: str | None = None
 _cached_elements: dict[int, list[ContentElement]] = {}
@@ -557,9 +562,7 @@ def _build_index(
     try:
         elements = interpreter.interpret()
     except (UnicodeDecodeError, ValueError, TypeError, KeyError) as exc:
-        raise OperatorError(
-            f"Failed to parse content stream on page {page_number}: {exc}"
-        ) from exc
+        raise OperatorError(f"Failed to parse content stream on page {page_number}: {exc}") from exc
 
     if pdf_path is not None:
         _cached_elements[page_number] = elements
@@ -886,6 +889,12 @@ def find(
     Returns:
         List of :class:`TextMatch` objects.  Empty list when *search_text*
         is empty or no matches are found.
+
+        Note: TextMatch objects contain operator indices into the content
+        stream. After any replace() call on the same PDF, previously
+        returned TextMatch objects are invalidated. Use batch_replace()
+        for multi-edit workflows, or call find() again after each
+        replace().
     """
     if not search_text:
         return []
@@ -1045,15 +1054,17 @@ def get_text_layout(pdf_path: str, page: int | None = None) -> list[TextBlock]:
                 gs = elem.graphics_state
                 f_name = gs.font_name or ""
                 f_size = gs.font_size or 0.0
-                blocks.append(TextBlock(
-                    text=elem.text_content,
-                    x=x0,
-                    y=y0,
-                    width=width,
-                    height=f_size,
-                    font_name=f_name,
-                    font_size=f_size,
-                    page=elem.page,
-                ))
+                blocks.append(
+                    TextBlock(
+                        text=elem.text_content,
+                        x=x0,
+                        y=y0,
+                        width=width,
+                        height=f_size,
+                        font_name=f_name,
+                        font_size=f_size,
+                        page=elem.page,
+                    )
+                )
     blocks.sort(key=lambda b: (b.page, -b.y, b.x))
     return blocks

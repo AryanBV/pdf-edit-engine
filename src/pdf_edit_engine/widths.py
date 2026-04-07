@@ -83,6 +83,10 @@ class GlyphWidthCache:
     def __init__(self) -> None:
         self._cache: dict[str, dict[int, float]] = {}
 
+    def clear(self) -> None:
+        """Discard all cached width tables."""
+        self._cache.clear()
+
     def get_width(
         self,
         page: pikepdf.Page,

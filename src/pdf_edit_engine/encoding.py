@@ -240,6 +240,16 @@ class FontResolverCache:
     def __init__(self) -> None:
         self._cache: dict[tuple[int, int, str], FontResolver] = {}
 
+    def clear(self) -> None:
+        """Discard all cached FontResolver instances."""
+        self._cache.clear()
+
+    def evict(self, page: pikepdf.Page, font_name: str) -> None:
+        """Remove a specific cached resolver (e.g. after font extension)."""
+        objgen: tuple[int, int] = page.obj.objgen
+        key = (objgen[0], objgen[1], font_name)
+        self._cache.pop(key, None)
+
     def get_resolver(
         self,
         page: pikepdf.Page,

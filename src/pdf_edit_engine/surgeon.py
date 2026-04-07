@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import pathlib
 from collections import defaultdict
 from typing import Any
 
@@ -10,7 +11,13 @@ import pikepdf
 
 from pdf_edit_engine._pathutil import validate_output_path
 from pdf_edit_engine.encoding import FontResolver, FontResolverCache
-from pdf_edit_engine.errors import FontNotFoundError, OperatorError, PDFEditError
+from pdf_edit_engine.errors import (
+    EncodingError,
+    FontNotFoundError,
+    OperatorError,
+    PDFEditError,
+    ReflowError,
+)
 from pdf_edit_engine.models import (
     Edit,
     EditResult,
@@ -27,14 +34,37 @@ logger = logging.getLogger(__name__)
 # Using Any avoids fighting pikepdf's pybind11 typing.
 _Ops = list[Any]
 
+# ── Module-level caches ─────────────────────────────────────────────────
+#
+# Singletons that persist across calls for same-PDF performance.
+# Cleared automatically when the public API detects a different PDF path.
+
+_width_cache = GlyphWidthCache()
+_resolver_cache = FontResolverCache()
+_cached_pdf_path: str | None = None
+
+
+def _ensure_caches_for_pdf(pdf_path: str) -> None:
+    """Clear module-level caches if the PDF path has changed.
+
+    Prevents cross-PDF leaks: GlyphWidthCache keys on font resource
+    names (e.g. ``"F1"``) which are PDF-local — different PDFs reuse
+    the same names for different fonts.
+    """
+    global _cached_pdf_path  # noqa: PLW0603
+    resolved = str(pathlib.Path(pdf_path).resolve())
+    if resolved != _cached_pdf_path:
+        _cached_pdf_path = resolved
+        _width_cache.clear()
+        _resolver_cache.clear()
+
 
 # ── Private helpers ──────────────────────────────────────────────────────
 
 
 def _get_font_resolver(page: pikepdf.Page, font_name: str) -> FontResolver:
     """Build a FontResolver for the given font on the page."""
-    cache = FontResolverCache()
-    return cache.get_resolver(page, font_name)
+    return _resolver_cache.get_resolver(page, font_name)
 
 
 def _nth_string_index(tj_items: list[object], frag_idx: int) -> int:
@@ -111,9 +141,7 @@ def _encode_with_kerning(
     glyph_items: list[tuple[bytes, float]] = []  # (encoded_bytes, width_font_units)
     for char in text:
         encoded = resolver.encode(char)
-        char_code = (
-            (encoded[0] << 8) | encoded[1] if bw == 2 and len(encoded) >= 2 else encoded[0]
-        )
+        char_code = (encoded[0] << 8) | encoded[1] if bw == 2 and len(encoded) >= 2 else encoded[0]
         w = width_cache.get_width(page, font_name, char_code)
         glyph_items.append((encoded, w))
 
@@ -400,7 +428,8 @@ def _apply_single_replacement(
 
             font_name = match.characters[0].font_name
             tier = extend_subset(pdf, page, font_name, "".join(missing))
-            # Get fresh resolver from updated font dicts
+            # Evict stale resolver so _get_font_resolver re-parses
+            _resolver_cache.evict(page, font_name)
             resolver = _get_font_resolver(page, font_name)
             can_enc_after, still_missing = resolver.can_encode(new_text)
             if not can_enc_after:
@@ -451,10 +480,9 @@ def _apply_single_replacement(
     # (operator_index, tj_fragment_index, byte_position).  The splice path
     # assumes 1 char = 1 CID slot and would overwrite the same position
     # twice, losing a character.  Force the rebuild path in that case.
-    cid_slots = len({
-        (ch.operator_index, ch.tj_fragment_index, ch.byte_position)
-        for ch in match.characters
-    })
+    cid_slots = len(
+        {(ch.operator_index, ch.tj_fragment_index, ch.byte_position) for ch in match.characters}
+    )
     has_ligatures = cid_slots != len(match.matched_text)
     same_length = (not has_ligatures) and len(new_text) == len(match.matched_text)
 
@@ -507,9 +535,7 @@ def _apply_single_replacement(
                 # Append to preceding wide operator
                 op_replacement_map[last_multi] += op_replacement_map.get(op_idx, "")
                 bonus = sum(ch.width for ch in chars_by_op[op_idx])
-                merged_width_bonus[last_multi] = (
-                    merged_width_bonus.get(last_multi, 0.0) + bonus
-                )
+                merged_width_bonus[last_multi] = merged_width_bonus.get(last_multi, 0.0) + bonus
                 op_replacement_map[op_idx] = ""
             elif n <= _MERGE_THRESHOLD:
                 deferred.append(op_idx)
@@ -518,9 +544,7 @@ def _apply_single_replacement(
     # non-empty operator.  sum(ch.width) misses inter-operator spacing that the
     # original Tm positions encode.  Using the Tm gap ensures the replacement
     # text fills exactly the visual space between operators.
-    active_ops = sorted(
-        op_idx for op_idx in chars_by_op if op_replacement_map.get(op_idx, "")
-    )
+    active_ops = sorted(op_idx for op_idx in chars_by_op if op_replacement_map.get(op_idx, ""))
 
     if not dry_run:
         for op_idx in sorted(chars_by_op.keys()):
@@ -671,8 +695,13 @@ def _modify_tj_operator(
         ):
             op_original_width = sum(ch.width for ch in op_chars) + width_bonus
             replacement_items = _encode_with_kerning(
-                replacement_text, op_original_width, font_size,
-                resolver, width_cache, page, font_name,
+                replacement_text,
+                op_original_width,
+                font_size,
+                resolver,
+                width_cache,
+                page,
+                font_name,
             )
         elif replacement_text:
             replacement_items = [pikepdf.String(resolver.encode(replacement_text))]
@@ -719,8 +748,13 @@ def _modify_tj_single_operator(
             suffix_bytes = raw[max_pos:]
             op_original_width = sum(ch.width for ch in op_chars) + width_bonus
             kerned_items = _encode_with_kerning(
-                replacement_text, op_original_width, font_size,
-                resolver, width_cache, page, font_name,
+                replacement_text,
+                op_original_width,
+                font_size,
+                resolver,
+                width_cache,
+                page,
+                font_name,
             )
             tj_items: list[object] = []
             if prefix_bytes:
@@ -772,101 +806,102 @@ def replace(
         PDFEditError: If the PDF is encrypted.
         OperatorError: If operator references are stale or invalid.
     """
+    _ensure_caches_for_pdf(pdf_path)
     if not dry_run:
         validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
-    if pdf.is_encrypted:
-        raise PDFEditError("Cannot edit encrypted PDF")
+    try:
+        if pdf.is_encrypted:
+            raise PDFEditError("Cannot edit encrypted PDF")
 
-    if match.page_number >= len(pdf.pages):
-        raise OperatorError(
-            f"Page {match.page_number} out of range (PDF has {len(pdf.pages)} pages)"
+        if match.page_number >= len(pdf.pages):
+            raise OperatorError(
+                f"Page {match.page_number} out of range (PDF has {len(pdf.pages)} pages)"
+            )
+
+        page = pdf.pages[match.page_number]
+        font_name = match.characters[0].font_name
+        resolver = _get_font_resolver(page, font_name)
+
+        # Check if reflow is needed: replacement wider than original
+        if reflow:
+            try:
+                old_width = sum(ch.width for ch in match.characters)
+                new_width = _calculate_new_width(
+                    new_text,
+                    page,
+                    font_name,
+                    match.characters[0].font_size,
+                    resolver,
+                    _width_cache,
+                )
+                # Only reflow if meaningfully wider (>1pt avoids trivial diffs)
+                needs_reflow = new_width > old_width + 1.0
+            except (KeyError, EncodingError, FontNotFoundError):
+                # Encoding failure — skip reflow, let simple replacement handle it
+                needs_reflow = False
+            if needs_reflow:
+                try:
+                    from pdf_edit_engine.locator import _build_index
+                    from pdf_edit_engine.reflow import (
+                        _detect_paragraphs_from_index,
+                        find_paragraph_for_match,
+                        reflow_paragraph,
+                    )
+
+                    elements = _build_index(page, match.page_number)
+                    page_width = float(page.MediaBox[2]) if page.MediaBox else 612.0
+                    paragraphs = _detect_paragraphs_from_index(
+                        elements,
+                        page_width,
+                    )
+                    para = find_paragraph_for_match(paragraphs, match)
+
+                    if para is not None:
+                        font_key = font_name if font_name.startswith("/") else f"/{font_name}"
+                        font_ref = page["/Resources"]["/Font"][font_key]
+                        result = reflow_paragraph(
+                            pdf,
+                            page,
+                            para,
+                            match,
+                            new_text,
+                            resolver,
+                            font_ref,
+                        )
+                        if result.success and not dry_run:
+                            pdf.save(output_path)
+                        _invalidate_locator_cache()
+                        return result
+                except (ReflowError, OperatorError, EncodingError, KeyError, ValueError):
+                    logger.warning(
+                        "Reflow failed, falling back to simple replacement",
+                        exc_info=True,
+                    )
+
+        ops = list(pikepdf.parse_content_stream(page))
+
+        result, _ = _apply_single_replacement(
+            pdf,
+            page,
+            ops,
+            match,
+            new_text,
+            resolver,
+            _width_cache,
+            dry_run,
         )
 
-    page = pdf.pages[match.page_number]
-    font_name = match.characters[0].font_name
-    resolver = _get_font_resolver(page, font_name)
-    width_cache = GlyphWidthCache()
+        if result.success and not dry_run:
+            new_stream = pikepdf.unparse_content_stream(ops)
+            page.Contents = pdf.make_stream(new_stream)
+            pdf.save(output_path)
 
-    # Check if reflow is needed: replacement wider than original
-    if reflow:
-        try:
-            old_width = sum(ch.width for ch in match.characters)
-            new_width = _calculate_new_width(
-                new_text,
-                page,
-                font_name,
-                match.characters[0].font_size,
-                resolver,
-                width_cache,
-            )
-            # Only reflow if meaningfully wider (>1pt avoids trivial diffs)
-            needs_reflow = new_width > old_width + 1.0
-        except (KeyError, Exception):
-            # Encoding failure — skip reflow, let simple replacement handle it
-            needs_reflow = False
-        if needs_reflow:
-            try:
-                from pdf_edit_engine.locator import _build_index
-                from pdf_edit_engine.reflow import (
-                    _detect_paragraphs_from_index,
-                    find_paragraph_for_match,
-                    reflow_paragraph,
-                )
-
-                elements = _build_index(page, match.page_number)
-                page_width = float(page.MediaBox[2]) if page.MediaBox else 612.0
-                paragraphs = _detect_paragraphs_from_index(
-                    elements,
-                    page_width,
-                )
-                para = find_paragraph_for_match(paragraphs, match)
-
-                if para is not None:
-                    font_key = font_name if font_name.startswith("/") else f"/{font_name}"
-                    font_ref = page["/Resources"]["/Font"][font_key]
-                    result = reflow_paragraph(
-                        pdf,
-                        page,
-                        para,
-                        match,
-                        new_text,
-                        resolver,
-                        font_ref,
-                    )
-                    if result.success and not dry_run:
-                        pdf.save(output_path)
-                    pdf.close()
-                    _invalidate_locator_cache()
-                    return result
-            except Exception:
-                logger.warning(
-                    "Reflow failed, falling back to simple replacement",
-                    exc_info=True,
-                )
-
-    ops = list(pikepdf.parse_content_stream(page))
-
-    result, _ = _apply_single_replacement(
-        pdf,
-        page,
-        ops,
-        match,
-        new_text,
-        resolver,
-        width_cache,
-        dry_run,
-    )
-
-    if result.success and not dry_run:
-        new_stream = pikepdf.unparse_content_stream(ops)
-        page.Contents = pdf.make_stream(new_stream)
-        pdf.save(output_path)
-
-    pdf.close()
-    # Invalidate locator cache since PDF content changed
-    _invalidate_locator_cache()
-    return result
+        # Invalidate locator cache since PDF content changed
+        _invalidate_locator_cache()
+        return result
+    finally:
+        pdf.close()
 
 
 def replace_all(
@@ -889,6 +924,7 @@ def replace_all(
     Returns:
         List of EditResult objects, one per match.
     """
+    _ensure_caches_for_pdf(pdf_path)
     if not dry_run:
         validate_output_path(output_path)
     from pdf_edit_engine.locator import find
@@ -898,65 +934,66 @@ def replace_all(
         return []
 
     pdf = pikepdf.Pdf.open(pdf_path)
-    if pdf.is_encrypted:
-        raise PDFEditError("Cannot edit encrypted PDF")
+    try:
+        if pdf.is_encrypted:
+            raise PDFEditError("Cannot edit encrypted PDF")
 
-    width_cache = GlyphWidthCache()
-    results: list[EditResult] = []
+        results: list[EditResult] = []
 
-    # Group matches by page
-    matches_by_page: dict[int, list[TextMatch]] = defaultdict(list)
-    for m in matches:
-        matches_by_page[m.page_number].append(m)
+        # Group matches by page
+        matches_by_page: dict[int, list[TextMatch]] = defaultdict(list)
+        for m in matches:
+            matches_by_page[m.page_number].append(m)
 
-    any_success = False
+        any_success = False
 
-    for page_num in sorted(matches_by_page.keys()):
-        page = pdf.pages[page_num]
-        ops = list(pikepdf.parse_content_stream(page))
-        resolver = _get_font_resolver(
-            page,
-            matches_by_page[page_num][0].characters[0].font_name,
-        )
-
-        # Sort matches in reverse operator order to preserve indices
-        page_matches = sorted(
-            matches_by_page[page_num],
-            key=lambda m: max(m.operator_refs),
-            reverse=True,
-        )
-
-        page_results: list[EditResult] = []
-        for m in page_matches:
-            result, resolver = _apply_single_replacement(
-                pdf,
+        for page_num in sorted(matches_by_page.keys()):
+            page = pdf.pages[page_num]
+            ops = list(pikepdf.parse_content_stream(page))
+            resolver = _get_font_resolver(
                 page,
-                ops,
-                m,
-                replacement,
-                resolver,
-                width_cache,
-                dry_run,
+                matches_by_page[page_num][0].characters[0].font_name,
             )
-            page_results.append(result)
-            if result.success:
-                any_success = True
 
-        # Write modified content stream for this page
+            # Sort matches in reverse operator order to preserve indices
+            page_matches = sorted(
+                matches_by_page[page_num],
+                key=lambda m: max(m.operator_refs),
+                reverse=True,
+            )
+
+            page_results: list[EditResult] = []
+            for m in page_matches:
+                result, resolver = _apply_single_replacement(
+                    pdf,
+                    page,
+                    ops,
+                    m,
+                    replacement,
+                    resolver,
+                    _width_cache,
+                    dry_run,
+                )
+                page_results.append(result)
+                if result.success:
+                    any_success = True
+
+            # Write modified content stream for this page
+            if any_success and not dry_run:
+                new_stream = pikepdf.unparse_content_stream(ops)
+                page.Contents = pdf.make_stream(new_stream)
+
+            # Reverse back to original order (we processed in reverse)
+            page_results.reverse()
+            results.extend(page_results)
+
         if any_success and not dry_run:
-            new_stream = pikepdf.unparse_content_stream(ops)
-            page.Contents = pdf.make_stream(new_stream)
+            pdf.save(output_path)
 
-        # Reverse back to original order (we processed in reverse)
-        page_results.reverse()
-        results.extend(page_results)
-
-    if any_success and not dry_run:
-        pdf.save(output_path)
-
-    pdf.close()
-    _invalidate_locator_cache()
-    return results
+        _invalidate_locator_cache()
+        return results
+    finally:
+        pdf.close()
 
 
 def batch_replace(
@@ -977,109 +1014,115 @@ def batch_replace(
     Returns:
         List of EditResult objects, one per edit.
     """
+    _ensure_caches_for_pdf(pdf_path)
     if not dry_run:
         validate_output_path(output_path)
     from pdf_edit_engine.locator import find
 
     pdf = pikepdf.Pdf.open(pdf_path)
-    if pdf.is_encrypted:
-        raise PDFEditError("Cannot edit encrypted PDF")
+    try:
+        if pdf.is_encrypted:
+            raise PDFEditError("Cannot edit encrypted PDF")
 
-    width_cache = GlyphWidthCache()
-    results: list[EditResult] = []
-    used_ops_by_page: dict[int, set[int]] = defaultdict(set)
-    any_success = False
+        results: list[EditResult] = []
+        used_ops_by_page: dict[int, set[int]] = defaultdict(set)
+        any_success = False
 
-    # Collect all (match, replacement) pairs with dedup
-    all_pairs: list[tuple[TextMatch, str, int]] = []
-    for edit_idx, edit in enumerate(edits):
-        matches = find(pdf_path, edit.find)
-        for m in matches:
-            all_pairs.append((m, edit.replace, edit_idx))
+        # Collect all (match, replacement) pairs with dedup
+        all_pairs: list[tuple[TextMatch, str, int]] = []
+        for edit_idx, edit in enumerate(edits):
+            matches = find(pdf_path, edit.find)
+            for m in matches:
+                all_pairs.append((m, edit.replace, edit_idx))
 
-    # Group by page
-    pairs_by_page: dict[int, list[tuple[TextMatch, str, int]]] = defaultdict(list)
-    for m, repl, edit_idx in all_pairs:
-        pairs_by_page[m.page_number].append((m, repl, edit_idx))
+        # Group by page
+        pairs_by_page: dict[int, list[tuple[TextMatch, str, int]]] = defaultdict(list)
+        for m, repl, edit_idx in all_pairs:
+            pairs_by_page[m.page_number].append((m, repl, edit_idx))
 
-    # Process each page
-    edit_results: dict[int, list[EditResult]] = defaultdict(list)
-    for page_num in sorted(pairs_by_page.keys()):
-        page = pdf.pages[page_num]
-        ops = list(pikepdf.parse_content_stream(page))
+        # Process each page
+        edit_results: dict[int, list[EditResult]] = defaultdict(list)
+        for page_num in sorted(pairs_by_page.keys()):
+            page = pdf.pages[page_num]
+            ops = list(pikepdf.parse_content_stream(page))
 
-        # Sort in reverse operator order
-        page_pairs = sorted(
-            pairs_by_page[page_num],
-            key=lambda p: max(p[0].operator_refs),
-            reverse=True,
-        )
+            # Sort in reverse operator order
+            page_pairs = sorted(
+                pairs_by_page[page_num],
+                key=lambda p: max(p[0].operator_refs),
+                reverse=True,
+            )
 
-        page_changed = False
-        for m, repl, edit_idx in page_pairs:
-            # Skip if operators overlap with already-processed match on same page
-            op_set = set(m.operator_refs)
-            if op_set & used_ops_by_page[page_num]:
-                edit_results[edit_idx].append(
+            page_changed = False
+            for m, repl, edit_idx in page_pairs:
+                # Skip if operators overlap with already-processed match on same page
+                op_set = set(m.operator_refs)
+                if op_set & used_ops_by_page[page_num]:
+                    edit_results[edit_idx].append(
+                        EditResult(
+                            success=False,
+                            original_text=m.matched_text,
+                            new_text=repl,
+                            font_action="kept",
+                            warnings=["Skipped: overlapping with previous edit"],
+                        )
+                    )
+                    continue
+
+                resolver = _get_font_resolver(page, m.characters[0].font_name)
+                result, resolver = _apply_single_replacement(
+                    pdf,
+                    page,
+                    ops,
+                    m,
+                    repl,
+                    resolver,
+                    _width_cache,
+                    dry_run,
+                )
+                edit_results[edit_idx].append(result)
+                if result.success:
+                    used_ops_by_page[page_num].update(m.operator_refs)
+                    any_success = True
+                    page_changed = True
+
+            if page_changed and not dry_run:
+                new_stream = pikepdf.unparse_content_stream(ops)
+                page.Contents = pdf.make_stream(new_stream)
+
+        if any_success and not dry_run:
+            pdf.save(output_path)
+
+        _invalidate_locator_cache()
+
+        # Flatten results: one per edit (aggregate per edit_idx)
+        for edit_idx in range(len(edits)):
+            if edit_idx in edit_results:
+                # Use the first result for this edit
+                results.append(edit_results[edit_idx][0])
+            else:
+                results.append(
                     EditResult(
                         success=False,
-                        original_text=m.matched_text,
-                        new_text=repl,
+                        original_text=edits[edit_idx].find,
+                        new_text=edits[edit_idx].replace,
                         font_action="kept",
-                        warnings=["Skipped: overlapping with previous edit"],
+                        warnings=["No matches found"],
                     )
                 )
-                continue
 
-            resolver = _get_font_resolver(page, m.characters[0].font_name)
-            result, resolver = _apply_single_replacement(
-                pdf,
-                page,
-                ops,
-                m,
-                repl,
-                resolver,
-                width_cache,
-                dry_run,
-            )
-            edit_results[edit_idx].append(result)
-            if result.success:
-                used_ops_by_page[page_num].update(m.operator_refs)
-                any_success = True
-                page_changed = True
-
-        if page_changed and not dry_run:
-            new_stream = pikepdf.unparse_content_stream(ops)
-            page.Contents = pdf.make_stream(new_stream)
-
-    if any_success and not dry_run:
-        pdf.save(output_path)
-
-    pdf.close()
-    _invalidate_locator_cache()
-
-    # Flatten results: one per edit (aggregate per edit_idx)
-    for edit_idx in range(len(edits)):
-        if edit_idx in edit_results:
-            # Use the first result for this edit
-            results.append(edit_results[edit_idx][0])
-        else:
-            results.append(
-                EditResult(
-                    success=False,
-                    original_text=edits[edit_idx].find,
-                    new_text=edits[edit_idx].replace,
-                    font_action="kept",
-                    warnings=["No matches found"],
-                )
-            )
-
-    return results
+        return results
+    finally:
+        pdf.close()
 
 
 def _invalidate_locator_cache() -> None:
-    """Clear the locator module's content element cache."""
+    """Clear the locator module's content element cache and surgeon caches."""
+    global _cached_pdf_path  # noqa: PLW0603
     from pdf_edit_engine import locator
 
     locator._cached_path = None  # noqa: SLF001
     locator._cached_elements = {}  # noqa: SLF001
+    _cached_pdf_path = None
+    _width_cache.clear()
+    _resolver_cache.clear()

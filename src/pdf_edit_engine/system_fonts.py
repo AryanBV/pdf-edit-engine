@@ -13,6 +13,11 @@ logger = logging.getLogger(__name__)
 
 # Module-level cache: PostScript name (str) → absolute path (str).
 # Populated lazily on first call to find_font() via the slow path.
+#
+# WARNING: Thread-unsafe global cache. This library is single-threaded.
+# The planned MCP wrapper (pdf-edit-mcp) must serialize all calls to the
+# Python engine. Do not use concurrent.futures or multiprocessing to call
+# find()/replace() in parallel.
 _FONT_CACHE: dict[str, str] | None = None
 
 # Metrically similar open-source alternatives for common proprietary fonts.

@@ -14,9 +14,8 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Text Processing :: General",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
@@ -35,6 +34,7 @@ dev = [
     "ruff>=0.4.0",
     "mypy>=1.10",
     "reportlab>=4.0",
+    "psutil>=5.9",
 ]
 
 [project.urls]
@@ -45,7 +45,7 @@ Changelog = "https://github.com/AryanBV/pdf-edit-engine/blob/main/CHANGELOG.md"
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py312"
 src = ["src"]
 
 [tool.ruff.lint]
@@ -61,4 +61,5 @@ pythonpath = ["src"]
 markers = [
     "benchmark: performance benchmark tests",
     "slow: slow tests (clean install, etc.)",
+    "stress: ultimate stress tests",
 ]

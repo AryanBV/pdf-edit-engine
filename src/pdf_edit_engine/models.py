@@ -30,7 +30,7 @@ class FontInfo:
 
     name: str
     postscript_name: str
-    encoding_type: Literal["WinAnsi", "Identity-H", "Custom"]
+    encoding_type: Literal["WinAnsi", "Identity-H", "MacRoman", "Custom"]
     is_subset: bool
     glyph_count: int
     embedded_type: Literal["TrueType", "CFF", "Type1"]
@@ -39,7 +39,13 @@ class FontInfo:
 
 @dataclass
 class TextMatch:
-    """A located text match in a PDF with operator references."""
+    """A located text match in a PDF with operator references.
+
+    Note: TextMatch objects contain operator indices into the content stream.
+    After any replace() call on the same PDF, previously returned TextMatch
+    objects are invalidated. Use batch_replace() for multi-edit workflows,
+    or call find() again after each replace().
+    """
 
     matched_text: str
     page_number: int
