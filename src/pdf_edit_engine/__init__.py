@@ -34,6 +34,12 @@ from pdf_edit_engine.models import (
     TextMatch,
 )
 from pdf_edit_engine.reflow import detect_paragraphs, reflow_paragraph
+from pdf_edit_engine.structural import (
+    delete_block,
+    insert_text_block,
+    replace_block,
+    shift_content_below,
+)
 from pdf_edit_engine.surgeon import batch_replace, replace, replace_all
 from pdf_edit_engine.wrapper import (
     add_bookmark,
@@ -63,6 +69,11 @@ __all__ = [
     "replace",
     "replace_all",
     "batch_replace",
+    # structural
+    "replace_block",
+    "delete_block",
+    "insert_text_block",
+    "shift_content_below",
     # fonts
     "analyze_subset",
     "can_render",

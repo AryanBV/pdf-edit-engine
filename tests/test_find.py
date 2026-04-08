@@ -141,6 +141,42 @@ class TestMultipleMatches:
         assert len(matches) == 1
 
 
+# ── TestCrossOperatorFind ────────────────────────────────────────────
+
+
+class TestCrossOperatorFind:
+    """Tests for find() matching text that spans multiple operators."""
+
+    def test_find_emdash_spanning(self) -> None:
+        """Find text spanning an em-dash operator boundary."""
+        matches = find(RESUME_PDF, "AJSP Manager \u2014 Business Management System")
+        assert len(matches) == 1
+        m = matches[0]
+        assert "AJSP Manager" in m.matched_text
+        assert "Business Management System" in m.matched_text
+        # Must span multiple operators
+        assert len(m.operator_refs) >= 2
+
+    def test_find_partial_emdash_text(self) -> None:
+        """Find a shorter span that still crosses operators."""
+        matches = find(RESUME_PDF, "AJSP Manager \u2014 Business")
+        assert len(matches) == 1
+        assert len(matches[0].operator_refs) >= 2
+
+    def test_find_cross_operator_characters(self) -> None:
+        """Characters from a cross-operator match have valid operator indices."""
+        matches = find(RESUME_PDF, "AJSP Manager \u2014 Business Management System")
+        assert len(matches) == 1
+        m = matches[0]
+        # All characters should have valid fields
+        for ch in m.characters:
+            assert isinstance(ch, TextCharacter)
+            assert ch.operator_index >= 0
+        # Characters should come from multiple distinct operators
+        unique_ops = {ch.operator_index for ch in m.characters}
+        assert len(unique_ops) >= 2
+
+
 # ── TestCache ─────────────────────────────────────────────────────────
 
 

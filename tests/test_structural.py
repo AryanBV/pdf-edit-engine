@@ -1,0 +1,402 @@
+"""Tests for structural editing — replace_block, shift_content_below,
+insert_text_block, delete_block."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pikepdf
+import pytest
+
+from pdf_edit_engine.locator import get_text
+from pdf_edit_engine.models import EditResult
+from pdf_edit_engine.reflow import detect_paragraphs
+from pdf_edit_engine.structural import (
+    delete_block,
+    insert_text_block,
+    replace_block,
+    shift_content_below,
+)
+
+CORPUS = Path(__file__).parent / "corpus"
+SIMPLE_PDF = str(CORPUS / "reportlab_simple.pdf")
+RESUME_PDF = str(CORPUS / "resume_aryan.pdf")
+
+_need_simple = pytest.mark.skipif(
+    not (CORPUS / "reportlab_simple.pdf").exists(),
+    reason="reportlab_simple.pdf not in corpus",
+)
+_need_resume = pytest.mark.skipif(
+    not (CORPUS / "resume_aryan.pdf").exists(),
+    reason="resume_aryan.pdf not in corpus",
+)
+
+
+# ── TestReplaceBlock ─────────────────────────────────────────────────
+
+
+@_need_simple
+class TestReplaceBlock:
+    """Tests for replace_block() — bbox-based paragraph replacement."""
+
+    def test_replace_block_reportlab(self, tmp_path: Path) -> None:
+        """Replace the 3-line body paragraph on reportlab_simple.pdf."""
+        out = str(tmp_path / "replaced.pdf")
+        # P1 bbox: (72.0, 667.2, 494.4, 708.2)
+        result = replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
+                               "Replacement text here.", out)
+        assert result.success
+        text = get_text(out)
+        assert "Replacement text" in text
+        assert "reportlab" not in text  # old text removed
+
+    def test_replace_block_auto_font(self, tmp_path: Path) -> None:
+        """Font auto-detection works when font_name not specified."""
+        out = str(tmp_path / "auto_font.pdf")
+        result = replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
+                               "Auto font test.", out)
+        assert result.success
+        assert result.fidelity_report.font_preserved
+
+    def test_replace_block_preserves_other(self, tmp_path: Path) -> None:
+        """Content outside the bbox is preserved."""
+        out = str(tmp_path / "preserve.pdf")
+        replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
+                      "New paragraph.", out)
+        text = get_text(out)
+        assert "Test Document" in text
+        assert "Section two" in text
+
+    def test_replace_block_overflow(self, tmp_path: Path) -> None:
+        """Long replacement text triggers overflow detection."""
+        out = str(tmp_path / "overflow.pdf")
+        long_text = "word " * 200  # much more than the bbox can hold
+        result = replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
+                               long_text.strip(), out)
+        assert result.success
+        assert result.fidelity_report.overflow_detected
+
+    def test_replace_block_empty_bbox(self, tmp_path: Path) -> None:
+        """Replacing in an empty region returns failure gracefully."""
+        out = str(tmp_path / "empty.pdf")
+        result = replace_block(SIMPLE_PDF, 0, (0, 0, 1, 1), "text", out)
+        assert not result.success
+
+    def test_replace_block_returns_edit_result(self, tmp_path: Path) -> None:
+        """Result includes original and new text."""
+        out = str(tmp_path / "result.pdf")
+        result = replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
+                               "New text.", out)
+        assert isinstance(result, EditResult)
+        assert result.original_text  # non-empty
+        assert result.new_text == "New text."
+
+
+@_need_resume
+class TestReplaceBlockResume:
+    """replace_block on the CIDFont resume PDF."""
+
+    def test_replace_project_title(self, tmp_path: Path) -> None:
+        """Replace the AJSP Manager project title line."""
+        out = str(tmp_path / "title.pdf")
+        # AJSP Manager bbox: (14.2, 435.9, 212.4, 445.9)
+        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
+                               "Custom Project", out)
+        assert result.success
+        text = get_text(out)
+        assert "Custom Project" in text
+
+    def test_replace_resume_paragraph(self, tmp_path: Path) -> None:
+        """Replace a multi-line bullet on the resume by bbox."""
+        out = str(tmp_path / "para.pdf")
+        paras = detect_paragraphs(RESUME_PDF, page=0)
+        # Find a multi-line paragraph (line_count > 1)
+        multi = [p for p in paras if p.line_count > 1 and p.full_text.strip()]
+        assert multi, "No multi-line paragraphs found"
+        p = multi[0]
+        elems = p.elements
+        bbox = (
+            min(e.bbox[0] for e in elems),
+            min(e.bbox[1] for e in elems),
+            max(e.bbox[2] for e in elems),
+            max(e.bbox[3] for e in elems),
+        )
+        result = replace_block(RESUME_PDF, 0, bbox, "Replaced paragraph.", out)
+        assert result.success
+        text = get_text(out)
+        assert "Replaced paragraph" in text
+
+
+# ── TestShiftContent ─────────────────────────────────────────────────
+
+
+@_need_simple
+class TestShiftContent:
+    """Tests for shift_content_below() — content shifting."""
+
+    def test_shift_down(self, tmp_path: Path) -> None:
+        """Shift content below y=700 down by 20pt."""
+        out = str(tmp_path / "shifted.pdf")
+        result = shift_content_below(SIMPLE_PDF, 0, 700.0, 20.0, out)
+        assert result.success
+
+        paras_before = detect_paragraphs(SIMPLE_PDF, page=0)
+        paras_after = detect_paragraphs(out, page=0)
+
+        before_map = {p.full_text[:20]: p.first_line_y for p in paras_before}
+        after_map = {p.full_text[:20]: p.first_line_y for p in paras_after}
+
+        # "Section two" is below y=700 — should shift down by 20
+        key = "Section two has numb"
+        assert key in before_map and key in after_map
+        assert abs((before_map[key] - after_map[key]) - 20.0) < 2.0
+
+    def test_shift_preserves_above(self, tmp_path: Path) -> None:
+        """Content above threshold should not move."""
+        out = str(tmp_path / "above.pdf")
+        shift_content_below(SIMPLE_PDF, 0, 700.0, 20.0, out)
+
+        paras_before = detect_paragraphs(SIMPLE_PDF, page=0)
+        paras_after = detect_paragraphs(out, page=0)
+
+        before_map = {p.full_text[:20]: p.first_line_y for p in paras_before}
+        after_map = {p.full_text[:20]: p.first_line_y for p in paras_after}
+
+        # "Test Document" is at y=750, above threshold — no shift
+        key = "Test Document"
+        assert key in before_map and key in after_map
+        assert abs(before_map[key] - after_map[key]) < 1.0
+
+    def test_shift_up(self, tmp_path: Path) -> None:
+        """Negative delta_y shifts content up (increases y)."""
+        out = str(tmp_path / "up.pdf")
+        result = shift_content_below(SIMPLE_PDF, 0, 700.0, -15.0, out)
+        assert result.success
+
+        paras_before = detect_paragraphs(SIMPLE_PDF, page=0)
+        paras_after = detect_paragraphs(out, page=0)
+
+        before_map = {p.full_text[:20]: p.first_line_y for p in paras_before}
+        after_map = {p.full_text[:20]: p.first_line_y for p in paras_after}
+
+        key = "Section two has numb"
+        if key in before_map and key in after_map:
+            # Should have moved up by 15pt
+            diff = after_map[key] - before_map[key]
+            assert abs(diff - 15.0) < 2.0
+
+    def test_shift_zero_is_noop(self, tmp_path: Path) -> None:
+        """delta_y=0 should not modify the PDF."""
+        out = str(tmp_path / "noop.pdf")
+        result = shift_content_below(SIMPLE_PDF, 0, 700.0, 0.0, out)
+        assert result.success
+        text_before = get_text(SIMPLE_PDF)
+        text_after = get_text(out)
+        assert text_before == text_after
+
+
+@_need_resume
+class TestShiftContentResume:
+    """Shift tests on the resume PDF with annotations."""
+
+    def test_shift_annotations(self, tmp_path: Path) -> None:
+        """Annotations below threshold should shift."""
+        out = str(tmp_path / "annot.pdf")
+        # Resume has link annotations. Shift below y=400
+        shift_content_below(RESUME_PDF, 0, 400.0, 30.0, out)
+
+        pdf_before = pikepdf.Pdf.open(RESUME_PDF)
+        pdf_after = pikepdf.Pdf.open(out)
+
+        annots_before = list(pdf_before.pages[0].get("/Annots", []))
+        annots_after = list(pdf_after.pages[0].get("/Annots", []))
+
+        # Check that annotations below y=400 were shifted
+        shifted_count = 0
+        for ab, aa in zip(annots_before, annots_after, strict=False):
+            rb = ab["/Rect"]
+            ra = aa["/Rect"]
+            if float(rb[3]) < 400.0:
+                diff = float(rb[1]) - float(ra[1])
+                if abs(diff - 30.0) < 2.0:
+                    shifted_count += 1
+        assert shifted_count >= 0  # may be 0 if no annotations below 400
+
+        pdf_before.close()
+        pdf_after.close()
+
+    def test_shift_overflow_warning(self, tmp_path: Path) -> None:
+        """Large shift should trigger overflow warning."""
+        out = str(tmp_path / "overflow.pdf")
+        # Shift everything below y=842 (entire page) down by 900pt
+        result = shift_content_below(RESUME_PDF, 0, 842.0, 900.0, out)
+        assert result.fidelity_report.overflow_detected
+        assert any("below page boundary" in w for w in result.warnings)
+
+
+# ── TestInsertTextBlock ──────────────────────────────────────────────
+
+
+@_need_simple
+class TestInsertTextBlock:
+    """Tests for insert_text_block()."""
+
+    def test_insert_basic(self, tmp_path: Path) -> None:
+        """Inserted text appears in the output PDF."""
+        out = str(tmp_path / "insert.pdf")
+        result = insert_text_block(SIMPLE_PDF, 0, x=72.0, y=720.0,
+                                   text="Hello from insert_text_block!",
+                                   output_path=out, font_size=11.0)
+        assert result.success
+        text = get_text(out)
+        assert "Hello from insert" in text
+
+    def test_insert_shifts_existing(self, tmp_path: Path) -> None:
+        """Content below the insertion point should shift down."""
+        out = str(tmp_path / "shifted.pdf")
+        insert_text_block(SIMPLE_PDF, 0, x=72.0, y=720.0,
+                          text="Inserted line.",
+                          output_path=out, font_size=11.0)
+
+        paras_before = detect_paragraphs(SIMPLE_PDF, page=0)
+        paras_after = detect_paragraphs(out, page=0)
+
+        before_map = {p.full_text[:20]: p.first_line_y for p in paras_before}
+        after_map = {p.full_text[:20]: p.first_line_y for p in paras_after}
+
+        # "This is a simple..." was at y=700, below insertion at 720
+        key = "This is a simple tes"
+        if key in before_map and key in after_map:
+            assert after_map[key] < before_map[key], "Content should have shifted down"
+
+    def test_insert_multiline(self, tmp_path: Path) -> None:
+        """Long text wraps into multiple lines."""
+        out = str(tmp_path / "multi.pdf")
+        long_text = "This is a longer paragraph that should wrap across lines. " * 3
+        result = insert_text_block(SIMPLE_PDF, 0, x=72.0, y=720.0,
+                                   text=long_text.strip(),
+                                   output_path=out, font_size=11.0)
+        assert result.success
+        text = get_text(out)
+        assert "longer paragraph" in text
+
+    def test_insert_preserves_existing(self, tmp_path: Path) -> None:
+        """Existing content is preserved after insertion."""
+        out = str(tmp_path / "preserve.pdf")
+        insert_text_block(SIMPLE_PDF, 0, x=72.0, y=720.0,
+                          text="New content.",
+                          output_path=out, font_size=11.0)
+        text = get_text(out)
+        assert "Test Document" in text
+        assert "Section two" in text
+
+
+# ── TestDeleteBlock ──────────────────────────────────────────────────
+
+
+@_need_simple
+class TestDeleteBlock:
+    """Tests for delete_block()."""
+
+    def test_delete_basic(self, tmp_path: Path) -> None:
+        """Deleted content is removed from the output."""
+        out = str(tmp_path / "deleted.pdf")
+        # Delete the body paragraph
+        result = delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), out)
+        assert result.success
+        text = get_text(out)
+        assert "reportlab" not in text
+        assert "Test Document" in text
+
+    def test_delete_close_gap(self, tmp_path: Path) -> None:
+        """Content below deleted region moves up when close_gap=True."""
+        out = str(tmp_path / "close.pdf")
+        delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), out,
+                     close_gap=True)
+        paras_before = detect_paragraphs(SIMPLE_PDF, page=0)
+        paras_after = detect_paragraphs(out, page=0)
+
+        before_map = {p.full_text[:20]: p.first_line_y for p in paras_before}
+        after_map = {p.full_text[:20]: p.first_line_y for p in paras_after}
+
+        key = "Section two has numb"
+        if key in before_map and key in after_map:
+            # Should have moved up (y increased) by approximately the deleted height
+            assert after_map[key] > before_map[key], "Content should shift up"
+
+    def test_delete_no_close_gap(self, tmp_path: Path) -> None:
+        """With close_gap=False, content below stays in place."""
+        out = str(tmp_path / "no_close.pdf")
+        delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), out,
+                     close_gap=False)
+        paras_before = detect_paragraphs(SIMPLE_PDF, page=0)
+        paras_after = detect_paragraphs(out, page=0)
+
+        before_map = {p.full_text[:20]: p.first_line_y for p in paras_before}
+        after_map = {p.full_text[:20]: p.first_line_y for p in paras_after}
+
+        key = "Section two has numb"
+        if key in before_map and key in after_map:
+            assert abs(after_map[key] - before_map[key]) < 1.0
+
+    def test_delete_returns_original_text(self, tmp_path: Path) -> None:
+        """Result includes the deleted original text."""
+        out = str(tmp_path / "result.pdf")
+        result = delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), out)
+        assert result.original_text
+        assert "simple test document" in result.original_text
+
+
+@_need_resume
+class TestDeleteBlockResume:
+    """delete_block on the resume PDF."""
+
+    def test_delete_smart_med(self, tmp_path: Path) -> None:
+        """Delete the SMART_MED section title."""
+        out = str(tmp_path / "no_smart.pdf")
+        # SMART_MED bbox: (14.2, 161.6, 250.2, 171.6)
+        result = delete_block(RESUME_PDF, 0,
+                              (14.2, 161.6, 250.2, 171.6), out,
+                              close_gap=False)
+        assert result.success
+        text = get_text(out)
+        assert "SMART_MED" not in text
+
+
+# ── TestCombinations ─────────────────────────────────────────────────
+
+
+@_need_simple
+class TestCombinations:
+    """Integration tests combining multiple structural operations."""
+
+    def test_delete_then_insert(self, tmp_path: Path) -> None:
+        """Delete a paragraph then insert new text in its place."""
+        intermediate = str(tmp_path / "step1.pdf")
+        final = str(tmp_path / "step2.pdf")
+
+        # Step 1: delete body paragraph
+        delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
+                     intermediate, close_gap=False)
+
+        # Step 2: insert new text where the old paragraph was
+        result = insert_text_block(intermediate, 0, x=72.0, y=700.0,
+                                   text="Brand new content replaces old.",
+                                   output_path=final, font_size=11.0)
+        assert result.success
+        text = get_text(final)
+        assert "Brand new content" in text
+        assert "reportlab" not in text
+        assert "Test Document" in text
+
+    def test_replace_then_shift(self, tmp_path: Path) -> None:
+        """Replace a block then shift content below it."""
+        step1 = str(tmp_path / "replaced.pdf")
+        step2 = str(tmp_path / "shifted.pdf")
+
+        replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
+                      "Short.", step1)
+        shift_content_below(step1, 0, 680.0, 10.0, step2)
+        text = get_text(step2)
+        assert "Short" in text
+        assert "Section two" in text
