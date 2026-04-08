@@ -61,9 +61,7 @@ def _get_font_names(pdf_path: str) -> set[str]:
 class TestFontPreservation:
     """Prove that pdf-edit-engine preserves fonts while PyMuPDF does not."""
 
-    @pytest.mark.skipif(
-        not RESUME_PDF.exists(), reason="resume_aryan.pdf not in corpus"
-    )
+    @pytest.mark.skipif(not RESUME_PDF.exists(), reason="resume_aryan.pdf not in corpus")
     def test_resume_font_preservation(self, tmp_path: Path) -> None:
         """Identity-H CIDFont: our edit preserves Calibri, PyMuPDF adds fonts."""
         resume = str(RESUME_PDF)
@@ -94,17 +92,13 @@ class TestFontPreservation:
             f"Font mismatch:\n  Original: {original_fonts}\n  Ours: {our_fonts}"
         )
         # PyMuPDF output should differ (adds its own font)
-        assert pymupdf_fonts != original_fonts, (
-            "Expected PyMuPDF to alter font set, but it didn't"
-        )
+        assert pymupdf_fonts != original_fonts, "Expected PyMuPDF to alter font set, but it didn't"
 
         print(f"\n  Original fonts: {sorted(original_fonts)}")
         print(f"  Our output:     {sorted(our_fonts)}  <- SAME")
         print(f"  PyMuPDF output: {sorted(pymupdf_fonts)}  <- DIFFERENT")
 
-    @pytest.mark.skipif(
-        not CIDFONT_PDF.exists(), reason="cidfont_synthetic.pdf not in corpus"
-    )
+    @pytest.mark.skipif(not CIDFONT_PDF.exists(), reason="cidfont_synthetic.pdf not in corpus")
     def test_cidfont_synthetic_font_preservation(self, tmp_path: Path) -> None:
         """Synthetic Identity-H CIDFont: our edit preserves font, PyMuPDF does not."""
         cidfont = str(CIDFONT_PDF)
@@ -208,13 +202,10 @@ class TestRoundTrip:
         original_fonts = get_fonts(SIMPLE_PDF)
         assert len(final_fonts) >= 1, "No fonts in final output"
         print(
-            f"\n  Round-trip: original fonts={len(original_fonts)},"
-            f" final fonts={len(final_fonts)}"
+            f"\n  Round-trip: original fonts={len(original_fonts)}, final fonts={len(final_fonts)}"
         )
 
-    @pytest.mark.skipif(
-        not RESUME_PDF.exists(), reason="resume_aryan.pdf not in corpus"
-    )
+    @pytest.mark.skipif(not RESUME_PDF.exists(), reason="resume_aryan.pdf not in corpus")
     def test_round_trip_with_extension(self, tmp_path: Path) -> None:
         """Edit with a character requiring font extension, then edit again."""
         resume = str(RESUME_PDF)
@@ -267,9 +258,7 @@ class TestRoundTrip:
             pdf.save(resave)
         pikepdf.Pdf.open(resave).close()
 
-    @pytest.mark.skipif(
-        not CIDFONT_PDF.exists(), reason="cidfont_synthetic.pdf not in corpus"
-    )
+    @pytest.mark.skipif(not CIDFONT_PDF.exists(), reason="cidfont_synthetic.pdf not in corpus")
     def test_round_trip_cidfont(self, tmp_path: Path) -> None:
         """Edit cidfont_synthetic.pdf 3 times sequentially."""
         cidfont = str(CIDFONT_PDF)
@@ -297,7 +286,6 @@ class TestRoundTrip:
     def test_batch_then_verify(self, tmp_path: Path) -> None:
         """batch_replace with multiple edits, all appear in output."""
         text = get_text(SIMPLE_PDF)
-        # Find words that actually exist
         edits: list[Edit] = []
         pairs = [
             ("Test Document", "Changed Document"),
@@ -306,16 +294,18 @@ class TestRoundTrip:
         for old, new in pairs:
             if old in text:
                 edits.append(Edit(find=old, replace=new))
-        if len(edits) < 2:
-            pytest.skip("Not enough findable text for batch test")
+        assert len(edits) == 2, "Both test phrases must be present in source PDF"
 
         output = str(tmp_path / "batch.pdf")
-        results = batch_replace(SIMPLE_PDF, edits, output)
+        results = batch_replace(SIMPLE_PDF, edits, output, reflow=False)
         successful = sum(1 for r in results if r.success)
-        assert successful >= 1
+        assert successful == len(edits), f"Only {successful}/{len(edits)} edits succeeded"
 
-        # Verify output is valid
+        # Verify output is valid and contains all replacements
         pikepdf.Pdf.open(output).close()
+        text_out = get_text(output)
+        for edit in edits:
+            assert edit.replace in text_out, f"'{edit.replace}' not found in output"
 
 
 # ── Phase 5: Clean install verification ───────────────────────────────

@@ -139,11 +139,12 @@ def _encode_with_kerning(
 
     bw = resolver.byte_width
     glyph_items: list[tuple[bytes, float]] = []  # (encoded_bytes, width_font_units)
-    for char in text:
-        encoded = resolver.encode(char)
-        char_code = (encoded[0] << 8) | encoded[1] if bw == 2 and len(encoded) >= 2 else encoded[0]
+    full_encoded = resolver.encode(text)
+    for i in range(0, len(full_encoded), bw):
+        glyph_bytes = full_encoded[i : i + bw]
+        char_code = (glyph_bytes[0] << 8) | glyph_bytes[1] if bw == 2 else glyph_bytes[0]
         w = width_cache.get_width(page, font_name, char_code)
-        glyph_items.append((encoded, w))
+        glyph_items.append((glyph_bytes, w))
 
     if len(glyph_items) <= 1:
         # Single glyph — no gaps to distribute kerning
@@ -165,11 +166,9 @@ def _encode_with_kerning(
     num_gaps = len(glyph_items) - 1
 
     if abs(total_kern) > 0.5 * original_fu and original_fu > 0:
-        logger.warning(
-            "Large width delta (%.1f%%) in rebuild kerning for '%s'",
-            abs(total_kern) / original_fu * 100,
-            text[:20],
-        )
+        # Width delta too large for kerning — return flat unkerned string
+        flat = b"".join(enc for enc, _ in glyph_items)
+        return [pikepdf.String(flat)]
 
     # Distribute kerning PROPORTIONALLY to each glyph's width.
     # Uniform distribution causes narrow chars (i, l, t) to overlap because
@@ -502,10 +501,17 @@ def _apply_single_replacement(
             op_replacement_map[op_idx] = new_text[idx : idx + n]
             idx += n
     elif sorted_ops:
-        # Genuinely different length: first operator gets all
-        op_replacement_map[sorted_ops[0]] = new_text
-        for op_idx in sorted_ops[1:]:
-            op_replacement_map[op_idx] = ""
+        # Different length: distribute proportionally by original char count
+        total_orig_chars = sum(len(chars_by_op[op]) for op in sorted_ops)
+        idx = 0
+        for i, op_idx in enumerate(sorted_ops):
+            n = len(chars_by_op[op_idx])
+            if i < len(sorted_ops) - 1:
+                share = round(len(new_text) * n / total_orig_chars) if total_orig_chars > 0 else 0
+            else:
+                share = len(new_text) - idx  # last op gets remainder
+            op_replacement_map[op_idx] = new_text[idx : idx + share]
+            idx += share
 
     # Merge narrow operators (1-2 chars) into adjacent wide operators.
     # Narrow operators (em-dashes, spaces, hyphens, "| ") have fixed Tm positions
@@ -904,6 +910,49 @@ def replace(
         pdf.close()
 
 
+def _try_reflow_match(
+    pdf: pikepdf.Pdf,
+    page: pikepdf.Page,
+    page_num: int,
+    match: TextMatch,
+    new_text: str,
+) -> EditResult | None:
+    """Attempt reflow for a single match.  Returns EditResult on success, None on failure."""
+    try:
+        font_name = match.characters[0].font_name
+        resolver = _get_font_resolver(page, font_name)
+        old_width = sum(ch.width for ch in match.characters)
+        new_width = _calculate_new_width(
+            new_text, page, font_name,
+            match.characters[0].font_size, resolver, _width_cache,
+        )
+        if new_width <= old_width + 1.0:
+            return None  # not meaningfully wider
+
+        from pdf_edit_engine.locator import _build_index
+        from pdf_edit_engine.reflow import (
+            _detect_paragraphs_from_index,
+            find_paragraph_for_match,
+            reflow_paragraph,
+        )
+
+        elements = _build_index(page, page_num)
+        page_width = float(page.MediaBox[2]) if page.MediaBox else 612.0
+        paragraphs = _detect_paragraphs_from_index(elements, page_width)
+        para = find_paragraph_for_match(paragraphs, match)
+        if para is None:
+            return None
+
+        font_key = font_name if font_name.startswith("/") else f"/{font_name}"
+        font_ref = page["/Resources"]["/Font"][font_key]
+        result = reflow_paragraph(pdf, page, para, match, new_text, resolver, font_ref)
+        return result if result.success else None
+    except (ReflowError, OperatorError, EncodingError, FontNotFoundError,
+            KeyError, ValueError):
+        logger.warning("Reflow failed, falling back to simple replacement", exc_info=True)
+        return None
+
+
 def replace_all(
     pdf_path: str,
     search: str,
@@ -911,6 +960,7 @@ def replace_all(
     output_path: str,
     *,
     dry_run: bool = False,
+    reflow: bool = True,
 ) -> list[EditResult]:
     """Find and replace all occurrences of text in a PDF.
 
@@ -920,6 +970,7 @@ def replace_all(
         replacement: Replacement text.
         output_path: Path for the output PDF.
         dry_run: If True, simulate edits without writing output.
+        reflow: If True and replacement is wider, attempt paragraph reflow.
 
     Returns:
         List of EditResult objects, one per match.
@@ -963,23 +1014,42 @@ def replace_all(
             )
 
             page_results: list[EditResult] = []
+            page_reflowed = False
+            simple_success = False
             for m in page_matches:
-                result, resolver = _apply_single_replacement(
-                    pdf,
-                    page,
-                    ops,
-                    m,
-                    replacement,
-                    resolver,
-                    _width_cache,
-                    dry_run,
-                )
+                # Attempt reflow for the first qualifying match per page
+                if reflow and not dry_run and not page_reflowed:
+                    reflow_result = _try_reflow_match(
+                        pdf, page, page_num, m, replacement,
+                    )
+                    if reflow_result is not None:
+                        page_results.append(reflow_result)
+                        any_success = True
+                        page_reflowed = True
+                        # Re-parse ops since reflow wrote to page directly
+                        ops = list(pikepdf.parse_content_stream(page))
+                        continue
+
+                try:
+                    result, resolver = _apply_single_replacement(
+                        pdf, page, ops, m, replacement,
+                        resolver, _width_cache, dry_run,
+                    )
+                except OperatorError:
+                    result = EditResult(
+                        success=False,
+                        original_text=m.matched_text,
+                        new_text=replacement,
+                        font_action="kept",
+                        warnings=["Skipped: operator indices invalidated by prior reflow"],
+                    )
                 page_results.append(result)
                 if result.success:
                     any_success = True
+                    simple_success = True
 
             # Write modified content stream for this page
-            if any_success and not dry_run:
+            if simple_success and not dry_run:
                 new_stream = pikepdf.unparse_content_stream(ops)
                 page.Contents = pdf.make_stream(new_stream)
 
@@ -1002,6 +1072,7 @@ def batch_replace(
     output_path: str,
     *,
     dry_run: bool = False,
+    reflow: bool = True,
 ) -> list[EditResult]:
     """Apply multiple find-and-replace operations to a PDF in a single pass.
 
@@ -1010,6 +1081,7 @@ def batch_replace(
         edits: List of Edit objects with find/replace pairs.
         output_path: Path for the output PDF.
         dry_run: If True, simulate edits without writing output.
+        reflow: If True and replacement is wider, attempt paragraph reflow.
 
     Returns:
         List of EditResult objects, one per edit.
@@ -1054,6 +1126,7 @@ def batch_replace(
             )
 
             page_changed = False
+            page_reflowed = False
             for m, repl, edit_idx in page_pairs:
                 # Skip if operators overlap with already-processed match on same page
                 op_set = set(m.operator_refs)
@@ -1069,17 +1142,31 @@ def batch_replace(
                     )
                     continue
 
+                # Attempt reflow for the first qualifying match per page
+                if reflow and not dry_run and not page_reflowed:
+                    reflow_result = _try_reflow_match(pdf, page, page_num, m, repl)
+                    if reflow_result is not None:
+                        edit_results[edit_idx].append(reflow_result)
+                        used_ops_by_page[page_num].update(m.operator_refs)
+                        any_success = True
+                        page_reflowed = True
+                        ops = list(pikepdf.parse_content_stream(page))
+                        continue
+
                 resolver = _get_font_resolver(page, m.characters[0].font_name)
-                result, resolver = _apply_single_replacement(
-                    pdf,
-                    page,
-                    ops,
-                    m,
-                    repl,
-                    resolver,
-                    _width_cache,
-                    dry_run,
-                )
+                try:
+                    result, resolver = _apply_single_replacement(
+                        pdf, page, ops, m, repl,
+                        resolver, _width_cache, dry_run,
+                    )
+                except OperatorError:
+                    result = EditResult(
+                        success=False,
+                        original_text=m.matched_text,
+                        new_text=repl,
+                        font_action="kept",
+                        warnings=["Skipped: operator indices invalidated by prior reflow"],
+                    )
                 edit_results[edit_idx].append(result)
                 if result.success:
                     used_ops_by_page[page_num].update(m.operator_refs)
