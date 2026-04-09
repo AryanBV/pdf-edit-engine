@@ -421,6 +421,190 @@ def shift_content_below(
         pdf.close()
 
 
+def _replace_block_on_page(
+    pdf: pikepdf.Pdf,
+    page_obj: pikepdf.Page,
+    page_number: int,
+    bbox: tuple[float, float, float, float],
+    new_text: str,
+    font_name: str | None = None,
+    font_size: float | None = None,
+) -> tuple[EditResult, float]:
+    """Core replace_block logic operating on an open PDF page.
+
+    Does NOT save the PDF — caller is responsible for saving.
+
+    Args:
+        pdf: Open pikepdf.Pdf object.
+        page_obj: Page to modify.
+        page_number: 0-indexed page number.
+        bbox: Target region (x0, y0, x1, y1) in PDF coordinates.
+        new_text: Replacement text.
+        font_name: Font resource name (e.g. 'F1').  Auto-detected if None.
+        font_size: Font size in points.  Auto-detected if None.
+
+    Returns:
+        Tuple of (EditResult, overflow_delta).  overflow_delta is positive
+        when the replacement text extends below the original bbox.
+    """
+    # Build element index and find elements in bbox
+    elements = _build_index(page_obj, page_number)
+    matched_elems, op_indices = _collect_elements_in_bbox(elements, bbox)
+
+    if not matched_elems:
+        return EditResult(
+            success=False,
+            original_text="",
+            new_text=new_text,
+            font_action="kept",
+            warnings=["No content found in specified bounding box"],
+        ), 0.0
+
+    # Detect font if not specified
+    det_name, det_size, fill_color = _detect_font_from_elements(matched_elems)
+    if font_name is None:
+        font_name = det_name
+    if font_size is None:
+        font_size = det_size
+
+    # Collect original text for the result
+    original_parts: list[str] = []
+    for elem in matched_elems:
+        if elem.text_content:
+            original_parts.append(elem.text_content)
+    original_text = " ".join(original_parts)
+
+    # Parse content stream and compute removal set
+    ops: _Ops = list(pikepdf.parse_content_stream(page_obj))
+    blocks = _find_bt_et_blocks(ops)
+    removal_indices = _expand_to_bt_et(sorted(op_indices), blocks)
+    removal_set = set(removal_indices)
+
+    # Resolve font for encoding
+    font_key = font_name if font_name.startswith("/") else f"/{font_name}"
+    clean_name = font_name.lstrip("/")
+    try:
+        font_ref = page_obj["/Resources"]["/Font"][font_key]
+    except (KeyError, TypeError) as exc:
+        raise OperatorError(
+            f"Font {font_name} not found in page resources"
+        ) from exc
+
+    resolver = _resolver_cache.get_resolver(page_obj, clean_name)
+
+    # Check encodability — extend font subset if needed
+    can_enc, missing = resolver.can_encode(new_text)
+    font_action_str = "kept"
+    if not can_enc:
+        try:
+            from pdf_edit_engine.fonts import extend_subset
+
+            extend_subset(pdf, page_obj, clean_name, "".join(missing))
+            _resolver_cache.evict(page_obj, clean_name)
+            resolver = _resolver_cache.get_resolver(page_obj, clean_name)
+            can_enc_after, still_missing = resolver.can_encode(new_text)
+            if not can_enc_after:
+                return EditResult(
+                    success=False,
+                    original_text=" ".join(original_parts),
+                    new_text=new_text,
+                    font_action="failed",
+                    warnings=[f"Cannot encode: {''.join(still_missing)}"],
+                    fidelity_report=FidelityReport(
+                        font_preserved=True,
+                        font_substituted=None,
+                        overflow_detected=False,
+                        reflow_applied=False,
+                        glyphs_missing=still_missing,
+                    ),
+                ), 0.0
+            font_action_str = "extended"
+        except Exception:
+            logger.warning("Font extension failed", exc_info=True)
+            return EditResult(
+                success=False,
+                original_text=" ".join(original_parts),
+                new_text=new_text,
+                font_action="failed",
+                warnings=["Font extension failed"],
+            ), 0.0
+
+    # Break text into lines for the bbox width
+    bbox_width = bbox[2] - bbox[0]
+    lines = break_into_lines(
+        new_text,
+        bbox_width,
+        resolver,
+        font_ref,
+        font_size,
+    )
+
+    # Line height from detected elements or default
+    line_height = font_size * 1.2
+
+    # Calculate overflow and shift content below if needed
+    bbox_height = bbox[3] - bbox[1]
+    text_height = len(lines) * line_height
+    overflow_delta = text_height - bbox_height
+
+    shift_warnings: list[str] = []
+    if overflow_delta > 0:
+        shift_warnings = _shift_content_below_inplace(
+            pdf, page_obj, page_number, bbox[1], overflow_delta,
+        )
+        # Re-parse content stream after in-place shift
+        ops = list(pikepdf.parse_content_stream(page_obj))
+        # Indices are stable (shift modifies values, not count/order)
+        # but recompute defensively from fresh parse
+        blocks = _find_bt_et_blocks(ops)
+        removal_indices = _expand_to_bt_et(sorted(op_indices), blocks)
+        removal_set = set(removal_indices)
+
+    # Build replacement BT/ET block
+    replacement = _build_replacement_ops(
+        lines=lines,
+        font_name=clean_name,
+        font_size=font_size,
+        fill_color=fill_color,
+        left_margin=bbox[0],
+        first_line_y=bbox[3] - font_size,
+        line_height=line_height,
+        resolver=resolver,
+        page=page_obj,
+    )
+
+    # Splice: remove old operators, insert replacement
+    insert_pos = min(removal_set)
+    new_ops: _Ops = []
+    inserted = False
+    for i, op in enumerate(ops):
+        if i == insert_pos and not inserted:
+            new_ops.extend(replacement)
+            inserted = True
+        if i not in removal_set:
+            new_ops.append(op)
+
+    # Write back to page (caller saves)
+    new_stream = pikepdf.unparse_content_stream(new_ops)
+    page_obj.Contents = pdf.make_stream(new_stream)
+
+    result = EditResult(
+        success=True,
+        original_text=original_text,
+        new_text=new_text,
+        font_action=font_action_str,  # type: ignore[arg-type]
+        warnings=shift_warnings,
+        fidelity_report=FidelityReport(
+            font_preserved=font_action_str == "kept",
+            font_substituted=None,
+            overflow_detected=overflow_delta > 0,
+            reflow_applied=True,
+            glyphs_missing=[],
+        ),
+    )
+    return result, max(0.0, overflow_delta)
+
+
 def replace_block(
     pdf_path: str,
     page_number: int,
@@ -434,6 +618,8 @@ def replace_block(
 
     Identifies all content stream operators within the bbox, removes them,
     and writes new text using the same (or specified) font and size.
+    When replacement text overflows the bbox vertically, content below
+    is automatically shifted downward to prevent interleaving.
 
     Args:
         pdf_path: Path to the input PDF.
@@ -452,149 +638,76 @@ def replace_block(
     try:
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
+        result, _ = _replace_block_on_page(
+            pdf, page_obj, page_number, bbox, new_text, font_name, font_size,
+        )
+        pdf.save(output_path)
+        _invalidate_caches()
+        return result
+    finally:
+        pdf.close()
 
-        # Build element index and find elements in bbox
-        elements = _build_index(page_obj, page_number)
-        matched_elems, op_indices = _collect_elements_in_bbox(elements, bbox)
 
-        if not matched_elems:
-            return EditResult(
-                success=False,
-                original_text="",
-                new_text=new_text,
-                font_action="kept",
-                warnings=["No content found in specified bounding box"],
+def batch_replace_block(
+    pdf_path: str,
+    page_number: int,
+    replacements: list[tuple[tuple[float, float, float, float], str]],
+    output_path: str,
+) -> list[EditResult]:
+    """Apply multiple bbox-based text replacements on a single page.
+
+    Processes replacements top-to-bottom (highest y1 first), tracking
+    cumulative vertical shift so each replacement's bbox accounts for
+    overflow from previous replacements.
+
+    Args:
+        pdf_path: Path to the input PDF.
+        page_number: 0-indexed page number.
+        replacements: List of (bbox, new_text) tuples.  Each bbox is
+            (x0, y0, x1, y1) in PDF coordinates.
+        output_path: Path for the output PDF.
+
+    Returns:
+        List of EditResult, one per replacement (same order as input).
+    """
+    validate_output_path(output_path)
+    if not replacements:
+        return []
+
+    pdf = pikepdf.Pdf.open(pdf_path)
+    try:
+        pages = _resolve_pages(pdf, page_number)
+        _, page_obj = pages[0]
+
+        # Sort by y1 descending (topmost first) while preserving input order
+        # for result mapping.
+        indexed = list(enumerate(replacements))
+        indexed.sort(key=lambda t: t[1][0][3], reverse=True)
+
+        results: list[tuple[int, EditResult]] = []
+        cumulative_shift = 0.0
+
+        for orig_idx, (bbox, new_text) in indexed:
+            # Offset bbox downward by cumulative shift from prior overflows
+            adjusted_bbox = (
+                bbox[0],
+                bbox[1] - cumulative_shift,
+                bbox[2],
+                bbox[3] - cumulative_shift,
             )
+            result, overflow = _replace_block_on_page(
+                pdf, page_obj, page_number, adjusted_bbox, new_text,
+            )
+            _invalidate_caches()
+            cumulative_shift += overflow
+            results.append((orig_idx, result))
 
-        # Detect font if not specified
-        det_name, det_size, fill_color = _detect_font_from_elements(matched_elems)
-        if font_name is None:
-            font_name = det_name
-        if font_size is None:
-            font_size = det_size
-
-        # Collect original text for the result
-        original_parts: list[str] = []
-        for elem in matched_elems:
-            if elem.text_content:
-                original_parts.append(elem.text_content)
-        original_text = " ".join(original_parts)
-
-        # Parse content stream and compute removal set
-        ops: _Ops = list(pikepdf.parse_content_stream(page_obj))
-        blocks = _find_bt_et_blocks(ops)
-        removal_indices = _expand_to_bt_et(sorted(op_indices), blocks)
-        removal_set = set(removal_indices)
-
-        # Resolve font for encoding
-        font_key = font_name if font_name.startswith("/") else f"/{font_name}"
-        clean_name = font_name.lstrip("/")
-        try:
-            font_ref = page_obj["/Resources"]["/Font"][font_key]
-        except (KeyError, TypeError) as exc:
-            raise OperatorError(
-                f"Font {font_name} not found in page resources"
-            ) from exc
-
-        resolver = _resolver_cache.get_resolver(page_obj, clean_name)
-
-        # Check encodability — extend font subset if needed
-        can_enc, missing = resolver.can_encode(new_text)
-        font_action_str = "kept"
-        if not can_enc:
-            try:
-                from pdf_edit_engine.fonts import extend_subset
-
-                extend_subset(pdf, page_obj, clean_name, "".join(missing))
-                _resolver_cache.evict(page_obj, clean_name)
-                resolver = _resolver_cache.get_resolver(page_obj, clean_name)
-                can_enc_after, still_missing = resolver.can_encode(new_text)
-                if not can_enc_after:
-                    return EditResult(
-                        success=False,
-                        original_text=" ".join(original_parts),
-                        new_text=new_text,
-                        font_action="failed",
-                        warnings=[f"Cannot encode: {''.join(still_missing)}"],
-                        fidelity_report=FidelityReport(
-                            font_preserved=True,
-                            font_substituted=None,
-                            overflow_detected=False,
-                            reflow_applied=False,
-                            glyphs_missing=still_missing,
-                        ),
-                    )
-                font_action_str = "extended"
-            except Exception:
-                logger.warning("Font extension failed", exc_info=True)
-                return EditResult(
-                    success=False,
-                    original_text=" ".join(original_parts),
-                    new_text=new_text,
-                    font_action="failed",
-                    warnings=["Font extension failed"],
-                )
-
-        # Break text into lines for the bbox width
-        bbox_width = bbox[2] - bbox[0]
-        lines = break_into_lines(
-            new_text,
-            bbox_width,
-            resolver,
-            font_ref,
-            font_size,
-        )
-
-        # Line height from detected elements or default
-        line_height = font_size * 1.2
-
-        # Build replacement BT/ET block
-        replacement = _build_replacement_ops(
-            lines=lines,
-            font_name=clean_name,
-            font_size=font_size,
-            fill_color=fill_color,
-            left_margin=bbox[0],
-            first_line_y=bbox[3] - font_size,
-            line_height=line_height,
-            resolver=resolver,
-            page=page_obj,
-        )
-
-        # Splice: remove old operators, insert replacement
-        insert_pos = min(removal_set)
-        new_ops: _Ops = []
-        inserted = False
-        for i, op in enumerate(ops):
-            if i == insert_pos and not inserted:
-                new_ops.extend(replacement)
-                inserted = True
-            if i not in removal_set:
-                new_ops.append(op)
-
-        # Write back
-        new_stream = pikepdf.unparse_content_stream(new_ops)
-        page_obj.Contents = pdf.make_stream(new_stream)
         pdf.save(output_path)
         _invalidate_caches()
 
-        # Overflow detection: does text extend below bbox bottom?
-        text_height = len(lines) * line_height
-        overflow = (bbox[3] - font_size - text_height + line_height) < bbox[1]
-
-        return EditResult(
-            success=True,
-            original_text=original_text,
-            new_text=new_text,
-            font_action=font_action_str,  # type: ignore[arg-type]
-            fidelity_report=FidelityReport(
-                font_preserved=font_action_str == "kept",
-                font_substituted=None,
-                overflow_detected=overflow,
-                reflow_applied=True,
-                glyphs_missing=[],
-            ),
-        )
+        # Return results in original input order
+        results.sort(key=lambda t: t[0])
+        return [r for _, r in results]
     finally:
         pdf.close()
 

@@ -12,6 +12,7 @@ from pdf_edit_engine.locator import get_text
 from pdf_edit_engine.models import EditResult
 from pdf_edit_engine.reflow import detect_paragraphs
 from pdf_edit_engine.structural import (
+    batch_replace_block,
     delete_block,
     insert_text_block,
     replace_block,
@@ -90,6 +91,21 @@ class TestReplaceBlock:
         assert isinstance(result, EditResult)
         assert result.original_text  # non-empty
         assert result.new_text == "New text."
+
+    def test_replace_block_overflow_shifts_content(self, tmp_path: Path) -> None:
+        """Multi-line replacement shifts content below, preventing interleaving."""
+        out = str(tmp_path / "shifted.pdf")
+        # Enough text to guarantee multi-line overflow in the ~41pt tall bbox
+        long_text = " ".join(["replacement"] * 60)
+        result = replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
+                               long_text, out)
+        assert result.success
+        assert result.fidelity_report.overflow_detected
+        text = get_text(out)
+        # "Section two" was originally below the bbox — it should still
+        # appear AFTER the replacement text, not interleaved within it
+        assert "replacement" in text.lower()
+        assert "Section two" in text
 
 
 @_need_resume
@@ -170,6 +186,20 @@ class TestReplaceBlockResume:
         assert "EDUCATION" in text
         assert "TECHNICAL SKILLS" in text
 
+    def test_replace_block_cid_overflow_no_interleave(self, tmp_path: Path) -> None:
+        """CIDFont multi-line overflow shifts content, no interleaving."""
+        out = str(tmp_path / "no_interleave.pdf")
+        long_text = "PDF Edit Engine \u2014 Format-Preserving PDF Text Editing Library"
+        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
+                               long_text, out)
+        assert result.success
+        assert result.fidelity_report.overflow_detected
+        text = get_text(out)
+        assert "Format-Preserving" in text
+        # EDUCATION section is below the AJSP bbox (lower y in PDF coords)
+        # and should appear after all replacement text
+        assert "EDUCATION" in text
+
     def test_replace_block_cid_uses_tj_array(self, tmp_path: Path) -> None:
         """CIDFont replacement uses TJ array and Tm positioning."""
         out = str(tmp_path / "ops.pdf")
@@ -199,6 +229,65 @@ class TestReplaceBlockResume:
         assert found_tm, "CIDFont replacement should use Tm"
         assert found_tj_array, "CIDFont replacement should use TJ array"
         pdf.close()
+
+
+# ── TestBatchReplaceBlock ────────────────────────────────────────────
+
+
+@_need_simple
+class TestBatchReplaceBlock:
+    """Tests for batch_replace_block() — multi-bbox replacement."""
+
+    def test_batch_two_replacements(self, tmp_path: Path) -> None:
+        """Two bbox replacements applied in one pass."""
+        out = str(tmp_path / "batch.pdf")
+        replacements = [
+            ((72.0, 745.5, 212.4, 763.5), "New Title"),          # P0 (title)
+            ((72.0, 632.2, 388.8, 643.2), "Replaced section."),  # P2 (section two)
+        ]
+        results = batch_replace_block(SIMPLE_PDF, 0, replacements, out)
+        assert len(results) == 2
+        assert all(r.success for r in results)
+        text = get_text(out)
+        assert "New Title" in text
+        assert "Replaced section" in text
+
+    def test_batch_preserves_order(self, tmp_path: Path) -> None:
+        """Results list matches input order regardless of processing order."""
+        out = str(tmp_path / "order.pdf")
+        # Provide in bottom-to-top order — results should still match input
+        replacements = [
+            ((72.0, 632.2, 388.8, 643.2), "Bottom first."),    # P2 (lower)
+            ((72.0, 745.5, 212.4, 763.5), "Top second."),      # P0 (higher)
+        ]
+        results = batch_replace_block(SIMPLE_PDF, 0, replacements, out)
+        assert results[0].new_text == "Bottom first."
+        assert results[1].new_text == "Top second."
+        assert all(r.success for r in results)
+
+    def test_batch_with_overflow_cumulative_shift(self, tmp_path: Path) -> None:
+        """Overflow from first replacement shifts second bbox correctly."""
+        out = str(tmp_path / "cumshift.pdf")
+        # P0 (title, ~18pt tall) replaced with long text that overflows
+        long_text = " ".join(["expanded"] * 40)
+        replacements = [
+            ((72.0, 745.5, 212.4, 763.5), long_text),           # P0 — overflows
+            ((72.0, 632.2, 388.8, 643.2), "Still correct."),    # P2 — below
+        ]
+        results = batch_replace_block(SIMPLE_PDF, 0, replacements, out)
+        assert len(results) == 2
+        assert results[0].success
+        assert results[0].fidelity_report.overflow_detected
+        assert results[1].success
+        text = get_text(out)
+        assert "expanded" in text
+        assert "Still correct" in text
+
+    def test_batch_empty_list(self, tmp_path: Path) -> None:
+        """Empty replacements returns empty list."""
+        out = str(tmp_path / "empty.pdf")
+        results = batch_replace_block(SIMPLE_PDF, 0, [], out)
+        assert results == []
 
 
 # ── TestShiftContent ─────────────────────────────────────────────────
