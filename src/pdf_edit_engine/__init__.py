@@ -35,6 +35,7 @@ from pdf_edit_engine.models import (
 )
 from pdf_edit_engine.reflow import detect_paragraphs, reflow_paragraph
 from pdf_edit_engine.structural import (
+    batch_replace_block,
     delete_block,
     insert_text_block,
     replace_block,
@@ -71,6 +72,7 @@ __all__ = [
     "batch_replace",
     # structural
     "replace_block",
+    "batch_replace_block",
     "delete_block",
     "insert_text_block",
     "shift_content_below",
