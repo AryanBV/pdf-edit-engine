@@ -204,9 +204,20 @@ class FontResolver:
         """
         missing: list[str] = []
         if self._is_cid:
-            for ch in text:
-                if ch not in self._unicode_to_cid:
-                    missing.append(ch)
+            # Greedy longest-match — same algorithm as encode() so that
+            # ligature sequences (e.g. 'fi') are recognised as encodable.
+            i = 0
+            while i < len(text):
+                matched = False
+                max_len = min(self._max_ligature_len, len(text) - i)
+                for length in range(max_len, 0, -1):
+                    if text[i:i + length] in self._unicode_to_cid:
+                        i += length
+                        matched = True
+                        break
+                if not matched:
+                    missing.append(text[i])
+                    i += 1
         else:
             for ch in text:
                 if ch not in self._unicode_to_byte:

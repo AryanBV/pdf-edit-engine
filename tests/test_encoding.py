@@ -16,9 +16,7 @@ if TYPE_CHECKING:
 CORPUS_DIR = Path(__file__).parent / "corpus"
 RESUME_PDF = CORPUS_DIR / "resume_aryan.pdf"
 
-pytestmark = pytest.mark.skipif(
-    not RESUME_PDF.exists(), reason="resume_aryan.pdf not in corpus"
-)
+pytestmark = pytest.mark.skipif(not RESUME_PDF.exists(), reason="resume_aryan.pdf not in corpus")
 
 
 @pytest.fixture
@@ -145,6 +143,25 @@ class TestCanEncode:
 
     def test_can_encode_winAnsi(self, f2_resolver: FontResolver) -> None:
         ok, missing = f2_resolver.can_encode("ABC")
+        assert ok is True
+        assert missing == []
+
+    def test_can_encode_ligature_sequence(
+        self,
+        f1_resolver: FontResolver,
+    ) -> None:
+        """can_encode accepts ligature sequences like 'fi' that encode() handles."""
+        ok, missing = f1_resolver.can_encode("fi")
+        assert ok is True
+        assert missing == []
+
+    def test_can_encode_ligature_in_context(
+        self,
+        f1_resolver: FontResolver,
+    ) -> None:
+        """can_encode handles ligatures surrounded by normal characters."""
+        # 'A' has standalone CID, 'fi' is a ligature — both should pass
+        ok, missing = f1_resolver.can_encode("Afi")
         assert ok is True
         assert missing == []
 
