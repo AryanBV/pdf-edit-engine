@@ -230,6 +230,58 @@ class TestReplaceBlockResume:
         assert found_tj_array, "CIDFont replacement should use TJ array"
         pdf.close()
 
+    def test_replace_block_mixed_font_cid_fallback(self, tmp_path: Path) -> None:
+        """replace_block falls back to CID font when WinAnsi can't encode.
+
+        The bbox (14.0, 745.0, 140.0, 770.0) captures a WinAnsi F4 space
+        before the CIDFont F1 'PROFESSIONAL SUMMARY' heading.  Auto-detection
+        picks F4 first, which cannot encode U+0100 (Ā).  The fix should fall
+        back to the CIDFont F1 and succeed via extend_subset().
+        """
+        out = str(tmp_path / "mixed_font.pdf")
+        result = replace_block(
+            RESUME_PDF, 0,
+            (14.0, 745.0, 140.0, 770.0),
+            "PROFESSIONAL SUMMARY \u0100",
+            out,
+        )
+        assert result.success, f"Expected success: {result.warnings}"
+        assert result.font_action != "failed"
+        assert result.fidelity_report.font_substituted is not None
+        text = get_text(out)
+        assert "PROFESSIONAL" in text
+
+    def test_replace_block_newline_in_text(self, tmp_path: Path) -> None:
+        """Newlines in replacement text don't fail can_encode (Bug B fix)."""
+        out = str(tmp_path / "newline.pdf")
+        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
+                               "Line One\nLine Two", out)
+        assert result.success, f"Expected success: {result.warnings}"
+        assert result.font_action != "failed"
+        text = get_text(out)
+        assert "Line One" in text
+        assert "Line Two" in text
+
+    def test_replace_block_massive_overflow_stays_on_page(
+        self, tmp_path: Path,
+    ) -> None:
+        """Massive overflow doesn't push content below page boundary (Bug A fix)."""
+        out = str(tmp_path / "clamp.pdf")
+        # Narrow bbox (61pt wide) + long text → many lines → huge overflow_delta
+        long_text = "This is a very long replacement " * 20
+        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 75.5, 445.9),
+                               long_text, out)
+        assert result.success
+        assert result.fidelity_report.overflow_detected
+        # Verify no Tm y-value < 0 in output content stream
+        with pikepdf.open(out) as pdf:
+            page = pdf.pages[0]
+            ops = list(pikepdf.parse_content_stream(page))
+            for operands, operator in ops:
+                if str(operator) == "Tm" and len(operands) >= 6:
+                    y_val = float(operands[5])
+                    assert y_val >= 0, f"Content at y={y_val} is below page"
+
 
 # ── TestBatchReplaceBlock ────────────────────────────────────────────
 

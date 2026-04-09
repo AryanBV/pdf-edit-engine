@@ -117,6 +117,35 @@ def _detect_font_from_elements(
     raise OperatorError("No text elements found in region for font detection")
 
 
+def _find_cid_font_in_elements(
+    elements: list[ContentElement],
+    page_obj: pikepdf.Page,
+) -> tuple[str, float] | None:
+    """Find the first CID/Identity-H font among text elements in a region.
+
+    Used as a fallback when the auto-detected font is a non-extensible
+    WinAnsi TrueType font.  CID fonts support extend_subset().
+
+    Args:
+        elements: Content elements to scan.
+        page_obj: Page for font resolution.
+
+    Returns:
+        Tuple of (font_name, font_size) for the first CID font, or None.
+    """
+    seen: set[str] = set()
+    for elem in elements:
+        if elem.type == "text" and elem.graphics_state.font_name:
+            name = elem.graphics_state.font_name
+            if name in seen:
+                continue
+            seen.add(name)
+            resolver = _resolver_cache.get_resolver(page_obj, name.lstrip("/"))
+            if resolver.is_cid_font:
+                return (name, elem.graphics_state.font_size or 12.0)
+    return None
+
+
 def _check_page_overflow(
     elements: list[ContentElement],
     page_obj: pikepdf.Page,
@@ -461,6 +490,7 @@ def _replace_block_on_page(
         ), 0.0
 
     # Detect font if not specified
+    font_size_was_auto = font_size is None
     det_name, det_size, fill_color = _detect_font_from_elements(matched_elems)
     if font_name is None:
         font_name = det_name
@@ -492,17 +522,54 @@ def _replace_block_on_page(
 
     resolver = _resolver_cache.get_resolver(page_obj, clean_name)
 
+    # Strip control characters — \n, \r, \t are line separators handled
+    # by break_into_lines, not renderable glyphs.
+    encodable_text = "".join(ch for ch in new_text if ch >= " ")
+
     # Check encodability — extend font subset if needed
-    can_enc, missing = resolver.can_encode(new_text)
+    can_enc, missing = resolver.can_encode(encodable_text)
     font_action_str = "kept"
+    font_switched = False
+
+    # CID font fallback: if the selected font is non-CID (e.g. WinAnsi
+    # TrueType) and cannot encode the replacement text, try to find an
+    # Identity-H CIDFont from the same bbox.  extend_subset() only supports
+    # Type0/Identity-H fonts, so calling it on TrueType would fail.
+    if not can_enc and not resolver.is_cid_font:
+        cid_alt = _find_cid_font_in_elements(matched_elems, page_obj)
+        if cid_alt is not None:
+            alt_name, alt_size = cid_alt
+            font_name = alt_name
+            clean_name = font_name.lstrip("/")
+            font_key = font_name if font_name.startswith("/") else f"/{font_name}"
+            font_ref = page_obj["/Resources"]["/Font"][font_key]
+            resolver = _resolver_cache.get_resolver(page_obj, clean_name)
+            if font_size_was_auto:
+                font_size = alt_size
+            can_enc, missing = resolver.can_encode(encodable_text)
+            font_switched = True
+            logger.debug(
+                "Mixed-font fallback: switched from non-CID to %s", clean_name,
+            )
+
     if not can_enc:
+        if not resolver.is_cid_font:
+            # Non-CID font and no CID alternative — cannot extend
+            return EditResult(
+                success=False,
+                original_text=" ".join(original_parts),
+                new_text=new_text,
+                font_action="failed",
+                warnings=["Font cannot encode text and no extensible "
+                          "(Type0/Identity-H) font available in bbox"],
+            ), 0.0
         try:
             from pdf_edit_engine.fonts import extend_subset
 
             extend_subset(pdf, page_obj, clean_name, "".join(missing))
             _resolver_cache.evict(page_obj, clean_name)
             resolver = _resolver_cache.get_resolver(page_obj, clean_name)
-            can_enc_after, still_missing = resolver.can_encode(new_text)
+            can_enc_after, still_missing = resolver.can_encode(encodable_text)
             if not can_enc_after:
                 return EditResult(
                     success=False,
@@ -548,10 +615,31 @@ def _replace_block_on_page(
     overflow_delta = text_height - bbox_height
 
     shift_warnings: list[str] = []
+    original_overflow = overflow_delta
     if overflow_delta > 0:
-        shift_warnings = _shift_content_below_inplace(
+        # Clamp shift to keep all content on-page
+        mediabox = page_obj.get("/MediaBox")
+        if mediabox is not None:
+            page_bottom = float(mediabox[1])
+            below_ys = [e.bbox[1] for e in elements if e.bbox[1] < bbox[1]]
+            if below_ys:
+                lowest_y = min(below_ys)
+                max_safe_shift = lowest_y - page_bottom
+                if max_safe_shift <= 0:
+                    overflow_delta = 0.0
+                elif overflow_delta > max_safe_shift:
+                    shift_warnings.append(
+                        f"Overflow shift clamped from {original_overflow:.1f}pt "
+                        f"to {max_safe_shift:.1f}pt to keep content on-page",
+                    )
+                    overflow_delta = max_safe_shift
+            else:
+                overflow_delta = 0.0
+
+    if overflow_delta > 0:
+        shift_warnings.extend(_shift_content_below_inplace(
             pdf, page_obj, page_number, bbox[1], overflow_delta,
-        )
+        ))
         # Re-parse content stream after in-place shift
         ops = list(pikepdf.parse_content_stream(page_obj))
         # Indices are stable (shift modifies values, not count/order)
@@ -595,9 +683,9 @@ def _replace_block_on_page(
         font_action=font_action_str,  # type: ignore[arg-type]
         warnings=shift_warnings,
         fidelity_report=FidelityReport(
-            font_preserved=font_action_str == "kept",
-            font_substituted=None,
-            overflow_detected=overflow_delta > 0,
+            font_preserved=font_action_str == "kept" and not font_switched,
+            font_substituted=clean_name if font_switched else None,
+            overflow_detected=original_overflow > 0,
             reflow_applied=True,
             glyphs_missing=[],
         ),
