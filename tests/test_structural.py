@@ -126,6 +126,80 @@ class TestReplaceBlockResume:
         text = get_text(out)
         assert "Replaced paragraph" in text
 
+    def test_replace_block_cid_bold_title(self, tmp_path: Path) -> None:
+        """replace_block on bold CIDFont title produces correct text."""
+        out = str(tmp_path / "bold.pdf")
+        # AJSP Manager title is F1 (Calibri-Bold), all chars in subset
+        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
+                               "PDF Edit Engine Plan", out)
+        assert result.success
+        assert result.font_action == "kept"
+        text = get_text(out)
+        assert "PDF Edit Engine Plan" in text
+
+    def test_replace_block_cid_bold_with_extension(self, tmp_path: Path) -> None:
+        """replace_block with font extension still produces correct text."""
+        out = str(tmp_path / "ext.pdf")
+        # 'x' is not in the F1 subset — triggers font extension
+        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
+                               "PDF Text Editing", out)
+        assert result.success
+        assert result.font_action == "extended"
+        text = get_text(out)
+        assert "PDF Text Editing" in text
+
+    def test_replace_block_cid_long_text_wraps(self, tmp_path: Path) -> None:
+        """Long CIDFont replacement wraps to multiple lines correctly."""
+        out = str(tmp_path / "wrap.pdf")
+        long_text = "PDF Edit Engine \u2014 Format-Preserving PDF Text Editing"
+        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
+                               long_text, out)
+        assert result.success
+        text = get_text(out)
+        assert "Format-Preserving" in text
+        assert "Editing" in text
+
+    def test_replace_block_cid_preserves_other_content(self, tmp_path: Path) -> None:
+        """Replacing a bold title does not garble other page content."""
+        out = str(tmp_path / "preserve.pdf")
+        replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
+                      "New Title", out)
+        text = get_text(out)
+        # Section headings should still be readable
+        assert "PROFESSIONAL SUMMARY" in text
+        assert "EDUCATION" in text
+        assert "TECHNICAL SKILLS" in text
+
+    def test_replace_block_cid_uses_tj_array(self, tmp_path: Path) -> None:
+        """CIDFont replacement uses TJ array and Tm positioning."""
+        out = str(tmp_path / "ops.pdf")
+        replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
+                      "Operator Test", out)
+        # Parse the output and verify operator structure
+        pdf = pikepdf.Pdf.open(out)
+        ops = list(pikepdf.parse_content_stream(pdf.pages[0]))
+        # Find the replacement BT/ET block (first one, near the top)
+        found_tm = False
+        found_tj_array = False
+        in_replacement_bt = False
+        for inst in ops:
+            op = str(inst.operator) if hasattr(inst, "operator") else str(inst[1])
+            if op == "BT":
+                in_replacement_bt = True
+            elif op == "ET":
+                if found_tm and found_tj_array:
+                    break
+                in_replacement_bt = False
+                found_tm = False
+                found_tj_array = False
+            elif in_replacement_bt and op == "Tm":
+                found_tm = True
+            elif in_replacement_bt and op == "TJ":
+                found_tj_array = True
+        assert found_tm, "CIDFont replacement should use Tm"
+        assert found_tj_array, "CIDFont replacement should use TJ array"
+        pdf.close()
+
 
 # ── TestShiftContent ─────────────────────────────────────────────────
 

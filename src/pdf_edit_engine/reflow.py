@@ -11,7 +11,7 @@ from typing import Any
 import pikepdf
 
 from pdf_edit_engine.encoding import FontResolver, FontResolverCache
-from pdf_edit_engine.errors import ReflowError
+from pdf_edit_engine.errors import EncodingError, FontNotFoundError, ReflowError
 from pdf_edit_engine.models import (
     ContentElement,
     EditResult,
@@ -19,7 +19,12 @@ from pdf_edit_engine.models import (
     Paragraph,
     TextMatch,
 )
-from pdf_edit_engine.widths import DEFAULT_WIDTH, parse_cid_widths, parse_simple_widths
+from pdf_edit_engine.widths import (
+    DEFAULT_WIDTH,
+    GlyphWidthCache,
+    parse_cid_widths,
+    parse_simple_widths,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -560,6 +565,49 @@ def _expand_to_bt_et(
     return sorted(removal)
 
 
+def _encode_line_as_tj(
+    line: str,
+    resolver: FontResolver,
+    width_cache: GlyphWidthCache | None,
+    page: pikepdf.Page | None,
+    font_name: str,
+    font_size: float,
+) -> tuple[list[Any], Any]:
+    """Encode a line of text into a content stream text operator.
+
+    For CIDFonts: produces a TJ operator with per-glyph String items,
+    matching how surgeon.py constructs replacement operators.  This
+    ensures PDF viewers advance each glyph individually using the
+    font's /W table rather than interpreting one long byte string.
+
+    For simple fonts: produces a flat Tj operator (single String).
+
+    Args:
+        line: Text for this line.
+        resolver: FontResolver for encoding.
+        width_cache: GlyphWidthCache for per-glyph width lookups (CID only).
+        page: PDF page for width lookup (CID only).
+        font_name: Font resource name.
+        font_size: Font size in points.
+
+    Returns:
+        Tuple of (operands, operator) for a Tj or TJ instruction.
+    """
+    encoded = resolver.encode(line)
+
+    if not resolver.is_cid_font:
+        return ([pikepdf.String(encoded)], pikepdf.Operator("Tj"))
+
+    # CIDFont: split into per-glyph 2-byte items for a TJ array
+    bw = resolver.byte_width
+    tj_items: list[object] = []
+    for i in range(0, len(encoded), bw):
+        glyph_bytes = encoded[i : i + bw]
+        tj_items.append(pikepdf.String(glyph_bytes))
+
+    return ([pikepdf.Array(tj_items)], pikepdf.Operator("TJ"))
+
+
 def _build_replacement_ops(
     lines: list[str],
     font_name: str,
@@ -569,10 +617,14 @@ def _build_replacement_ops(
     first_line_y: float,
     line_height: float,
     resolver: FontResolver,
+    page: pikepdf.Page | None = None,
 ) -> list[tuple[list[Any], Any]]:
     """Build replacement content stream operators for a reflowed paragraph.
 
-    Constructs a single BT/ET block with Tf, color, and Td/Tj per line.
+    Constructs a single BT/ET block with Tf, color, and positioning/text
+    per line.  For CIDFonts, uses Tm (text matrix) for first-line
+    positioning and TJ arrays with per-glyph strings — matching the
+    operator structure produced by surgeon.py and expected by PDF viewers.
 
     Args:
         lines: Text broken into lines by break_into_lines.
@@ -583,10 +635,15 @@ def _build_replacement_ops(
         first_line_y: Y-position for the first line.
         line_height: Vertical distance between lines.
         resolver: FontResolver for encoding text.
+        page: PDF page object (needed for CIDFont width lookups).
 
     Returns:
         List of (operands, operator) tuples for the replacement block.
     """
+    width_cache: GlyphWidthCache | None = None
+    if resolver.is_cid_font and page is not None:
+        width_cache = GlyphWidthCache()
+
     new_ops: list[tuple[list[Any], Any]] = []
 
     # BT
@@ -606,23 +663,33 @@ def _build_replacement_ops(
         elif len(fill_color) == 4:
             new_ops.append((color_operands, pikepdf.Operator("k")))
 
-    # First line: absolute position (BT resets text matrix to identity)
-    new_ops.append(
-        ([left_margin, first_line_y], pikepdf.Operator("Td")),
-    )
+    # First line positioning — use Tm for CID fonts (matches original
+    # document structure), Td for simple fonts (backward compatible).
+    if resolver.is_cid_font:
+        new_ops.append(
+            ([1, 0, 0, 1, left_margin, first_line_y], pikepdf.Operator("Tm")),
+        )
+    else:
+        new_ops.append(
+            ([left_margin, first_line_y], pikepdf.Operator("Td")),
+        )
 
     # First line text
-    encoded = resolver.encode(lines[0])
-    new_ops.append(([pikepdf.String(encoded)], pikepdf.Operator("Tj")))
+    new_ops.append(
+        _encode_line_as_tj(line=lines[0], resolver=resolver,
+                           width_cache=width_cache, page=page,
+                           font_name=font_name, font_size=font_size),
+    )
 
     # Subsequent lines
     for line in lines[1:]:
         new_ops.append(
             ([0.0, -line_height], pikepdf.Operator("Td")),
         )
-        encoded = resolver.encode(line)
         new_ops.append(
-            ([pikepdf.String(encoded)], pikepdf.Operator("Tj")),
+            _encode_line_as_tj(line=line, resolver=resolver,
+                               width_cache=width_cache, page=page,
+                               font_name=font_name, font_size=font_size),
         )
 
     # ET
@@ -710,7 +777,7 @@ def reflow_paragraph(
                 "Font extension succeeded for %d missing chars during reflow",
                 len(missing),
             )
-        except Exception:
+        except (FontNotFoundError, EncodingError, OSError):
             logger.warning("Font extension failed during reflow", exc_info=True)
             return EditResult(
                 success=False,
@@ -746,6 +813,7 @@ def reflow_paragraph(
         first_line_y=paragraph.first_line_y,
         line_height=paragraph.line_height,
         resolver=font_resolver,
+        page=page,
     )
 
     # 8. Splice: remove old operators, insert replacement

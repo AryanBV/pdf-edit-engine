@@ -558,6 +558,7 @@ def replace_block(
             first_line_y=bbox[3] - font_size,
             line_height=line_height,
             resolver=resolver,
+            page=page_obj,
         )
 
         # Splice: remove old operators, insert replacement
@@ -721,6 +722,7 @@ def insert_text_block(
             first_line_y=y,
             line_height=line_height,
             resolver=resolver,
+            page=page_obj,
         )
 
         # Append to end of content stream
