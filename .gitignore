@@ -211,7 +211,15 @@ __marimo__/
 
 # Demo output (for manual inspection, not committed)
 demo_output/
+validate_output/
+diagnose_output/
 
-# Test corpus PDFs (auto-generated and manually placed)
+# Test corpus PDFs (auto-generated and manually placed — includes personal resume)
 tests/corpus/*.pdf
 !tests/corpus/cidfont_synthetic.pdf
+
+# MCP config (contains local paths)
+.mcp.json
+
+# Stress test output
+tests/stress_output/
