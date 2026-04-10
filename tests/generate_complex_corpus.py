@@ -170,22 +170,37 @@ def make_contract_pdf(path: Path) -> None:
     styles = getSampleStyleSheet()
 
     title_style = ParagraphStyle(
-        "ContractTitle", parent=styles["Title"], fontSize=16,
-        spaceAfter=6, alignment=1,
+        "ContractTitle",
+        parent=styles["Title"],
+        fontSize=16,
+        spaceAfter=6,
+        alignment=1,
     )
     heading_style = ParagraphStyle(
-        "ContractHeading", parent=styles["Heading2"], fontSize=13,
-        spaceBefore=16, spaceAfter=8, fontName="Helvetica-Bold",
+        "ContractHeading",
+        parent=styles["Heading2"],
+        fontSize=13,
+        spaceBefore=16,
+        spaceAfter=8,
+        fontName="Helvetica-Bold",
     )
     body_style = ParagraphStyle(
-        "ContractBody", parent=styles["Normal"], fontSize=10,
-        spaceAfter=6, leading=14,
+        "ContractBody",
+        parent=styles["Normal"],
+        fontSize=10,
+        spaceAfter=6,
+        leading=14,
     )
     right_style = ParagraphStyle(
-        "RightAlign", parent=body_style, alignment=2,
+        "RightAlign",
+        parent=body_style,
+        alignment=2,
     )
     clause_style = ParagraphStyle(
-        "Clause", parent=body_style, leftIndent=20, spaceAfter=4,
+        "Clause",
+        parent=body_style,
+        leftIndent=20,
+        spaceAfter=4,
     )
 
     elements: list[object] = []
@@ -197,59 +212,80 @@ def make_contract_pdf(path: Path) -> None:
     elements.append(Spacer(1, 12))
 
     elements.append(Paragraph("PARTIES", heading_style))
-    elements.append(Paragraph(
-        '<b>Provider:</b> Acme Technology Solutions Inc., '
-        '123 Innovation Drive, San Francisco, CA 94105, '
-        'represented by Jane Smith, Chief Executive Officer.',
-        body_style,
-    ))
-    elements.append(Paragraph(
-        '<b>Client:</b> GlobalTech Enterprises LLC, '
-        '456 Commerce Boulevard, New York, NY 10001, '
-        'represented by John Roberts, VP of Operations.',
-        body_style,
-    ))
+    elements.append(
+        Paragraph(
+            "<b>Provider:</b> Acme Technology Solutions Inc., "
+            "123 Innovation Drive, San Francisco, CA 94105, "
+            "represented by Jane Smith, Chief Executive Officer.",
+            body_style,
+        )
+    )
+    elements.append(
+        Paragraph(
+            "<b>Client:</b> GlobalTech Enterprises LLC, "
+            "456 Commerce Boulevard, New York, NY 10001, "
+            "represented by John Roberts, VP of Operations.",
+            body_style,
+        )
+    )
     elements.append(Spacer(1, 8))
 
     # Horizontal rule via a thin table
-    hr = Table([[""]],  colWidths=[6.5 * inch])
-    hr.setStyle(TableStyle([
-        ("LINEABOVE", (0, 0), (-1, 0), 1, colors.black),
-    ]))
+    hr = Table([[""]], colWidths=[6.5 * inch])
+    hr.setStyle(
+        TableStyle(
+            [
+                ("LINEABOVE", (0, 0), (-1, 0), 1, colors.black),
+            ]
+        )
+    )
     elements.append(hr)
     elements.append(Spacer(1, 8))
 
     elements.append(Paragraph("SCOPE OF SERVICES", heading_style))
-    elements.append(Paragraph(
-        "The Provider agrees to deliver software development, consulting, "
-        "and technical support services as described in Exhibit A attached hereto.",
-        body_style,
-    ))
+    elements.append(
+        Paragraph(
+            "The Provider agrees to deliver software development, consulting, "
+            "and technical support services as described in Exhibit A attached hereto.",
+            body_style,
+        )
+    )
 
     # ── Page 2 ──
     elements.append(PageBreak())
     elements.append(Paragraph("TERMS AND CONDITIONS", heading_style))
 
     clauses = [
-        ("1. COMPENSATION",
-         "The Client shall pay the Provider a total fee of $50,000.00 "
-         "(fifty thousand dollars) for services rendered under this Agreement."),
-        ("1.1 Payment Schedule",
-         "Payments shall be made in three installments: $20,000.00 upon signing, "
-         "$15,000.00 at midpoint delivery, and $15,000.00 upon final acceptance."),
-        ("1.2 Late Payment",
-         "Late payments shall accrue interest at 1.5% per month."),
-        ("2. TERM",
-         "This Agreement shall be effective from April 4, 2026 through "
-         "October 4, 2026, unless terminated earlier per Section 4."),
-        ("3. CONFIDENTIALITY",
-         "Both parties agree to maintain strict confidentiality regarding "
-         "proprietary information exchanged during the term of this Agreement."),
-        ("4. TERMINATION",
-         "Either party may terminate this Agreement with 30 days written notice. "
-         "Upon termination, Client shall pay for all services rendered to date."),
-        ("5. GOVERNING LAW",
-         "This Agreement shall be governed by the laws of the State of California."),
+        (
+            "1. COMPENSATION",
+            "The Client shall pay the Provider a total fee of $50,000.00 "
+            "(fifty thousand dollars) for services rendered under this Agreement.",
+        ),
+        (
+            "1.1 Payment Schedule",
+            "Payments shall be made in three installments: $20,000.00 upon signing, "
+            "$15,000.00 at midpoint delivery, and $15,000.00 upon final acceptance.",
+        ),
+        ("1.2 Late Payment", "Late payments shall accrue interest at 1.5% per month."),
+        (
+            "2. TERM",
+            "This Agreement shall be effective from April 4, 2026 through "
+            "October 4, 2026, unless terminated earlier per Section 4.",
+        ),
+        (
+            "3. CONFIDENTIALITY",
+            "Both parties agree to maintain strict confidentiality regarding "
+            "proprietary information exchanged during the term of this Agreement.",
+        ),
+        (
+            "4. TERMINATION",
+            "Either party may terminate this Agreement with 30 days written notice. "
+            "Upon termination, Client shall pay for all services rendered to date.",
+        ),
+        (
+            "5. GOVERNING LAW",
+            "This Agreement shall be governed by the laws of the State of California.",
+        ),
     ]
     for title, text in clauses:
         elements.append(Paragraph(f"<b>{title}</b>", body_style))
@@ -266,24 +302,30 @@ def make_contract_pdf(path: Path) -> None:
         ["Project Management", "$175.00", "30 hours"],
     ]
     t = Table(table_data, colWidths=[2.2 * inch, 1.5 * inch, 1.5 * inch])
-    t.setStyle(TableStyle([
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.Color(0.9, 0.9, 0.9)),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("ALIGN", (1, 1), (-1, -1), "CENTER"),
-    ]))
+    t.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.Color(0.9, 0.9, 0.9)),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("ALIGN", (1, 1), (-1, -1), "CENTER"),
+            ]
+        )
+    )
     elements.append(t)
 
     # ── Page 3 ──
     elements.append(PageBreak())
     elements.append(Paragraph("SIGNATURES", heading_style))
     elements.append(Spacer(1, 20))
-    elements.append(Paragraph(
-        "IN WITNESS WHEREOF, the parties have executed this Agreement "
-        "as of the date first written above.",
-        body_style,
-    ))
+    elements.append(
+        Paragraph(
+            "IN WITNESS WHEREOF, the parties have executed this Agreement "
+            "as of the date first written above.",
+            body_style,
+        )
+    )
     elements.append(Spacer(1, 30))
 
     sig_data = [
@@ -294,11 +336,15 @@ def make_contract_pdf(path: Path) -> None:
         ["Date: ___________________________", "Date: ___________________________"],
     ]
     sig_table = Table(sig_data, colWidths=[3 * inch, 3 * inch])
-    sig_table.setStyle(TableStyle([
-        ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ("TOPPADDING", (0, 0), (-1, -1), 8),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-    ]))
+    sig_table.setStyle(
+        TableStyle(
+            [
+                ("FONTSIZE", (0, 0), (-1, -1), 10),
+                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ]
+        )
+    )
     elements.append(sig_table)
 
     doc.build(elements, onFirstPage=_page_footer, onLaterPages=_page_footer)
@@ -492,59 +538,73 @@ def make_cidfont_pdf(path: Path) -> bool:
     font_stream["/Length1"] = len(font_bytes)
 
     # FontDescriptor
-    font_descriptor = pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/FontDescriptor"),
-        "/FontName": pikepdf.Name(ps_name),
-        "/Flags": 4,
-        "/FontBBox": pikepdf.Array(bbox_1000),
-        "/ItalicAngle": 0,
-        "/Ascent": ascent_1000,
-        "/Descent": descent_1000,
-        "/CapHeight": round(font["OS/2"].sCapHeight * 1000 / units_per_em),
-        "/StemV": 80,
-        "/FontFile2": font_stream,
-    })
+    font_descriptor = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/FontDescriptor"),
+            "/FontName": pikepdf.Name(ps_name),
+            "/Flags": 4,
+            "/FontBBox": pikepdf.Array(bbox_1000),
+            "/ItalicAngle": 0,
+            "/Ascent": ascent_1000,
+            "/Descent": descent_1000,
+            "/CapHeight": round(font["OS/2"].sCapHeight * 1000 / units_per_em),
+            "/StemV": 80,
+            "/FontFile2": font_stream,
+        }
+    )
 
     # CIDFont (descendant)
-    cid_font = pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Font"),
-        "/Subtype": pikepdf.Name("/CIDFontType2"),
-        "/BaseFont": pikepdf.Name(ps_name),
-        "/CIDSystemInfo": pikepdf.Dictionary({
-            "/Registry": pikepdf.String("Adobe"),
-            "/Ordering": pikepdf.String("Identity"),
-            "/Supplement": 0,
-        }),
-        "/FontDescriptor": pdf.make_indirect(font_descriptor),
-        "/DW": 1000,
-        "/W": pikepdf.Array(_build_w_array(w_entries)),
-        "/CIDToGIDMap": pikepdf.Name("/Identity"),
-    })
+    cid_font = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/Font"),
+            "/Subtype": pikepdf.Name("/CIDFontType2"),
+            "/BaseFont": pikepdf.Name(ps_name),
+            "/CIDSystemInfo": pikepdf.Dictionary(
+                {
+                    "/Registry": pikepdf.String("Adobe"),
+                    "/Ordering": pikepdf.String("Identity"),
+                    "/Supplement": 0,
+                }
+            ),
+            "/FontDescriptor": pdf.make_indirect(font_descriptor),
+            "/DW": 1000,
+            "/W": pikepdf.Array(_build_w_array(w_entries)),
+            "/CIDToGIDMap": pikepdf.Name("/Identity"),
+        }
+    )
 
     # ToUnicode stream
     tounicode_stream = pikepdf.Stream(pdf, tounicode_str.encode("latin-1"))
 
     # Type0 font (top-level)
-    type0_font = pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Font"),
-        "/Subtype": pikepdf.Name("/Type0"),
-        "/BaseFont": pikepdf.Name(ps_name),
-        "/Encoding": pikepdf.Name("/Identity-H"),
-        "/DescendantFonts": pikepdf.Array([pdf.make_indirect(cid_font)]),
-        "/ToUnicode": tounicode_stream,
-    })
+    type0_font = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/Font"),
+            "/Subtype": pikepdf.Name("/Type0"),
+            "/BaseFont": pikepdf.Name(ps_name),
+            "/Encoding": pikepdf.Name("/Identity-H"),
+            "/DescendantFonts": pikepdf.Array([pdf.make_indirect(cid_font)]),
+            "/ToUnicode": tounicode_stream,
+        }
+    )
 
     # Page
-    page_dict = pikepdf.Dictionary({
-        "/Type": pikepdf.Name("/Page"),
-        "/MediaBox": pikepdf.Array([0, 0, W, H]),
-        "/Resources": pikepdf.Dictionary({
-            "/Font": pikepdf.Dictionary({
-                "/F1": pdf.make_indirect(type0_font),
-            }),
-        }),
-        "/Contents": pikepdf.Stream(pdf, content_stream),
-    })
+    page_dict = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/Page"),
+            "/MediaBox": pikepdf.Array([0, 0, W, H]),
+            "/Resources": pikepdf.Dictionary(
+                {
+                    "/Font": pikepdf.Dictionary(
+                        {
+                            "/F1": pdf.make_indirect(type0_font),
+                        }
+                    ),
+                }
+            ),
+            "/Contents": pikepdf.Stream(pdf, content_stream),
+        }
+    )
     pdf.pages.append(pikepdf.Page(page_dict))
     pdf.save(str(path))
     pdf.close()

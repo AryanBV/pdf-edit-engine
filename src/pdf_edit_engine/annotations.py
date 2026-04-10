@@ -47,9 +47,7 @@ def get_annotations(
             annots_arr: Any = page_obj["/Annots"]
             for idx in range(len(annots_arr)):
                 annot_ref: Any = annots_arr[idx]
-                annot: Any = (
-                    annot_ref.resolve() if hasattr(annot_ref, "resolve") else annot_ref
-                )
+                annot: Any = annot_ref.resolve() if hasattr(annot_ref, "resolve") else annot_ref
                 subtype = str(annot.get("/Subtype", "")).lstrip("/")
                 rect_obj: Any = annot.get("/Rect")
                 if rect_obj is None:
@@ -68,14 +66,16 @@ def get_annotations(
                 text_content: str | None = None
                 if "/Contents" in annot:
                     text_content = str(annot["/Contents"])
-                annotations.append(Annotation(
-                    index=idx,
-                    page=page_num,
-                    subtype=subtype,
-                    rect=rect,
-                    uri=uri,
-                    text=text_content,
-                ))
+                annotations.append(
+                    Annotation(
+                        index=idx,
+                        page=page_num,
+                        subtype=subtype,
+                        rect=rect,
+                        uri=uri,
+                        text=text_content,
+                    )
+                )
     return annotations
 
 
@@ -134,9 +134,7 @@ def delete_annotation(
         if annot.index < len(annots_list):
             annots_list.pop(annot.index)
         if annots_list:
-            page_obj["/Annots"] = pdf.make_indirect(
-                pikepdf.Array(annots_list)
-            )
+            page_obj["/Annots"] = pdf.make_indirect(pikepdf.Array(annots_list))
         else:
             del page_obj["/Annots"]  # type: ignore[operator]
         pdf.save(out)
@@ -194,18 +192,22 @@ def add_annotation(
     allow_overwrite = path == out
     with pikepdf.open(path, allow_overwriting_input=allow_overwrite) as pdf:
         page_obj = pdf.pages[page]
-        annot = pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/Annot"),
-            "/Subtype": pikepdf.Name("/Link"),
-            "/Rect": pikepdf.Array([float(v) for v in rect]),
-            "/A": pikepdf.Dictionary({
-                "/Type": pikepdf.Name("/Action"),
-                "/S": pikepdf.Name("/URI"),
-                "/URI": pikepdf.String(uri),
-            }),
-            "/Border": pikepdf.Array([0, 0, 0]),
-            "/F": 4,
-        })
+        annot = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Link"),
+                "/Rect": pikepdf.Array([float(v) for v in rect]),
+                "/A": pikepdf.Dictionary(
+                    {
+                        "/Type": pikepdf.Name("/Action"),
+                        "/S": pikepdf.Name("/URI"),
+                        "/URI": pikepdf.String(uri),
+                    }
+                ),
+                "/Border": pikepdf.Array([0, 0, 0]),
+                "/F": 4,
+            }
+        )
         if border_style == "underline":
             annot["/Border"] = pikepdf.Array([0, 0, 1])
             annot["/C"] = pikepdf.Array([0.0, 0.0, 1.0])

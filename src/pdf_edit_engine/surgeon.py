@@ -923,8 +923,12 @@ def _try_reflow_match(
         resolver = _get_font_resolver(page, font_name)
         old_width = sum(ch.width for ch in match.characters)
         new_width = _calculate_new_width(
-            new_text, page, font_name,
-            match.characters[0].font_size, resolver, _width_cache,
+            new_text,
+            page,
+            font_name,
+            match.characters[0].font_size,
+            resolver,
+            _width_cache,
         )
         if new_width <= old_width + 1.0:
             return None  # not meaningfully wider
@@ -947,8 +951,7 @@ def _try_reflow_match(
         font_ref = page["/Resources"]["/Font"][font_key]
         result = reflow_paragraph(pdf, page, para, match, new_text, resolver, font_ref)
         return result if result.success else None
-    except (ReflowError, OperatorError, EncodingError, FontNotFoundError,
-            KeyError, ValueError):
+    except (ReflowError, OperatorError, EncodingError, FontNotFoundError, KeyError, ValueError):
         logger.warning("Reflow failed, falling back to simple replacement", exc_info=True)
         return None
 
@@ -1020,7 +1023,11 @@ def replace_all(
                 # Attempt reflow for the first qualifying match per page
                 if reflow and not dry_run and not page_reflowed:
                     reflow_result = _try_reflow_match(
-                        pdf, page, page_num, m, replacement,
+                        pdf,
+                        page,
+                        page_num,
+                        m,
+                        replacement,
                     )
                     if reflow_result is not None:
                         page_results.append(reflow_result)
@@ -1032,8 +1039,14 @@ def replace_all(
 
                 try:
                     result, resolver = _apply_single_replacement(
-                        pdf, page, ops, m, replacement,
-                        resolver, _width_cache, dry_run,
+                        pdf,
+                        page,
+                        ops,
+                        m,
+                        replacement,
+                        resolver,
+                        _width_cache,
+                        dry_run,
                     )
                 except OperatorError:
                     result = EditResult(
@@ -1156,8 +1169,14 @@ def batch_replace(
                 resolver = _get_font_resolver(page, m.characters[0].font_name)
                 try:
                     result, resolver = _apply_single_replacement(
-                        pdf, page, ops, m, repl,
-                        resolver, _width_cache, dry_run,
+                        pdf,
+                        page,
+                        ops,
+                        m,
+                        repl,
+                        resolver,
+                        _width_cache,
+                        dry_run,
                     )
                 except OperatorError:
                     result = EditResult(

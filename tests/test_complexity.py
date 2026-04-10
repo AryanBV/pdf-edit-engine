@@ -77,8 +77,7 @@ class TestMultiFont:
         matches = find(str(MULTIFONT_PDF), "support@example.com")
         assert len(matches) >= 1
         output = str(tmp_path / "email_replaced.pdf")
-        result = replace(str(MULTIFONT_PDF), matches[0], "help@newdomain.com", output,
-                         reflow=False)
+        result = replace(str(MULTIFONT_PDF), matches[0], "help@newdomain.com", output, reflow=False)
         assert result.success
         assert result.fidelity_report.font_preserved
         text = get_text(output)
@@ -92,13 +91,6 @@ class TestMultiFont:
     def test_find_dollar_amount(self) -> None:
         matches = find(str(MULTIFONT_PDF), "$1,234.56")
         assert len(matches) >= 1
-
-    def test_cross_font_search_documented(self) -> None:
-        """Cross-font search may or may not work — document the result."""
-        matches = find(str(MULTIFONT_PDF), "Contact us at support@example.com for help")
-        # This spans Times-Roman + Courier + Times-Roman
-        # Document result regardless of outcome
-        print(f"\n  Cross-font search: {'found' if matches else 'not found (known limitation)'}")
 
 
 # ── Level 2: Transformed text ──────────────────────────────────────────
@@ -116,8 +108,9 @@ class TestTransformed:
         matches = find(str(TRANSFORMED_PDF), "Normal text here")
         assert len(matches) >= 1
         output = str(tmp_path / "normal_replaced.pdf")
-        result = replace(str(TRANSFORMED_PDF), matches[0], "Changed text here", output,
-                         reflow=False)
+        result = replace(
+            str(TRANSFORMED_PDF), matches[0], "Changed text here", output, reflow=False
+        )
         assert result.success
         pikepdf.Pdf.open(output).close()
 
@@ -135,14 +128,10 @@ class TestTransformed:
         assert len(matches) >= 1
 
     def test_rotated_text_no_crash(self) -> None:
-        """Rotated text: engine must not crash. find() may or may not match."""
+        """Rotated text: engine must not crash. Non-rotated text always extracts."""
         text = get_text(str(TRANSFORMED_PDF))
-        assert text  # At least some text extracted
-        matches = find(str(TRANSFORMED_PDF), "Rotated five degrees")
-        if matches:
-            print("\n  Rotated text: find() succeeded")
-        else:
-            print("\n  Rotated text: find() returned no matches (known limitation)")
+        assert text
+        assert "Normal text here" in text
 
     def test_find_compressed_text(self) -> None:
         matches = find(str(TRANSFORMED_PDF), "Compressed text")
@@ -247,7 +236,10 @@ class TestPyMuPDFEdited:
         output = str(tmp_path / "re_edited.pdf")
         try:
             result = replace(
-                str(PYMUPDF_EDITED_PDF), matches[0], "Re-Edited Author", output,
+                str(PYMUPDF_EDITED_PDF),
+                matches[0],
+                "Re-Edited Author",
+                output,
                 reflow=False,
             )
             assert result.success
@@ -269,8 +261,10 @@ class TestCIDFont:
         assert len(identity_h_fonts) >= 1, (
             f"Expected Identity-H font, got: {[f.encoding_type for f in fonts]}"
         )
-        print(f"\n  CIDFont: {identity_h_fonts[0].postscript_name} "
-              f"({identity_h_fonts[0].glyph_count} glyphs)")
+        print(
+            f"\n  CIDFont: {identity_h_fonts[0].postscript_name} "
+            f"({identity_h_fonts[0].glyph_count} glyphs)"
+        )
 
     def test_find_software_engineer(self) -> None:
         matches = find(str(CIDFONT_PDF), "Software Engineer")
@@ -334,9 +328,7 @@ class TestCIDFont:
             f"Engine font mismatch:\n  Original: {original_fonts}\n  Ours: {our_fonts}"
         )
         # PyMuPDF output should differ
-        assert pymupdf_fonts != original_fonts, (
-            "Expected PyMuPDF to alter font set, but it didn't"
-        )
+        assert pymupdf_fonts != original_fonts, "Expected PyMuPDF to alter font set, but it didn't"
 
         print(f"\n  Original fonts: {sorted(original_fonts)}")
         print(f"  Our output:     {sorted(our_fonts)}  <- SAME")

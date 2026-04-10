@@ -8,7 +8,8 @@ regions rather than text matches, enabling paragraph-level editing.
 from __future__ import annotations
 
 import logging
-from collections import Counter
+from collections import Counter, defaultdict
+from dataclasses import dataclass
 from typing import Any
 
 import pikepdf
@@ -93,10 +94,166 @@ def _invalidate_caches() -> None:
     _resolver_cache.clear()
 
 
+def _detect_line_height(
+    elements: list[ContentElement],
+    font_size: float,
+) -> float:
+    """Detect line height from y-positions of text elements.
+
+    Returns the median gap between consecutive text lines.  Falls back
+    to ``font_size * 1.2`` when fewer than two distinct lines exist.
+    """
+    text_elems = [e for e in elements if e.type == "text" and e.characters]
+    if len(text_elems) < 2:
+        return font_size * 1.2
+    y_positions = sorted(
+        {round(e.bbox[3] * 2) / 2 for e in text_elems},
+        reverse=True,
+    )
+    if len(y_positions) < 2:
+        return font_size * 1.2
+    gaps = [y_positions[i] - y_positions[i + 1] for i in range(len(y_positions) - 1)]
+    positive = sorted(g for g in gaps if 0 < g < font_size * 3)
+    if not positive:
+        return font_size * 1.2
+    return positive[len(positive) // 2]
+
+
+@dataclass
+class _StylePalette:
+    """Typographic roles detected from original content in a bbox region.
+
+    Derived entirely from the data — no document-type assumptions.
+
+    Attributes:
+        heading_font: Font of the first visual line if ≠ body.  None otherwise.
+        body_font: Most common font in the region.
+        body_size: Font size of the body font.
+        body_color: Fill color of the body font (or None).
+        marker_fonts: ``{char: font_name}`` for line-initial single-character
+            elements that use a non-body, non-heading font (e.g. bullet "•").
+        marker_x: Absolute x-position for marker characters (0 = no indent).
+        body_after_marker_x: Absolute x-position for body text after markers.
+    """
+
+    heading_font: str | None
+    body_font: str
+    body_size: float
+    body_color: tuple[float, ...] | None
+    marker_fonts: dict[str, str]
+    marker_x: float = 0.0
+    body_after_marker_x: float = 0.0
+
+
+def _build_style_palette(
+    elements: list[ContentElement],
+    body_font: str,
+    body_size: float,
+    body_color: tuple[float, ...] | None,
+) -> _StylePalette:
+    """Build a style palette from the original content in a bbox.
+
+    Groups text elements by y-position into visual lines, then extracts:
+    - **heading_font**: dominant font of the topmost line, if ≠ body_font.
+    - **marker_fonts**: for each visual line's leftmost element that is a
+      single non-whitespace character in a non-body, non-heading font,
+      record ``{char: font_name}``.
+
+    This is universal — it works for any document type because it derives
+    styles from what the original content actually used.
+    """
+    text_elems = [e for e in elements if e.type == "text" and e.graphics_state.font_name]
+    if not text_elems:
+        return _StylePalette(None, body_font, body_size, body_color, {})
+
+    # Group elements by visual line (y-position, rounded to 0.5pt)
+    lines_by_y: dict[float, list[ContentElement]] = defaultdict(list)
+    for e in text_elems:
+        y_key = round(e.bbox[3] * 2) / 2
+        lines_by_y[y_key].append(e)
+
+    sorted_ys = sorted(lines_by_y, reverse=True)  # top to bottom
+
+    # ── Heading font: dominant non-body font in the top visual lines ──
+    # Scan the top 2 lines (not just the topmost) to handle stray elements
+    # that leak into the bbox from adjacent sections during batch processing.
+    # Only consider elements with substantial text (>1 visible char) to
+    # avoid misidentifying single-char markers (bullets, dashes).
+    heading_font: str | None = None
+    for y_key in sorted_ys[:2]:
+        line = lines_by_y[y_key]
+        significant = [e for e in line if e.text_content and len(e.text_content.strip()) > 1]
+        if not significant:
+            continue
+        font_counts: Counter[str] = Counter()
+        for e in significant:
+            font_counts[e.graphics_state.font_name] += 1
+        dominant = font_counts.most_common(1)[0][0]
+        if dominant != body_font:
+            heading_font = dominant
+            break
+
+    # ── Marker fonts: line-initial single non-ws chars ───────────
+    marker_fonts: dict[str, str] = {}
+    for y_key in sorted_ys:
+        line_elems = lines_by_y[y_key]
+        # Find leftmost element on this line
+        leftmost = min(line_elems, key=lambda e: e.bbox[0])
+        text = leftmost.text_content
+        if not text:
+            continue
+        stripped = text.strip()
+        if (
+            len(stripped) == 1
+            and not stripped.isspace()
+            and leftmost.graphics_state.font_name != body_font
+            and leftmost.graphics_state.font_name != heading_font
+            and stripped not in marker_fonts
+        ):
+            marker_fonts[stripped] = leftmost.graphics_state.font_name
+
+    # ── Marker indentation: x-positions of markers and body after markers ─
+    marker_x = 0.0
+    body_after_marker_x = 0.0
+    if marker_fonts:
+        # Find x-positions from lines that have markers
+        for y_key in sorted_ys:
+            line_elems = sorted(lines_by_y[y_key], key=lambda e: e.bbox[0])
+            leftmost = line_elems[0]
+            text = leftmost.text_content
+            if text and text.strip() in marker_fonts:
+                marker_x = leftmost.bbox[0]
+                # Find the first non-marker, non-space element on the same line
+                for e in line_elems[1:]:
+                    if (
+                        e.text_content
+                        and e.text_content.strip()
+                        and e.graphics_state.font_name != leftmost.graphics_state.font_name
+                    ):
+                        body_after_marker_x = e.bbox[0]
+                        break
+                if body_after_marker_x > 0:
+                    break  # found both positions
+
+    return _StylePalette(
+        heading_font=heading_font,
+        body_font=body_font,
+        body_size=body_size,
+        body_color=body_color,
+        marker_fonts=marker_fonts,
+        marker_x=marker_x,
+        body_after_marker_x=body_after_marker_x,
+    )
+
+
 def _detect_font_from_elements(
     elements: list[ContentElement],
 ) -> tuple[str, float, tuple[float, ...] | None]:
     """Auto-detect font name, size, and fill color from text elements.
+
+    Uses the most common font in the region so that body text fonts
+    (e.g. regular-weight F3) are preferred over title fonts (bold F1)
+    that appear only once or twice.
 
     Args:
         elements: Content elements (should include text elements).
@@ -107,14 +264,22 @@ def _detect_font_from_elements(
     Raises:
         OperatorError: If no text elements found.
     """
+    font_counts: Counter[str] = Counter()
+    font_info: dict[str, tuple[float, tuple[float, ...] | None]] = {}
     for elem in elements:
         if elem.type == "text" and elem.graphics_state.font_name:
-            return (
-                elem.graphics_state.font_name,
-                elem.graphics_state.font_size or 12.0,
-                elem.graphics_state.fill_color,
-            )
-    raise OperatorError("No text elements found in region for font detection")
+            name = elem.graphics_state.font_name
+            font_counts[name] += 1
+            if name not in font_info:
+                font_info[name] = (
+                    elem.graphics_state.font_size or 12.0,
+                    elem.graphics_state.fill_color,
+                )
+    if not font_counts:
+        raise OperatorError("No text elements found in region for font detection")
+    most_common = font_counts.most_common(1)[0][0]
+    size, color = font_info[most_common]
+    return most_common, size, color
 
 
 def _find_cid_font_in_elements(
@@ -175,11 +340,86 @@ def _check_page_overflow(
             new_bottom = elem_bottom - delta_y
             if new_bottom < page_bottom:
                 overshoot = page_bottom - new_bottom
-                warnings.append(
-                    f"Content shifted below page boundary by {overshoot:.1f}pt"
-                )
+                warnings.append(f"Content shifted below page boundary by {overshoot:.1f}pt")
                 break
     return warnings
+
+
+# ── Core: annotation sync ───────────────────────────────────────────────
+
+
+def _sync_annotations_in_bbox(
+    page_obj: pikepdf.Page,
+    bbox: tuple[float, float, float, float],
+    delta_y: float,
+    new_text: str = "",
+) -> None:
+    """Sync annotations within *bbox* after content replacement.
+
+    For each annotation overlapping the bbox:
+    - **Relevant** (URI keywords found in *new_text*): shift by *delta_y*
+      and restore underlines if the content-stream decoration was removed.
+    - **Orphaned** (URI keywords NOT in *new_text*): remove entirely,
+      because the linked content no longer exists at this position.
+
+    This is universal: when content is replaced, annotations that match
+    the new content are repositioned; annotations that don't are cleaned up.
+
+    Args:
+        page_obj: The page whose annotations to adjust.
+        bbox: The replaced region (x0, y0, x1, y1).
+        delta_y: Vertical shift to apply (positive = up in PDF coords).
+        new_text: The replacement text (used to detect orphaned annotations).
+    """
+    annots = page_obj.get("/Annots")
+    if not annots:
+        return
+    new_lower = new_text.lower()
+    to_remove: list[int] = []
+    for idx, annot in enumerate(annots):
+        try:
+            rect = [float(r) for r in annot["/Rect"]]
+        except (KeyError, TypeError):
+            continue
+        # Check vertical overlap with bbox
+        if not (rect[1] < bbox[3] and rect[3] > bbox[1]):
+            continue
+
+        # Determine if annotation is orphaned: extract keywords from URI
+        # and check if any appear in the replacement text.
+        a_dict = annot.get("/A")
+        uri = str(a_dict.get("/URI", "")) if a_dict else ""
+        if uri and new_lower:
+            # Extract meaningful keywords from last URI path segment
+            path = uri.rstrip("/").rsplit("/", 1)[-1]
+            keywords = [
+                kw for kw in path.replace("-", " ").replace("_", " ").lower().split() if len(kw) > 2
+            ]
+            if keywords and not any(kw in new_lower for kw in keywords):
+                to_remove.append(idx)
+                continue
+
+        # Relevant annotation — shift and restore underline
+        annot["/Rect"] = pikepdf.Array(
+            [
+                rect[0],
+                rect[1] + delta_y,
+                rect[2],
+                rect[3] + delta_y,
+            ]
+        )
+        bs = annot.get("/BS")
+        if bs is not None and float(bs.get("/W", 1)) == 0:
+            annot["/BS"] = pikepdf.Dictionary(
+                {
+                    "/W": 0.5,
+                    "/S": pikepdf.Name("/U"),
+                }
+            )
+
+    # Remove orphaned annotations (reverse order to preserve indices)
+    for idx in reversed(to_remove):
+        del annots[idx]
 
 
 # ── Core: shift content below ────────────────────────────────────────────
@@ -246,9 +486,7 @@ def _shift_content_below_inplace(
                 ty = float(operands[5])
                 if ty < y_threshold:
                     new_operands = list(operands)
-                    new_operands[5] = pikepdf.Object.parse(
-                        str(ty - delta_y).encode()
-                    )
+                    new_operands[5] = pikepdf.Object.parse(str(ty - delta_y).encode())
                     operator = inst.operator if hasattr(inst, "operator") else inst[1]
                     ops[i] = (new_operands, operator)
             seen_positioning_in_block = True
@@ -291,9 +529,7 @@ def _shift_content_below_inplace(
                 for yi in (1, 3, 5):
                     val = float(operands[yi])
                     if val < y_threshold:
-                        new_operands[yi] = pikepdf.Object.parse(
-                            str(val - delta_y).encode()
-                        )
+                        new_operands[yi] = pikepdf.Object.parse(str(val - delta_y).encode())
                 ops[i] = (new_operands, operator)
 
         elif op_str in ("v", "y") and len(operands) >= 4:
@@ -303,9 +539,7 @@ def _shift_content_below_inplace(
                 for yi in (1, 3):
                     val = float(operands[yi])
                     if val < y_threshold:
-                        new_operands[yi] = pikepdf.Object.parse(
-                            str(val - delta_y).encode()
-                        )
+                        new_operands[yi] = pikepdf.Object.parse(str(val - delta_y).encode())
                 ops[i] = (new_operands, operator)
 
         elif op_str == "re" and len(operands) >= 4:
@@ -337,9 +571,7 @@ def _shift_content_below_inplace(
                 ty = float(operands[5])
                 if ty < y_threshold:
                     new_operands = list(operands)
-                    new_operands[5] = pikepdf.Object.parse(
-                        str(ty - delta_y).encode()
-                    )
+                    new_operands[5] = pikepdf.Object.parse(str(ty - delta_y).encode())
                     ops[i] = (new_operands, operator)
 
     # Write back content stream
@@ -352,22 +584,20 @@ def _shift_content_below_inplace(
         try:
             annots: list[Any] = list(page_obj[annots_key])  # type: ignore[call-overload]
             for annot_ref in annots:
-                annot = (
-                    annot_ref.resolve()
-                    if hasattr(annot_ref, "resolve")
-                    else annot_ref
-                )
+                annot = annot_ref.resolve() if hasattr(annot_ref, "resolve") else annot_ref
                 rect_key = pikepdf.Name("/Rect")
                 if rect_key in annot:
                     rect = annot[rect_key]
                     rect_y1 = float(rect[3])
                     if rect_y1 < y_threshold:
-                        annot[rect_key] = pikepdf.Array([
-                            float(rect[0]),
-                            float(rect[1]) - delta_y,
-                            float(rect[2]),
-                            rect_y1 - delta_y,
-                        ])
+                        annot[rect_key] = pikepdf.Array(
+                            [
+                                float(rect[0]),
+                                float(rect[1]) - delta_y,
+                                float(rect[2]),
+                                rect_y1 - delta_y,
+                            ]
+                        )
         except (KeyError, TypeError, IndexError):
             logger.warning("Failed to shift annotations on page %d", page_num)
 
@@ -381,9 +611,7 @@ def _shift_content_below_inplace(
         for elem in elements:
             if elem.bbox[1] < page_bottom:
                 overshoot = page_bottom - elem.bbox[1]
-                warnings.append(
-                    f"Content shifted below page boundary by {overshoot:.1f}pt"
-                )
+                warnings.append(f"Content shifted below page boundary by {overshoot:.1f}pt")
                 break
     return warnings
 
@@ -425,7 +653,11 @@ def shift_content_below(
         _, page_obj = pages[0]
 
         warnings = _shift_content_below_inplace(
-            pdf, page_obj, page_number, y_threshold, delta_y,
+            pdf,
+            page_obj,
+            page_number,
+            y_threshold,
+            delta_y,
         )
 
         overflow = any("below page boundary" in w for w in warnings)
@@ -450,6 +682,167 @@ def shift_content_below(
         pdf.close()
 
 
+def compute_uniform_layout(
+    region_height: float,
+    line_counts: list[int],
+    font_size: float = 10.0,
+    original_gap: float = 27.0,
+) -> tuple[float, float]:
+    """Compute uniform line_height and section_gap for N sections.
+
+    Uses a cascade: first reduces inter-section gaps, then (if still
+    insufficient) reduces line spacing.  Never compresses line_height
+    below ``font_size * 1.05``.
+
+    This is a pure computation with no side effects — it does not modify
+    any PDF.  The caller passes the result as ``line_height`` to
+    :func:`batch_replace_block`.
+
+    Args:
+        region_height: Total vertical space available for all sections
+            (from the top of the first section to the bottom of the last).
+        line_counts: Number of text lines in each section.
+        font_size: Base font size (used for minimum spacing calculation).
+        original_gap: Desired inter-section gap (from the original document).
+
+    Returns:
+        ``(line_height, section_gap)`` — both in PDF points.
+    """
+    n_sections = len(line_counts)
+    total_inter_line_gaps = sum(lc - 1 for lc in line_counts)
+    if total_inter_line_gaps <= 0:
+        return (font_size * 1.2, original_gap)
+
+    section_gap = original_gap
+    min_line_height = font_size * 1.05
+
+    while section_gap >= 0:
+        available = region_height - n_sections * section_gap
+        line_height = available / total_inter_line_gaps
+        if line_height >= min_line_height:
+            return (round(line_height, 2), round(section_gap, 2))
+        section_gap -= 0.5
+
+    # Even with zero gaps, content may be too large — clamp to minimum
+    line_height = region_height / total_inter_line_gaps
+    return (max(round(line_height, 2), font_size), 0.0)
+
+
+def _auto_compute_layout(
+    page_obj: pikepdf.Page,
+    page_number: int,
+    replacements: list[tuple[tuple[float, float, float, float], str]],
+) -> tuple[float, float]:
+    """Auto-detect layout params from original content and replacement text.
+
+    Analyzes the original sections to measure font size and section gaps,
+    then computes optimal ``(line_height, section_gap)`` via
+    :func:`compute_uniform_layout`.  Called internally by
+    :func:`batch_replace_block` when the caller omits layout parameters.
+    """
+    # Collect all text elements across all bboxes for font detection
+    elements = _build_index(page_obj, page_number)
+    all_matched: list[ContentElement] = []
+    for bbox, _ in replacements:
+        matched, _ = _collect_elements_in_bbox(elements, bbox)
+        all_matched.extend(matched)
+
+    if not all_matched:
+        return (12.0, 27.0)  # safe fallback
+
+    det_name, font_size, _ = _detect_font_from_elements(all_matched)
+    clean = det_name.lstrip("/")
+
+    # Measure original section gap: median y-distance between adjacent bboxes
+    sorted_bboxes = sorted(
+        [bb for bb, _ in replacements],
+        key=lambda b: -b[3],
+    )
+    gaps: list[float] = []
+    for i in range(len(sorted_bboxes) - 1):
+        gap = sorted_bboxes[i][1] - sorted_bboxes[i + 1][3]
+        if gap > 0:
+            gaps.append(gap)
+    original_gap = sorted(gaps)[len(gaps) // 2] if gaps else 27.0
+
+    # Count lines for each replacement text at the detected font/width
+    try:
+        resolver = _resolver_cache.get_resolver(page_obj, clean)
+        font_ref = page_obj["/Resources"]["/Font"]["/" + clean]
+    except (KeyError, TypeError):
+        return (font_size * 1.2, original_gap)
+
+    bbox_width = sorted_bboxes[0][2] - sorted_bboxes[0][0]
+    line_counts: list[int] = []
+    for bbox, text in replacements:
+        # Build style palette for this bbox (same as _replace_block_on_page)
+        # to get accurate indent-aware, continuation-joined line counts.
+        matched, _ = _collect_elements_in_bbox(elements, bbox)
+        if matched:
+            body_color: tuple[float, ...] | None = None
+            palette = _build_style_palette(matched, clean, font_size, body_color)
+        else:
+            palette = _StylePalette(None, clean, font_size, None, {})
+
+        if palette.body_after_marker_x > 0:
+            marker_indent = palette.body_after_marker_x - bbox[0]
+            indented_width = bbox_width - marker_indent
+            raw_segs = text.split("\n")
+            segs: list[str] = []
+            for seg in raw_segs:
+                stripped = seg.lstrip()
+                if stripped[:1] in palette.marker_fonts:
+                    segs.append(seg)
+                elif segs and segs[-1].lstrip()[:1] in palette.marker_fonts:
+                    segs[-1] = segs[-1].rstrip() + " " + seg.lstrip()
+                else:
+                    segs.append(seg)
+            count = 0
+            for seg in segs:
+                stripped = seg.lstrip()
+                w = indented_width if stripped[:1] in palette.marker_fonts else bbox_width
+                count += len(break_into_lines(seg, w, resolver, font_ref, font_size))
+        else:
+            count = len(break_into_lines(text, bbox_width, resolver, font_ref, font_size))
+        line_counts.append(count)
+
+    region_top = max(bb[3] for bb, _ in replacements)
+    region_bottom = min(bb[1] for bb, _ in replacements)
+    return compute_uniform_layout(
+        region_top - region_bottom,
+        line_counts,
+        font_size=font_size,
+        original_gap=original_gap,
+    )
+
+
+def _extend_font(
+    pdf: pikepdf.Pdf,
+    page_obj: pikepdf.Page,
+    font_name: str,
+    text: str,
+) -> bool:
+    """Extend a font's subset to encode *text*.  Returns True on success."""
+    from pdf_edit_engine.fonts import extend_subset
+
+    clean = font_name.lstrip("/")
+    r = _resolver_cache.get_resolver(page_obj, clean)
+    can, missing = r.can_encode(text)
+    if can:
+        return True
+    if not r.is_cid_font:
+        return False  # can't extend non-CID fonts
+    try:
+        extend_subset(pdf, page_obj, clean, "".join(missing))
+        _resolver_cache.evict(page_obj, clean)
+        r2 = _resolver_cache.get_resolver(page_obj, clean)
+        ok, _ = r2.can_encode(text)
+        return ok
+    except Exception:
+        logger.warning("Font extension failed for %s", font_name, exc_info=True)
+        return False
+
+
 def _replace_block_on_page(
     pdf: pikepdf.Pdf,
     page_obj: pikepdf.Page,
@@ -458,38 +851,50 @@ def _replace_block_on_page(
     new_text: str,
     font_name: str | None = None,
     font_size: float | None = None,
-) -> tuple[EditResult, float]:
+    line_height: float | None = None,
+    first_line_y_override: float | None = None,
+    skip_vertical_shift: bool = False,
+) -> tuple[EditResult, float, float]:
     """Core replace_block logic operating on an open PDF page.
+
+    Pipeline order (each step uses outputs of previous steps):
+      1. Collect elements → matched_elems
+      2. Detect body font → body_font, body_size, body_color
+      3. Build style palette → heading/marker fonts, indentation
+      4. Extend ALL palette fonts (body + heading + markers)
+      5. Break text into lines (indent-aware widths)
+      6. Detect line height from original content
+      7. Handle overflow (shift down) / record underflow
+      8. Render replacement ops (styled, indented)
+      9. Splice into content stream
+     10. Post-splice underflow collapse (shift up)
 
     Does NOT save the PDF — caller is responsible for saving.
 
-    Args:
-        pdf: Open pikepdf.Pdf object.
-        page_obj: Page to modify.
-        page_number: 0-indexed page number.
-        bbox: Target region (x0, y0, x1, y1) in PDF coordinates.
-        new_text: Replacement text.
-        font_name: Font resource name (e.g. 'F1').  Auto-detected if None.
-        font_size: Font size in points.  Auto-detected if None.
-
     Returns:
-        Tuple of (EditResult, overflow_delta).  overflow_delta is positive
-        when the replacement text extends below the original bbox.
+        Tuple of (EditResult, overflow_delta).  Positive when replacement
+        extends below the bbox, negative when it is shorter (underflow).
     """
-    # Build element index and find elements in bbox
+    from pdf_edit_engine.encoding import FontResolver
+
+    # ── Phase 1: Analyze ──────────────────────────────────────────────
     elements = _build_index(page_obj, page_number)
     matched_elems, op_indices = _collect_elements_in_bbox(elements, bbox)
 
     if not matched_elems:
-        return EditResult(
-            success=False,
-            original_text="",
-            new_text=new_text,
-            font_action="kept",
-            warnings=["No content found in specified bounding box"],
-        ), 0.0
+        return (
+            EditResult(
+                success=False,
+                original_text="",
+                new_text=new_text,
+                font_action="kept",
+                warnings=["No content found in specified bounding box"],
+            ),
+            0.0,
+            bbox[3],
+        )
 
-    # Detect font if not specified
+    # Detect body font (most common in region)
     font_size_was_auto = font_size is None
     det_name, det_size, fill_color = _detect_font_from_elements(matched_elems)
     if font_name is None:
@@ -497,44 +902,35 @@ def _replace_block_on_page(
     if font_size is None:
         font_size = det_size
 
-    # Collect original text for the result
-    original_parts: list[str] = []
-    for elem in matched_elems:
-        if elem.text_content:
-            original_parts.append(elem.text_content)
+    font_key = font_name if font_name.startswith("/") else f"/{font_name}"
+    clean_name = font_name.lstrip("/")
+
+    # Collect original text
+    original_parts = [e.text_content for e in matched_elems if e.text_content]
     original_text = " ".join(original_parts)
 
-    # Parse content stream and compute removal set
+    # Build style palette — BEFORE font extension and line breaking
+    palette = _build_style_palette(matched_elems, clean_name, font_size, fill_color)
+
+    # Compute removal set
     ops: _Ops = list(pikepdf.parse_content_stream(page_obj))
     blocks = _find_bt_et_blocks(ops)
     removal_indices = _expand_to_bt_et(sorted(op_indices), blocks)
     removal_set = set(removal_indices)
 
-    # Resolve font for encoding
-    font_key = font_name if font_name.startswith("/") else f"/{font_name}"
-    clean_name = font_name.lstrip("/")
+    # ── Phase 2: Extend ALL palette fonts ─────────────────────────────
     try:
         font_ref = page_obj["/Resources"]["/Font"][font_key]
     except (KeyError, TypeError) as exc:
-        raise OperatorError(
-            f"Font {font_name} not found in page resources"
-        ) from exc
+        raise OperatorError(f"Font {font_name} not found in page resources") from exc
 
     resolver = _resolver_cache.get_resolver(page_obj, clean_name)
-
-    # Strip control characters — \n, \r, \t are line separators handled
-    # by break_into_lines, not renderable glyphs.
     encodable_text = "".join(ch for ch in new_text if ch >= " ")
-
-    # Check encodability — extend font subset if needed
-    can_enc, missing = resolver.can_encode(encodable_text)
     font_action_str = "kept"
     font_switched = False
 
-    # CID font fallback: if the selected font is non-CID (e.g. WinAnsi
-    # TrueType) and cannot encode the replacement text, try to find an
-    # Identity-H CIDFont from the same bbox.  extend_subset() only supports
-    # Type0/Identity-H fonts, so calling it on TrueType would fail.
+    # CID font fallback for non-CID body font
+    can_enc, missing = resolver.can_encode(encodable_text)
     if not can_enc and not resolver.is_cid_font:
         cid_alt = _find_cid_font_in_elements(matched_elems, page_obj)
         if cid_alt is not None:
@@ -548,76 +944,141 @@ def _replace_block_on_page(
                 font_size = alt_size
             can_enc, missing = resolver.can_encode(encodable_text)
             font_switched = True
-            logger.debug(
-                "Mixed-font fallback: switched from non-CID to %s", clean_name,
-            )
 
+    # Extend body font
     if not can_enc:
         if not resolver.is_cid_font:
-            # Non-CID font and no CID alternative — cannot extend
-            return EditResult(
-                success=False,
-                original_text=" ".join(original_parts),
-                new_text=new_text,
-                font_action="failed",
-                warnings=["Font cannot encode text and no extensible "
-                          "(Type0/Identity-H) font available in bbox"],
-            ), 0.0
-        try:
-            from pdf_edit_engine.fonts import extend_subset
-
-            extend_subset(pdf, page_obj, clean_name, "".join(missing))
-            _resolver_cache.evict(page_obj, clean_name)
-            resolver = _resolver_cache.get_resolver(page_obj, clean_name)
-            can_enc_after, still_missing = resolver.can_encode(encodable_text)
-            if not can_enc_after:
-                return EditResult(
+            return (
+                EditResult(
                     success=False,
-                    original_text=" ".join(original_parts),
+                    original_text=original_text,
                     new_text=new_text,
                     font_action="failed",
-                    warnings=[f"Cannot encode: {''.join(still_missing)}"],
-                    fidelity_report=FidelityReport(
-                        font_preserved=True,
-                        font_substituted=None,
-                        overflow_detected=False,
-                        reflow_applied=False,
-                        glyphs_missing=still_missing,
-                    ),
-                ), 0.0
-            font_action_str = "extended"
-        except Exception:
-            logger.warning("Font extension failed", exc_info=True)
-            return EditResult(
-                success=False,
-                original_text=" ".join(original_parts),
-                new_text=new_text,
-                font_action="failed",
-                warnings=["Font extension failed"],
-            ), 0.0
+                    warnings=[
+                        "Font cannot encode text and no extensible "
+                        "(Type0/Identity-H) font available in bbox"
+                    ],
+                ),
+                0.0,
+                bbox[3],
+            )
+        if not _extend_font(pdf, page_obj, clean_name, encodable_text):
+            return (
+                EditResult(
+                    success=False,
+                    original_text=original_text,
+                    new_text=new_text,
+                    font_action="failed",
+                    warnings=["Font extension failed for body font"],
+                ),
+                0.0,
+                bbox[3],
+            )
+        resolver = _resolver_cache.get_resolver(page_obj, clean_name)
+        font_ref = page_obj["/Resources"]["/Font"][font_key]
+        font_action_str = "extended"
 
-    # Break text into lines for the bbox width
+    # Extend heading font (for the first line)
+    first_line = new_text.split("\n", 1)[0] if new_text else ""
+    first_line_clean = "".join(ch for ch in first_line if ch >= " ")
+    if palette.heading_font and palette.heading_font != clean_name:
+        if _extend_font(pdf, page_obj, palette.heading_font, first_line_clean):
+            if font_action_str == "kept":
+                font_action_str = "extended"
+        else:
+            palette = _StylePalette(  # degrade: drop heading font
+                heading_font=None,
+                body_font=palette.body_font,
+                body_size=palette.body_size,
+                body_color=palette.body_color,
+                marker_fonts=palette.marker_fonts,
+                marker_x=palette.marker_x,
+                body_after_marker_x=palette.body_after_marker_x,
+            )
+
+    # Extend marker fonts
+    for char, mfont in list(palette.marker_fonts.items()):
+        if mfont != clean_name:
+            if not _extend_font(pdf, page_obj, mfont, char):
+                del palette.marker_fonts[char]  # degrade: drop this marker
+
+    # Build resolvers for ALL palette fonts
+    extra_resolvers: dict[str, FontResolver] = {}
+    for fn in {palette.heading_font, *palette.marker_fonts.values()} - {None, clean_name}:
+        try:
+            extra_resolvers[fn] = _resolver_cache.get_resolver(
+                page_obj,
+                fn.lstrip("/"),
+            )
+        except (KeyError, TypeError):
+            pass
+
+    # ── Phase 3: Break text into lines (indent-aware) ────────────────
     bbox_width = bbox[2] - bbox[0]
-    lines = break_into_lines(
-        new_text,
-        bbox_width,
-        resolver,
-        font_ref,
-        font_size,
-    )
 
-    # Line height from detected elements or default
-    line_height = font_size * 1.2
+    if palette.body_after_marker_x > 0:
+        # Indent-aware breaking: bullet lines have less width.
+        marker_indent = palette.body_after_marker_x - bbox[0]
+        indented_width = bbox_width - marker_indent
 
-    # Calculate overflow and shift content below if needed
+        # Join continuation segments back into their bullet paragraph.
+        # Extracted text preserves original visual line breaks as \n,
+        # splitting "• retailer —\ncovering 500+" into two segments.
+        # Merging non-marker segments after a marker into the marker's
+        # paragraph produces optimal reflow and correct indented width.
+        raw_segments = new_text.split("\n")
+        segments: list[str] = []
+        for seg in raw_segments:
+            stripped = seg.lstrip()
+            if stripped[:1] in palette.marker_fonts:
+                segments.append(seg)
+            elif segments and segments[-1].lstrip()[:1] in palette.marker_fonts:
+                # Continuation of previous bullet — join with space
+                segments[-1] = segments[-1].rstrip() + " " + seg.lstrip()
+            else:
+                segments.append(seg)
+
+        all_lines: list[str] = []
+        for seg in segments:
+            stripped = seg.lstrip()
+            if stripped[:1] in palette.marker_fonts:
+                seg_lines = break_into_lines(
+                    seg,
+                    indented_width,
+                    resolver,
+                    font_ref,
+                    font_size,
+                )
+            else:
+                seg_lines = break_into_lines(
+                    seg,
+                    bbox_width,
+                    resolver,
+                    font_ref,
+                    font_size,
+                )
+            all_lines.extend(seg_lines)
+        lines = all_lines if all_lines else [""]
+    else:
+        lines = break_into_lines(new_text, bbox_width, resolver, font_ref, font_size)
+
+    # ── Phase 4: Layout ──────────────────────────────────────────────
+    caller_line_height = line_height is not None
+    if not caller_line_height:
+        line_height = _detect_line_height(matched_elems, font_size)
     bbox_height = bbox[3] - bbox[1]
     text_height = len(lines) * line_height
     overflow_delta = text_height - bbox_height
 
     shift_warnings: list[str] = []
     original_overflow = overflow_delta
-    if overflow_delta > 0:
-        # Clamp shift to keep all content on-page
+
+    # In sequential mode (skip_vertical_shift), the batch caller handles
+    # all vertical shifts at the end.  Bboxes are for removal only; text
+    # is positioned via first_line_y_override.  Skipping per-section
+    # shifts keeps content at original positions so subsequent bboxes
+    # still find the right elements to remove.
+    if not skip_vertical_shift and overflow_delta > 0:
         mediabox = page_obj.get("/MediaBox")
         if mediabox is not None:
             page_bottom = float(mediabox[1])
@@ -636,32 +1097,50 @@ def _replace_block_on_page(
             else:
                 overflow_delta = 0.0
 
-    if overflow_delta > 0:
-        shift_warnings.extend(_shift_content_below_inplace(
-            pdf, page_obj, page_number, bbox[1], overflow_delta,
-        ))
-        # Re-parse content stream after in-place shift
+    if not skip_vertical_shift and overflow_delta > 0:
+        shift_warnings.extend(
+            _shift_content_below_inplace(
+                pdf,
+                page_obj,
+                page_number,
+                bbox[1],
+                overflow_delta,
+            )
+        )
         ops = list(pikepdf.parse_content_stream(page_obj))
-        # Indices are stable (shift modifies values, not count/order)
-        # but recompute defensively from fresh parse
         blocks = _find_bt_et_blocks(ops)
         removal_indices = _expand_to_bt_et(sorted(op_indices), blocks)
         removal_set = set(removal_indices)
 
-    # Build replacement BT/ET block
+    # If text still exceeds available space after clamped shift,
+    # compress line_height so all lines fit without overlapping
+    # content below.  Skip when the caller provided an explicit
+    # line_height (they already computed uniform spacing).
+    if not caller_line_height:
+        available_height = bbox_height + max(0.0, overflow_delta)
+        if text_height > available_height and len(lines) > 1:
+            line_height = available_height / len(lines)
+        text_height = available_height  # recalculate for underflow check
+
+    # ── Phase 5: Render ──────────────────────────────────────────────
+    actual_first_y = (
+        first_line_y_override if first_line_y_override is not None else bbox[3] - font_size
+    )
     replacement = _build_replacement_ops(
         lines=lines,
         font_name=clean_name,
         font_size=font_size,
         fill_color=fill_color,
         left_margin=bbox[0],
-        first_line_y=bbox[3] - font_size,
+        first_line_y=actual_first_y,
         line_height=line_height,
         resolver=resolver,
         page=page_obj,
+        style_palette=palette,
+        extra_resolvers=extra_resolvers,
     )
 
-    # Splice: remove old operators, insert replacement
+    # ── Phase 6: Write ───────────────────────────────────────────────
     insert_pos = min(removal_set)
     new_ops: _Ops = []
     inserted = False
@@ -672,9 +1151,30 @@ def _replace_block_on_page(
         if i not in removal_set:
             new_ops.append(op)
 
-    # Write back to page (caller saves)
     new_stream = pikepdf.unparse_content_stream(new_ops)
     page_obj.Contents = pdf.make_stream(new_stream)
+
+    # Sync annotations: shift link rects to match new text position
+    delta_y = actual_first_y - (bbox[3] - font_size)
+    if abs(delta_y) > 0.5:
+        _sync_annotations_in_bbox(page_obj, bbox, delta_y, new_text)
+
+    # Post-splice underflow collapse: shift content below bbox UP.
+    # Skipped in sequential mode (skip_vertical_shift) — the batch
+    # caller handles one net shift at the end for the whole region.
+    if not skip_vertical_shift and overflow_delta < 0:
+        shift_warnings.extend(
+            _shift_content_below_inplace(
+                pdf,
+                page_obj,
+                page_number,
+                bbox[1],
+                overflow_delta,
+            )
+        )
+
+    last_line_y = actual_first_y - max(0, len(lines) - 1) * line_height
+    effective_delta = 0.0 if skip_vertical_shift else overflow_delta
 
     result = EditResult(
         success=True,
@@ -690,7 +1190,7 @@ def _replace_block_on_page(
             glyphs_missing=[],
         ),
     )
-    return result, max(0.0, overflow_delta)
+    return result, effective_delta, last_line_y
 
 
 def replace_block(
@@ -701,6 +1201,7 @@ def replace_block(
     output_path: str,
     font_name: str | None = None,
     font_size: float | None = None,
+    line_height: float | None = None,
 ) -> EditResult:
     """Replace all content within a bounding box with new reflowed text.
 
@@ -726,8 +1227,15 @@ def replace_block(
     try:
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
-        result, _ = _replace_block_on_page(
-            pdf, page_obj, page_number, bbox, new_text, font_name, font_size,
+        result, _, _ = _replace_block_on_page(
+            pdf,
+            page_obj,
+            page_number,
+            bbox,
+            new_text,
+            font_name,
+            font_size,
+            line_height=line_height,
         )
         pdf.save(output_path)
         _invalidate_caches()
@@ -741,12 +1249,25 @@ def batch_replace_block(
     page_number: int,
     replacements: list[tuple[tuple[float, float, float, float], str]],
     output_path: str,
+    *,
+    line_height: float | None = None,
+    section_gap: float | None = None,
 ) -> list[EditResult]:
     """Apply multiple bbox-based text replacements on a single page.
 
-    Processes replacements top-to-bottom (highest y1 first), tracking
-    cumulative vertical shift so each replacement's bbox accounts for
-    overflow from previous replacements.
+    Processes replacements top-to-bottom (highest y1 first).
+
+    **Default mode** (no ``section_gap``): Each replacement's text is
+    anchored to the top of its bbox.  Cumulative vertical shifts track
+    overflow/underflow between replacements.
+
+    **Sequential mode** (``section_gap`` provided with ``line_height``):
+    Bboxes define what to *remove* only.  Text flows sequentially from
+    the top of the region: each section starts at the previous section's
+    last line minus ``section_gap``.  A single net vertical shift at the
+    end adjusts content below the region.  This mode is designed for
+    use with :func:`compute_uniform_layout`, which returns both
+    ``line_height`` and ``section_gap`` as a coordinated pair.
 
     Args:
         pdf_path: Path to the input PDF.
@@ -754,6 +1275,9 @@ def batch_replace_block(
         replacements: List of (bbox, new_text) tuples.  Each bbox is
             (x0, y0, x1, y1) in PDF coordinates.
         output_path: Path for the output PDF.
+        line_height: Uniform line spacing (optional).
+        section_gap: Gap between sections in sequential mode (optional).
+            Only effective when ``line_height`` is also provided.
 
     Returns:
         List of EditResult, one per replacement (same order as input).
@@ -767,28 +1291,104 @@ def batch_replace_block(
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
 
+        # Auto-layout: when multiple replacements are given without explicit
+        # layout params, analyze the original content and compute optimal
+        # spacing automatically.  This is the "brain" — the caller provides
+        # only bboxes and text, the engine figures out the rest.
+        if line_height is None and len(replacements) > 1:
+            line_height, section_gap = _auto_compute_layout(
+                page_obj,
+                page_number,
+                replacements,
+            )
+
         # Sort by y1 descending (topmost first) while preserving input order
         # for result mapping.
         indexed = list(enumerate(replacements))
         indexed.sort(key=lambda t: t[1][0][3], reverse=True)
 
         results: list[tuple[int, EditResult]] = []
-        cumulative_shift = 0.0
+        sequential = section_gap is not None and line_height is not None
 
-        for orig_idx, (bbox, new_text) in indexed:
-            # Offset bbox downward by cumulative shift from prior overflows
-            adjusted_bbox = (
-                bbox[0],
-                bbox[1] - cumulative_shift,
-                bbox[2],
-                bbox[3] - cumulative_shift,
-            )
-            result, overflow = _replace_block_on_page(
-                pdf, page_obj, page_number, adjusted_bbox, new_text,
-            )
-            _invalidate_caches()
-            cumulative_shift += overflow
-            results.append((orig_idx, result))
+        if sequential:
+            # ── Sequential mode ──────────────────────────────────
+            # Bboxes = removal only.  Text positioned by layout algorithm.
+            prev_last_line_y: float | None = None
+
+            for orig_idx, (bbox, new_text) in indexed:
+                ffly = None if prev_last_line_y is None else prev_last_line_y - section_gap
+                result, _delta, last_y = _replace_block_on_page(
+                    pdf,
+                    page_obj,
+                    page_number,
+                    bbox,
+                    new_text,
+                    line_height=line_height,
+                    first_line_y_override=ffly,
+                    skip_vertical_shift=True,
+                )
+                _invalidate_caches()
+                prev_last_line_y = last_y
+                results.append((orig_idx, result))
+
+            # Net shift: adjust content below the region.
+            # Measure the ACTUAL gap from the last rendered line to the
+            # first content element below the region.  If this gap exceeds
+            # section_gap, shift content up to close the excess — keeping
+            # the trailing gap proportional to inter-section gaps.
+            region_bottom = min(bb[1] for bb, _ in replacements)
+            if prev_last_line_y is not None:
+                if prev_last_line_y < region_bottom:
+                    # Overflow: text extends below region → shift down
+                    _shift_content_below_inplace(
+                        pdf,
+                        page_obj,
+                        page_number,
+                        region_bottom,
+                        region_bottom - prev_last_line_y,
+                    )
+                else:
+                    # Measure actual gap to first content below region
+                    _invalidate_caches()
+                    below_elems = [
+                        e
+                        for e in _build_index(page_obj, page_number)
+                        if e.type == "text" and e.bbox[3] < region_bottom
+                    ]
+                    if below_elems:
+                        next_y = max(e.bbox[3] for e in below_elems)
+                        actual_gap = prev_last_line_y - next_y
+                        if actual_gap > section_gap:
+                            collapse = actual_gap - section_gap
+                            _shift_content_below_inplace(
+                                pdf,
+                                page_obj,
+                                page_number,
+                                region_bottom,
+                                -collapse,  # negative = shift up
+                            )
+        else:
+            # ── Default mode (bbox-anchored) ─────────────────────
+            cumulative_shift = 0.0
+
+            for orig_idx, (bbox, new_text) in indexed:
+                adjusted_bbox = (
+                    bbox[0],
+                    bbox[1] - cumulative_shift,
+                    bbox[2],
+                    bbox[3] - cumulative_shift,
+                )
+                result, overflow, _last_y = _replace_block_on_page(
+                    pdf,
+                    page_obj,
+                    page_number,
+                    adjusted_bbox,
+                    new_text,
+                    line_height=line_height,
+                )
+                _invalidate_caches()
+                cumulative_shift += overflow
+                results.append((orig_idx, result))
 
         pdf.save(output_path)
         _invalidate_caches()
@@ -865,9 +1465,7 @@ def insert_text_block(
         try:
             font_ref = page_obj["/Resources"]["/Font"][font_key]
         except (KeyError, TypeError) as exc:
-            raise OperatorError(
-                f"Font {font_name} not found in page resources"
-            ) from exc
+            raise OperatorError(f"Font {font_name} not found in page resources") from exc
 
         resolver = _resolver_cache.get_resolver(page_obj, clean_name)
 
@@ -907,7 +1505,11 @@ def insert_text_block(
         # Shift existing content down to make room.
         # Use y + 0.5 as threshold so elements AT the insertion y also shift.
         shift_warnings = _shift_content_below_inplace(
-            pdf, page_obj, page_number, y + 0.5, text_height,
+            pdf,
+            page_obj,
+            page_number,
+            y + 0.5,
+            text_height,
         )
 
         # Re-parse content stream after shift
@@ -1024,11 +1626,7 @@ def delete_block(
                 annots: list[Any] = list(page_obj[annots_key])  # type: ignore[call-overload]
                 kept: list[Any] = []
                 for annot_ref in annots:
-                    annot = (
-                        annot_ref.resolve()
-                        if hasattr(annot_ref, "resolve")
-                        else annot_ref
-                    )
+                    annot = annot_ref.resolve() if hasattr(annot_ref, "resolve") else annot_ref
                     rect_key = pikepdf.Name("/Rect")
                     if rect_key in annot:
                         rect = annot[rect_key]
@@ -1042,9 +1640,7 @@ def delete_block(
                             continue  # remove this annotation
                     kept.append(annot_ref)
                 if len(kept) != len(annots):
-                    page_obj[annots_key] = pdf.make_indirect(
-                        pikepdf.Array(kept)
-                    )
+                    page_obj[annots_key] = pdf.make_indirect(pikepdf.Array(kept))
             except (KeyError, TypeError, IndexError):
                 logger.warning("Failed to clean annotations on page %d", page_number)
 
@@ -1056,7 +1652,11 @@ def delete_block(
             # y_threshold = bbox[1] (bottom of deleted region)
             # delta_y = -deleted_height (negative = shift up)
             warnings = _shift_content_below_inplace(
-                pdf, page_obj, page_number, bbox[1], -deleted_height,
+                pdf,
+                page_obj,
+                page_number,
+                bbox[1],
+                -deleted_height,
             )
 
         pdf.save(output_path)

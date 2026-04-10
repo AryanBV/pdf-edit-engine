@@ -1068,3 +1068,55 @@ def get_text_layout(pdf_path: str, page: int | None = None) -> list[TextBlock]:
                 )
     blocks.sort(key=lambda b: (b.page, -b.y, b.x))
     return blocks
+
+
+def extract_bbox_text(
+    pdf_path: str,
+    *,
+    bbox: tuple[float, float, float, float],
+    page: int,
+    tolerance: float = 2.0,
+) -> str:
+    """Extract text from a bounding box region with gap-aware joining.
+
+    Uses the same gap detection logic as :func:`get_text` to avoid
+    inserting spurious spaces between adjacent text runs (e.g., "monthly"
+    stays "monthly", not "month ly").
+
+    Args:
+        pdf_path: Path to the PDF file.
+        bbox: Target region ``(x0, y0, x1, y1)`` in PDF coordinates.
+        page: 0-indexed page number.
+        tolerance: Extra margin (in points) for bbox overlap matching.
+
+    Returns:
+        Extracted text with lines separated by newlines.
+    """
+    x0, y0, x1, y1 = bbox
+    path = str(Path(pdf_path).resolve())
+    with pikepdf.open(path) as pdf:
+        pages = _resolve_pages(pdf, page)
+        if not pages:
+            return ""
+        _, page_obj = pages[0]
+        elements = _build_index(page_obj, page, pdf_path=path)
+        text_elements = [e for e in elements if e.type == "text" and e.text_content]
+
+        # Filter to elements overlapping the bbox (with tolerance)
+        hits: list[ContentElement] = []
+        for elem in text_elements:
+            ex0, ey0, ex1, ey1 = elem.bbox
+            if (
+                ex0 < x1 + tolerance
+                and ex1 > x0 - tolerance
+                and ey0 < y1 + tolerance
+                and ey1 > y0 - tolerance
+            ):
+                hits.append(elem)
+
+        # Sort by reading order: y descending (top first), x ascending
+        hits.sort(key=lambda e: (-e.bbox[3], e.bbox[0]))
+
+        # Reuse the gap-aware line grouping
+        lines = _group_into_lines(hits)
+        return "\n".join(lines)

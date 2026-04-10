@@ -178,6 +178,10 @@ class TestWinAnsi:
     def test_encode_ascii(self, f2_resolver: FontResolver) -> None:
         assert f2_resolver.encode("A") == bytes([0x41])
 
+    def test_encode_space(self, f2_resolver: FontResolver) -> None:
+        """Space must encode to 0x20, not 0xAD (soft hyphen)."""
+        assert f2_resolver.encode(" ") == bytes([0x20])
+
     def test_decode_multiple(self, f2_resolver: FontResolver) -> None:
         assert f2_resolver.decode(bytes([0x48, 0x69])) == "Hi"
 

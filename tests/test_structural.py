@@ -44,8 +44,9 @@ class TestReplaceBlock:
         """Replace the 3-line body paragraph on reportlab_simple.pdf."""
         out = str(tmp_path / "replaced.pdf")
         # P1 bbox: (72.0, 667.2, 494.4, 708.2)
-        result = replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
-                               "Replacement text here.", out)
+        result = replace_block(
+            SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), "Replacement text here.", out
+        )
         assert result.success
         text = get_text(out)
         assert "Replacement text" in text
@@ -54,16 +55,14 @@ class TestReplaceBlock:
     def test_replace_block_auto_font(self, tmp_path: Path) -> None:
         """Font auto-detection works when font_name not specified."""
         out = str(tmp_path / "auto_font.pdf")
-        result = replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
-                               "Auto font test.", out)
+        result = replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), "Auto font test.", out)
         assert result.success
         assert result.fidelity_report.font_preserved
 
     def test_replace_block_preserves_other(self, tmp_path: Path) -> None:
         """Content outside the bbox is preserved."""
         out = str(tmp_path / "preserve.pdf")
-        replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
-                      "New paragraph.", out)
+        replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), "New paragraph.", out)
         text = get_text(out)
         assert "Test Document" in text
         assert "Section two" in text
@@ -72,8 +71,7 @@ class TestReplaceBlock:
         """Long replacement text triggers overflow detection."""
         out = str(tmp_path / "overflow.pdf")
         long_text = "word " * 200  # much more than the bbox can hold
-        result = replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
-                               long_text.strip(), out)
+        result = replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), long_text.strip(), out)
         assert result.success
         assert result.fidelity_report.overflow_detected
 
@@ -86,8 +84,7 @@ class TestReplaceBlock:
     def test_replace_block_returns_edit_result(self, tmp_path: Path) -> None:
         """Result includes original and new text."""
         out = str(tmp_path / "result.pdf")
-        result = replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
-                               "New text.", out)
+        result = replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), "New text.", out)
         assert isinstance(result, EditResult)
         assert result.original_text  # non-empty
         assert result.new_text == "New text."
@@ -97,8 +94,7 @@ class TestReplaceBlock:
         out = str(tmp_path / "shifted.pdf")
         # Enough text to guarantee multi-line overflow in the ~41pt tall bbox
         long_text = " ".join(["replacement"] * 60)
-        result = replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
-                               long_text, out)
+        result = replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), long_text, out)
         assert result.success
         assert result.fidelity_report.overflow_detected
         text = get_text(out)
@@ -116,8 +112,7 @@ class TestReplaceBlockResume:
         """Replace the AJSP Manager project title line."""
         out = str(tmp_path / "title.pdf")
         # AJSP Manager bbox: (14.2, 435.9, 212.4, 445.9)
-        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
-                               "Custom Project", out)
+        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9), "Custom Project", out)
         assert result.success
         text = get_text(out)
         assert "Custom Project" in text
@@ -146,8 +141,9 @@ class TestReplaceBlockResume:
         """replace_block on bold CIDFont title produces correct text."""
         out = str(tmp_path / "bold.pdf")
         # AJSP Manager title is F1 (Calibri-Bold), all chars in subset
-        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
-                               "PDF Edit Engine Plan", out)
+        result = replace_block(
+            RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9), "PDF Edit Engine Plan", out
+        )
         assert result.success
         assert result.font_action == "kept"
         text = get_text(out)
@@ -157,8 +153,7 @@ class TestReplaceBlockResume:
         """replace_block with font extension still produces correct text."""
         out = str(tmp_path / "ext.pdf")
         # 'x' is not in the F1 subset — triggers font extension
-        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
-                               "PDF Text Editing", out)
+        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9), "PDF Text Editing", out)
         assert result.success
         assert result.font_action == "extended"
         text = get_text(out)
@@ -168,8 +163,7 @@ class TestReplaceBlockResume:
         """Long CIDFont replacement wraps to multiple lines correctly."""
         out = str(tmp_path / "wrap.pdf")
         long_text = "PDF Edit Engine \u2014 Format-Preserving PDF Text Editing"
-        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
-                               long_text, out)
+        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9), long_text, out)
         assert result.success
         text = get_text(out)
         assert "Format-Preserving" in text
@@ -178,8 +172,7 @@ class TestReplaceBlockResume:
     def test_replace_block_cid_preserves_other_content(self, tmp_path: Path) -> None:
         """Replacing a bold title does not garble other page content."""
         out = str(tmp_path / "preserve.pdf")
-        replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
-                      "New Title", out)
+        replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9), "New Title", out)
         text = get_text(out)
         # Section headings should still be readable
         assert "PROFESSIONAL SUMMARY" in text
@@ -190,8 +183,7 @@ class TestReplaceBlockResume:
         """CIDFont multi-line overflow shifts content, no interleaving."""
         out = str(tmp_path / "no_interleave.pdf")
         long_text = "PDF Edit Engine \u2014 Format-Preserving PDF Text Editing Library"
-        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
-                               long_text, out)
+        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9), long_text, out)
         assert result.success
         assert result.fidelity_report.overflow_detected
         text = get_text(out)
@@ -203,8 +195,7 @@ class TestReplaceBlockResume:
     def test_replace_block_cid_uses_tj_array(self, tmp_path: Path) -> None:
         """CIDFont replacement uses TJ array and Tm positioning."""
         out = str(tmp_path / "ops.pdf")
-        replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
-                      "Operator Test", out)
+        replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9), "Operator Test", out)
         # Parse the output and verify operator structure
         pdf = pikepdf.Pdf.open(out)
         ops = list(pikepdf.parse_content_stream(pdf.pages[0]))
@@ -240,7 +231,8 @@ class TestReplaceBlockResume:
         """
         out = str(tmp_path / "mixed_font.pdf")
         result = replace_block(
-            RESUME_PDF, 0,
+            RESUME_PDF,
+            0,
             (14.0, 745.0, 140.0, 770.0),
             "PROFESSIONAL SUMMARY \u0100",
             out,
@@ -254,8 +246,9 @@ class TestReplaceBlockResume:
     def test_replace_block_newline_in_text(self, tmp_path: Path) -> None:
         """Newlines in replacement text don't fail can_encode (Bug B fix)."""
         out = str(tmp_path / "newline.pdf")
-        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9),
-                               "Line One\nLine Two", out)
+        result = replace_block(
+            RESUME_PDF, 0, (14.2, 435.9, 212.4, 445.9), "Line One\nLine Two", out
+        )
         assert result.success, f"Expected success: {result.warnings}"
         assert result.font_action != "failed"
         text = get_text(out)
@@ -263,14 +256,14 @@ class TestReplaceBlockResume:
         assert "Line Two" in text
 
     def test_replace_block_massive_overflow_stays_on_page(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         """Massive overflow doesn't push content below page boundary (Bug A fix)."""
         out = str(tmp_path / "clamp.pdf")
         # Narrow bbox (61pt wide) + long text → many lines → huge overflow_delta
         long_text = "This is a very long replacement " * 20
-        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 75.5, 445.9),
-                               long_text, out)
+        result = replace_block(RESUME_PDF, 0, (14.2, 435.9, 75.5, 445.9), long_text, out)
         assert result.success
         assert result.fidelity_report.overflow_detected
         # Verify no Tm y-value < 0 in output content stream
@@ -294,7 +287,7 @@ class TestBatchReplaceBlock:
         """Two bbox replacements applied in one pass."""
         out = str(tmp_path / "batch.pdf")
         replacements = [
-            ((72.0, 745.5, 212.4, 763.5), "New Title"),          # P0 (title)
+            ((72.0, 745.5, 212.4, 763.5), "New Title"),  # P0 (title)
             ((72.0, 632.2, 388.8, 643.2), "Replaced section."),  # P2 (section two)
         ]
         results = batch_replace_block(SIMPLE_PDF, 0, replacements, out)
@@ -309,8 +302,8 @@ class TestBatchReplaceBlock:
         out = str(tmp_path / "order.pdf")
         # Provide in bottom-to-top order — results should still match input
         replacements = [
-            ((72.0, 632.2, 388.8, 643.2), "Bottom first."),    # P2 (lower)
-            ((72.0, 745.5, 212.4, 763.5), "Top second."),      # P0 (higher)
+            ((72.0, 632.2, 388.8, 643.2), "Bottom first."),  # P2 (lower)
+            ((72.0, 745.5, 212.4, 763.5), "Top second."),  # P0 (higher)
         ]
         results = batch_replace_block(SIMPLE_PDF, 0, replacements, out)
         assert results[0].new_text == "Bottom first."
@@ -323,8 +316,8 @@ class TestBatchReplaceBlock:
         # P0 (title, ~18pt tall) replaced with long text that overflows
         long_text = " ".join(["expanded"] * 40)
         replacements = [
-            ((72.0, 745.5, 212.4, 763.5), long_text),           # P0 — overflows
-            ((72.0, 632.2, 388.8, 643.2), "Still correct."),    # P2 — below
+            ((72.0, 745.5, 212.4, 763.5), long_text),  # P0 — overflows
+            ((72.0, 632.2, 388.8, 643.2), "Still correct."),  # P2 — below
         ]
         results = batch_replace_block(SIMPLE_PDF, 0, replacements, out)
         assert len(results) == 2
@@ -459,9 +452,15 @@ class TestInsertTextBlock:
     def test_insert_basic(self, tmp_path: Path) -> None:
         """Inserted text appears in the output PDF."""
         out = str(tmp_path / "insert.pdf")
-        result = insert_text_block(SIMPLE_PDF, 0, x=72.0, y=720.0,
-                                   text="Hello from insert_text_block!",
-                                   output_path=out, font_size=11.0)
+        result = insert_text_block(
+            SIMPLE_PDF,
+            0,
+            x=72.0,
+            y=720.0,
+            text="Hello from insert_text_block!",
+            output_path=out,
+            font_size=11.0,
+        )
         assert result.success
         text = get_text(out)
         assert "Hello from insert" in text
@@ -469,9 +468,9 @@ class TestInsertTextBlock:
     def test_insert_shifts_existing(self, tmp_path: Path) -> None:
         """Content below the insertion point should shift down."""
         out = str(tmp_path / "shifted.pdf")
-        insert_text_block(SIMPLE_PDF, 0, x=72.0, y=720.0,
-                          text="Inserted line.",
-                          output_path=out, font_size=11.0)
+        insert_text_block(
+            SIMPLE_PDF, 0, x=72.0, y=720.0, text="Inserted line.", output_path=out, font_size=11.0
+        )
 
         paras_before = detect_paragraphs(SIMPLE_PDF, page=0)
         paras_after = detect_paragraphs(out, page=0)
@@ -488,9 +487,9 @@ class TestInsertTextBlock:
         """Long text wraps into multiple lines."""
         out = str(tmp_path / "multi.pdf")
         long_text = "This is a longer paragraph that should wrap across lines. " * 3
-        result = insert_text_block(SIMPLE_PDF, 0, x=72.0, y=720.0,
-                                   text=long_text.strip(),
-                                   output_path=out, font_size=11.0)
+        result = insert_text_block(
+            SIMPLE_PDF, 0, x=72.0, y=720.0, text=long_text.strip(), output_path=out, font_size=11.0
+        )
         assert result.success
         text = get_text(out)
         assert "longer paragraph" in text
@@ -498,9 +497,9 @@ class TestInsertTextBlock:
     def test_insert_preserves_existing(self, tmp_path: Path) -> None:
         """Existing content is preserved after insertion."""
         out = str(tmp_path / "preserve.pdf")
-        insert_text_block(SIMPLE_PDF, 0, x=72.0, y=720.0,
-                          text="New content.",
-                          output_path=out, font_size=11.0)
+        insert_text_block(
+            SIMPLE_PDF, 0, x=72.0, y=720.0, text="New content.", output_path=out, font_size=11.0
+        )
         text = get_text(out)
         assert "Test Document" in text
         assert "Section two" in text
@@ -526,8 +525,7 @@ class TestDeleteBlock:
     def test_delete_close_gap(self, tmp_path: Path) -> None:
         """Content below deleted region moves up when close_gap=True."""
         out = str(tmp_path / "close.pdf")
-        delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), out,
-                     close_gap=True)
+        delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), out, close_gap=True)
         paras_before = detect_paragraphs(SIMPLE_PDF, page=0)
         paras_after = detect_paragraphs(out, page=0)
 
@@ -542,8 +540,7 @@ class TestDeleteBlock:
     def test_delete_no_close_gap(self, tmp_path: Path) -> None:
         """With close_gap=False, content below stays in place."""
         out = str(tmp_path / "no_close.pdf")
-        delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), out,
-                     close_gap=False)
+        delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), out, close_gap=False)
         paras_before = detect_paragraphs(SIMPLE_PDF, page=0)
         paras_after = detect_paragraphs(out, page=0)
 
@@ -570,9 +567,7 @@ class TestDeleteBlockResume:
         """Delete the SMART_MED section title."""
         out = str(tmp_path / "no_smart.pdf")
         # SMART_MED bbox: (14.2, 161.6, 250.2, 171.6)
-        result = delete_block(RESUME_PDF, 0,
-                              (14.2, 161.6, 250.2, 171.6), out,
-                              close_gap=False)
+        result = delete_block(RESUME_PDF, 0, (14.2, 161.6, 250.2, 171.6), out, close_gap=False)
         assert result.success
         text = get_text(out)
         assert "SMART_MED" not in text
@@ -591,13 +586,18 @@ class TestCombinations:
         final = str(tmp_path / "step2.pdf")
 
         # Step 1: delete body paragraph
-        delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
-                     intermediate, close_gap=False)
+        delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), intermediate, close_gap=False)
 
         # Step 2: insert new text where the old paragraph was
-        result = insert_text_block(intermediate, 0, x=72.0, y=700.0,
-                                   text="Brand new content replaces old.",
-                                   output_path=final, font_size=11.0)
+        result = insert_text_block(
+            intermediate,
+            0,
+            x=72.0,
+            y=700.0,
+            text="Brand new content replaces old.",
+            output_path=final,
+            font_size=11.0,
+        )
         assert result.success
         text = get_text(final)
         assert "Brand new content" in text
@@ -609,8 +609,7 @@ class TestCombinations:
         step1 = str(tmp_path / "replaced.pdf")
         step2 = str(tmp_path / "shifted.pdf")
 
-        replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2),
-                      "Short.", step1)
+        replace_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), "Short.", step1)
         shift_content_below(step1, 0, 680.0, 10.0, step2)
         text = get_text(step2)
         assert "Short" in text

@@ -20,7 +20,13 @@ from pdf_edit_engine.errors import (
     ReflowError,
 )
 from pdf_edit_engine.fonts import analyze_subset, can_render, extend_subset
-from pdf_edit_engine.locator import find, get_fonts, get_text, get_text_layout
+from pdf_edit_engine.locator import (
+    extract_bbox_text,
+    find,
+    get_fonts,
+    get_text,
+    get_text_layout,
+)
 from pdf_edit_engine.models import (
     ContentElement,
     Edit,
@@ -36,6 +42,7 @@ from pdf_edit_engine.models import (
 from pdf_edit_engine.reflow import detect_paragraphs, reflow_paragraph
 from pdf_edit_engine.structural import (
     batch_replace_block,
+    compute_uniform_layout,
     delete_block,
     insert_text_block,
     replace_block,
@@ -66,6 +73,7 @@ __all__ = [
     "get_text",
     "get_text_layout",
     "get_fonts",
+    "extract_bbox_text",
     # surgeon
     "replace",
     "replace_all",
@@ -76,6 +84,7 @@ __all__ = [
     "delete_block",
     "insert_text_block",
     "shift_content_below",
+    "compute_uniform_layout",
     # fonts
     "analyze_subset",
     "can_render",

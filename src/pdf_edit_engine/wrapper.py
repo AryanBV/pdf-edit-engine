@@ -9,6 +9,15 @@ import pikepdf
 from pdf_edit_engine._pathutil import validate_output_dir, validate_output_path
 from pdf_edit_engine.errors import PDFEditError
 
+
+def _validate_page_indices(pages: list[int], total: int, operation: str) -> None:
+    """Validate that all page indices are within bounds."""
+    for i in pages:
+        if i < 0 or i >= total:
+            msg = f"{operation}: page index {i} out of bounds for PDF with {total} pages"
+            raise PDFEditError(msg)
+
+
 # --- Page operations ---
 
 
@@ -27,10 +36,19 @@ def merge_pdfs(pdf_paths: list[str], output_path: str) -> str:
         msg = "No PDF paths provided"
         raise PDFEditError(msg)
     pdf = pikepdf.Pdf.open(pdf_paths[0])
-    for path in pdf_paths[1:]:
-        other = pikepdf.Pdf.open(path)
-        pdf.pages.extend(other.pages)
-    pdf.save(output_path)
+    try:
+        others: list[pikepdf.Pdf] = []
+        try:
+            for path in pdf_paths[1:]:
+                other = pikepdf.Pdf.open(path)
+                others.append(other)
+                pdf.pages.extend(other.pages)
+            pdf.save(output_path)
+        finally:
+            for other in others:
+                other.close()
+    finally:
+        pdf.close()
     return output_path
 
 
@@ -48,13 +66,16 @@ def split_pdf(pdf_path: str, output_dir: str) -> list[str]:
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     pdf = pikepdf.Pdf.open(pdf_path)
-    outputs: list[str] = []
-    for i, page in enumerate(pdf.pages):
-        new_pdf = pikepdf.Pdf.new()
-        new_pdf.pages.append(page)
-        out = str(out_dir / f"page_{i}.pdf")
-        new_pdf.save(out)
-        outputs.append(out)
+    try:
+        outputs: list[str] = []
+        for i, page in enumerate(pdf.pages):
+            new_pdf = pikepdf.Pdf.new()
+            new_pdf.pages.append(page)
+            out = str(out_dir / f"page_{i}.pdf")
+            new_pdf.save(out)
+            outputs.append(out)
+    finally:
+        pdf.close()
     return outputs
 
 
@@ -71,10 +92,14 @@ def reorder_pages(pdf_path: str, page_order: list[int], output_path: str) -> str
     """
     validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
-    new_pdf = pikepdf.Pdf.new()
-    for i in page_order:
-        new_pdf.pages.append(pdf.pages[i])
-    new_pdf.save(output_path)
+    try:
+        _validate_page_indices(page_order, len(pdf.pages), "reorder_pages")
+        new_pdf = pikepdf.Pdf.new()
+        for i in page_order:
+            new_pdf.pages.append(pdf.pages[i])
+        new_pdf.save(output_path)
+    finally:
+        pdf.close()
     return output_path
 
 
@@ -95,12 +120,16 @@ def rotate_pages(pdf_path: str, pages: list[int], angle: int, output_path: str) 
         msg = f"Angle must be 90, 180, or 270, got {angle}"
         raise PDFEditError(msg)
     pdf = pikepdf.Pdf.open(pdf_path)
-    for i in pages:
-        page = pdf.pages[i]
-        rotate_val = page.get("/Rotate")
-        existing = int(rotate_val) if rotate_val is not None else 0
-        page["/Rotate"] = (existing + angle) % 360
-    pdf.save(output_path)
+    try:
+        _validate_page_indices(pages, len(pdf.pages), "rotate_pages")
+        for i in pages:
+            page = pdf.pages[i]
+            rotate_val = page.get("/Rotate")
+            existing = int(rotate_val) if rotate_val is not None else 0
+            page["/Rotate"] = (existing + angle) % 360
+        pdf.save(output_path)
+    finally:
+        pdf.close()
     return output_path
 
 
@@ -117,9 +146,13 @@ def delete_pages(pdf_path: str, pages: list[int], output_path: str) -> str:
     """
     validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
-    for i in sorted(pages, reverse=True):
-        del pdf.pages[i]
-    pdf.save(output_path)
+    try:
+        _validate_page_indices(pages, len(pdf.pages), "delete_pages")
+        for i in sorted(pages, reverse=True):
+            del pdf.pages[i]
+        pdf.save(output_path)
+    finally:
+        pdf.close()
     return output_path
 
 
@@ -140,11 +173,14 @@ def crop_pages(
     """
     validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
-    for page in pdf.pages:
-        page["/CropBox"] = pikepdf.Array(
-            [pikepdf.Object.parse(str(v).encode()) for v in box],
-        )
-    pdf.save(output_path)
+    try:
+        for page in pdf.pages:
+            page["/CropBox"] = pikepdf.Array(
+                [pikepdf.Object.parse(str(v).encode()) for v in box],
+            )
+        pdf.save(output_path)
+    finally:
+        pdf.close()
     return output_path
 
 
@@ -172,11 +208,14 @@ def edit_metadata(pdf_path: str, metadata: dict[str, str], output_path: str) -> 
         "creator": "xmp:CreatorTool",
     }
     pdf = pikepdf.Pdf.open(pdf_path)
-    with pdf.open_metadata() as meta:
-        for key, value in metadata.items():
-            xmp_key = _simple_to_xmp.get(key, key)
-            meta[xmp_key] = value
-    pdf.save(output_path)
+    try:
+        with pdf.open_metadata() as meta:
+            for key, value in metadata.items():
+                xmp_key = _simple_to_xmp.get(key, key)
+                meta[xmp_key] = value
+        pdf.save(output_path)
+    finally:
+        pdf.close()
     return output_path
 
 
@@ -194,9 +233,12 @@ def add_bookmark(pdf_path: str, title: str, page: int, output_path: str) -> str:
     """
     validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
-    with pdf.open_outline() as outline:
-        outline.root.append(pikepdf.OutlineItem(title, page))
-    pdf.save(output_path)
+    try:
+        with pdf.open_outline() as outline:
+            outline.root.append(pikepdf.OutlineItem(title, page))
+        pdf.save(output_path)
+    finally:
+        pdf.close()
     return output_path
 
 
@@ -219,10 +261,13 @@ def encrypt_pdf(
     """
     validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
-    pdf.save(
-        output_path,
-        encryption=pikepdf.Encryption(owner=owner_pass, user=user_pass),
-    )
+    try:
+        pdf.save(
+            output_path,
+            encryption=pikepdf.Encryption(owner=owner_pass, user=user_pass),
+        )
+    finally:
+        pdf.close()
     return output_path
 
 
@@ -239,7 +284,10 @@ def decrypt_pdf(pdf_path: str, password: str, output_path: str) -> str:
     """
     validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path, password=password)
-    pdf.save(output_path)
+    try:
+        pdf.save(output_path)
+    finally:
+        pdf.close()
     return output_path
 
 
@@ -267,30 +315,33 @@ def add_hyperlink(
     """
     validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
-    target_page = pdf.pages[page]
-    annot = pdf.make_indirect(
-        pikepdf.Dictionary(
-            {
-                "/Type": pikepdf.Name.Annot,
-                "/Subtype": pikepdf.Name.Link,
-                "/Rect": pikepdf.Array(
-                    [pikepdf.Object.parse(str(v).encode()) for v in bbox],
-                ),
-                "/A": pikepdf.Dictionary(
-                    {
-                        "/Type": pikepdf.Name.Action,
-                        "/S": pikepdf.Name.URI,
-                        "/URI": pikepdf.String(uri),
-                    }
-                ),
-                "/Border": pikepdf.Array([0, 0, 0]),
-            }
+    try:
+        target_page = pdf.pages[page]
+        annot = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name.Annot,
+                    "/Subtype": pikepdf.Name.Link,
+                    "/Rect": pikepdf.Array(
+                        [pikepdf.Object.parse(str(v).encode()) for v in bbox],
+                    ),
+                    "/A": pikepdf.Dictionary(
+                        {
+                            "/Type": pikepdf.Name.Action,
+                            "/S": pikepdf.Name.URI,
+                            "/URI": pikepdf.String(uri),
+                        }
+                    ),
+                    "/Border": pikepdf.Array([0, 0, 0]),
+                }
+            )
         )
-    )
-    if "/Annots" not in target_page:
-        target_page["/Annots"] = pikepdf.Array()
-    target_page["/Annots"].append(annot)
-    pdf.save(output_path)
+        if "/Annots" not in target_page:
+            target_page["/Annots"] = pikepdf.Array()
+        target_page["/Annots"].append(annot)
+        pdf.save(output_path)
+    finally:
+        pdf.close()
     return output_path
 
 
@@ -314,30 +365,33 @@ def add_highlight(
     """
     validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
-    target_page = pdf.pages[page]
-    # Derive bounding rect from quad points
-    xs = quad_points[0::2]
-    ys = quad_points[1::2]
-    rect = [min(xs), min(ys), max(xs), max(ys)]
-    annot = pdf.make_indirect(
-        pikepdf.Dictionary(
-            {
-                "/Type": pikepdf.Name.Annot,
-                "/Subtype": pikepdf.Name.Highlight,
-                "/Rect": pikepdf.Array(
-                    [pikepdf.Object.parse(str(v).encode()) for v in rect],
-                ),
-                "/QuadPoints": pikepdf.Array(
-                    [pikepdf.Object.parse(str(v).encode()) for v in quad_points],
-                ),
-                "/C": pikepdf.Array([1, 1, 0]),  # Yellow
-            }
+    try:
+        target_page = pdf.pages[page]
+        # Derive bounding rect from quad points
+        xs = quad_points[0::2]
+        ys = quad_points[1::2]
+        rect = [min(xs), min(ys), max(xs), max(ys)]
+        annot = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name.Annot,
+                    "/Subtype": pikepdf.Name.Highlight,
+                    "/Rect": pikepdf.Array(
+                        [pikepdf.Object.parse(str(v).encode()) for v in rect],
+                    ),
+                    "/QuadPoints": pikepdf.Array(
+                        [pikepdf.Object.parse(str(v).encode()) for v in quad_points],
+                    ),
+                    "/C": pikepdf.Array([1, 1, 0]),  # Yellow
+                }
+            )
         )
-    )
-    if "/Annots" not in target_page:
-        target_page["/Annots"] = pikepdf.Array()
-    target_page["/Annots"].append(annot)
-    pdf.save(output_path)
+        if "/Annots" not in target_page:
+            target_page["/Annots"] = pikepdf.Array()
+        target_page["/Annots"].append(annot)
+        pdf.save(output_path)
+    finally:
+        pdf.close()
     return output_path
 
 
@@ -358,11 +412,14 @@ def flatten_annotations(pdf_path: str, output_path: str) -> str:
     """
     validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
-    for page in pdf.pages:
-        page_obj = page.obj
-        if "/Annots" in page_obj:
-            del page_obj["/Annots"]
-    pdf.save(output_path)
+    try:
+        for page in pdf.pages:
+            page_obj = page.obj
+            if "/Annots" in page_obj:
+                del page_obj["/Annots"]
+        pdf.save(output_path)
+    finally:
+        pdf.close()
     return output_path
 
 
@@ -386,23 +443,26 @@ def fill_form(pdf_path: str, field_values: dict[str, str], output_path: str) -> 
     """
     validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
-    if "/AcroForm" not in pdf.Root:
-        msg = "PDF has no AcroForm"
-        raise PDFEditError(msg)
+    try:
+        if "/AcroForm" not in pdf.Root:
+            msg = "PDF has no AcroForm"
+            raise PDFEditError(msg)
 
-    def _fill_fields(fields: pikepdf.Object) -> None:
-        for field in list(fields):  # type: ignore[call-overload]
-            name = str(field.get("/T", ""))
-            if name in field_values:
-                field["/V"] = pikepdf.String(field_values[name])
-            if "/Kids" in field:
-                _fill_fields(field["/Kids"])
+        def _fill_fields(fields: pikepdf.Object) -> None:
+            for field in list(fields):  # type: ignore[call-overload]
+                name = str(field.get("/T", ""))
+                if name in field_values:
+                    field["/V"] = pikepdf.String(field_values[name])
+                if "/Kids" in field:
+                    _fill_fields(field["/Kids"])
 
-    acroform = pdf.Root["/AcroForm"]
-    if "/Fields" in acroform:
-        _fill_fields(acroform["/Fields"])
-    acroform["/NeedAppearances"] = True
-    pdf.save(output_path)
+        acroform = pdf.Root["/AcroForm"]
+        if "/Fields" in acroform:
+            _fill_fields(acroform["/Fields"])
+        acroform["/NeedAppearances"] = True
+        pdf.save(output_path)
+    finally:
+        pdf.close()
     return output_path
 
 
@@ -422,9 +482,15 @@ def add_watermark(pdf_path: str, watermark_path: str, output_path: str) -> str:
     """
     validate_output_path(output_path)
     pdf = pikepdf.Pdf.open(pdf_path)
-    watermark = pikepdf.Pdf.open(watermark_path)
-    watermark_page = watermark.pages[0]
-    for page in pdf.pages:
-        page.add_underlay(watermark_page, None)
-    pdf.save(output_path)
+    try:
+        watermark = pikepdf.Pdf.open(watermark_path)
+        try:
+            watermark_page = watermark.pages[0]
+            for page in pdf.pages:
+                page.add_underlay(watermark_page, None)
+            pdf.save(output_path)
+        finally:
+            watermark.close()
+    finally:
+        pdf.close()
     return output_path

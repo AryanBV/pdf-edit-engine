@@ -481,6 +481,11 @@ def break_into_lines(
                 # Fits on current line
                 current_line_words.append(word)
                 current_width += space_w + word_w
+            elif word.strip() and all(not c.isalnum() for c in word):
+                # Punctuation-only word (em-dash "—", etc.) — keep with
+                # previous line to avoid orphaning a lone dash on a new line.
+                current_line_words.append(word)
+                current_width += space_w + word_w
             else:
                 # Start new line
                 all_lines.append(" ".join(current_line_words))
@@ -618,24 +623,40 @@ def _build_replacement_ops(
     line_height: float,
     resolver: FontResolver,
     page: pikepdf.Page | None = None,
+    *,
+    style_palette: Any | None = None,
+    extra_resolvers: dict[str, FontResolver] | None = None,
 ) -> list[tuple[list[Any], Any]]:
     """Build replacement content stream operators for a reflowed paragraph.
 
     Constructs a single BT/ET block with Tf, color, and positioning/text
     per line.  For CIDFonts, uses Tm (text matrix) for first-line
-    positioning and TJ arrays with per-glyph strings — matching the
-    operator structure produced by surgeon.py and expected by PDF viewers.
+    positioning and TJ arrays with per-glyph strings.
+
+    When *style_palette* is provided, per-line style preservation is applied:
+
+    - The first replacement line uses the heading font (if one was detected
+      in the original content) — typically a bold variant.
+    - Lines starting with a character in ``style_palette.marker_fonts``
+      render that character in its original font, then switch to the body
+      font for the rest of the line.
+    - All other lines use the body font.
+
+    This is universal: the palette is built from whatever fonts the original
+    content used, with no document-type assumptions.
 
     Args:
         lines: Text broken into lines by break_into_lines.
-        font_name: Font resource name (e.g., 'F1').
+        font_name: Font resource name for body text (e.g., 'F3').
         font_size: Font size in points.
         fill_color: Fill color tuple (grayscale/RGB/CMYK) or None.
         left_margin: X-position for the left edge.
         first_line_y: Y-position for the first line.
         line_height: Vertical distance between lines.
-        resolver: FontResolver for encoding text.
+        resolver: FontResolver for body text encoding.
         page: PDF page object (needed for CIDFont width lookups).
+        style_palette: Optional _StylePalette with heading/marker fonts.
+        extra_resolvers: ``{font_name: FontResolver}`` for non-body fonts.
 
     Returns:
         List of (operands, operator) tuples for the replacement block.
@@ -644,16 +665,21 @@ def _build_replacement_ops(
     if resolver.is_cid_font and page is not None:
         width_cache = GlyphWidthCache()
 
+    extra = extra_resolvers or {}
+    body_font_ref = pikepdf.Name("/" + font_name)
     new_ops: list[tuple[list[Any], Any]] = []
 
-    # BT
+    # Extract palette fields (avoid importing _StylePalette in reflow.py)
+    heading_font: str | None = None
+    marker_fonts: dict[str, str] = {}
+    if style_palette is not None:
+        heading_font = getattr(style_palette, "heading_font", None)
+        marker_fonts = getattr(style_palette, "marker_fonts", {}) or {}
+
+    # ── BT ────────────────────────────────────────────────────────
     new_ops.append(([], pikepdf.Operator("BT")))
 
-    # Tf — set font
-    font_name_ref = pikepdf.Name("/" + font_name)
-    new_ops.append(([font_name_ref, font_size], pikepdf.Operator("Tf")))
-
-    # Color — set fill color
+    # Color
     if fill_color is not None:
         color_operands = [float(c) for c in fill_color]
         if len(fill_color) == 1:
@@ -663,8 +689,20 @@ def _build_replacement_ops(
         elif len(fill_color) == 4:
             new_ops.append((color_operands, pikepdf.Operator("k")))
 
-    # First line positioning — use Tm for CID fonts (matches original
-    # document structure), Td for simple fonts (backward compatible).
+    # Decide first-line font: heading if available and line doesn't start
+    # with a marker character (markers get their own font handling).
+    first_char = lines[0].lstrip()[:1] if lines else ""
+    use_heading = (
+        heading_font is not None and heading_font in extra and first_char not in marker_fonts
+    )
+
+    current_font = heading_font if use_heading else font_name
+    current_resolver = extra[heading_font] if use_heading else resolver
+    new_ops.append(
+        ([pikepdf.Name("/" + current_font), font_size], pikepdf.Operator("Tf")),
+    )
+
+    # ── Positioning ───────────────────────────────────────────────
     if resolver.is_cid_font:
         new_ops.append(
             ([1, 0, 0, 1, left_margin, first_line_y], pikepdf.Operator("Tm")),
@@ -674,25 +712,145 @@ def _build_replacement_ops(
             ([left_margin, first_line_y], pikepdf.Operator("Td")),
         )
 
-    # First line text
+    # ── Encode first line ─────────────────────────────────────────
+    # If the heading font can't encode the text, fall back to body font.
+    if use_heading:
+        can_enc, _ = current_resolver.can_encode(lines[0])
+        if not can_enc:
+            # Graceful degradation: render in body font instead
+            current_font = font_name
+            current_resolver = resolver
+            new_ops[-2] = ([body_font_ref, font_size], pikepdf.Operator("Tf"))
+
     new_ops.append(
-        _encode_line_as_tj(line=lines[0], resolver=resolver,
-                           width_cache=width_cache, page=page,
-                           font_name=font_name, font_size=font_size),
+        _encode_line_as_tj(
+            line=lines[0],
+            resolver=current_resolver,
+            width_cache=width_cache,
+            page=page,
+            font_name=current_font,
+            font_size=font_size,
+        ),
     )
 
-    # Subsequent lines
-    for line in lines[1:]:
+    # Switch back to body if we used heading
+    if current_font != font_name:
+        current_font = font_name
+        current_resolver = resolver
+        new_ops.append(([body_font_ref, font_size], pikepdf.Operator("Tf")))
+
+    # ── Subsequent lines ──────────────────────────────────────────
+    # Track whether we're inside a bullet section for continuation line
+    # indentation.  A bullet section starts when a marker character is
+    # found and continues until the next marker or a non-indented segment.
+    in_bullet_section = False
+
+    # Extract indent positions from palette (constant across lines)
+    pal_marker_x = getattr(style_palette, "marker_x", 0) if style_palette else 0
+    pal_body_x = getattr(style_palette, "body_after_marker_x", 0) if style_palette else 0
+
+    for line_idx, line in enumerate(lines[1:], start=1):
         new_ops.append(
             ([0.0, -line_height], pikepdf.Operator("Td")),
         )
-        new_ops.append(
-            _encode_line_as_tj(line=line, resolver=resolver,
-                               width_cache=width_cache, page=page,
-                               font_name=font_name, font_size=font_size),
-        )
 
-    # ET
+        stripped = line.lstrip()
+        marker_char = stripped[:1] if stripped else ""
+        marker_font = marker_fonts.get(marker_char)
+        marker_resolver = extra.get(marker_font) if marker_font else None
+
+        if marker_font and marker_resolver and marker_resolver.can_encode(marker_char)[0]:
+            # ── Indented marker line ──────────────────────────────
+            in_bullet_section = True
+            # Position marker at marker_x, body text at body_after_marker_x
+            if pal_marker_x > 0:
+                # Use absolute Tm for marker position
+                current_y = first_line_y - line_idx * line_height
+                new_ops.append(
+                    ([1, 0, 0, 1, pal_marker_x, current_y], pikepdf.Operator("Tm")),
+                )
+            if current_font != marker_font:
+                new_ops.append(
+                    ([pikepdf.Name("/" + marker_font), font_size], pikepdf.Operator("Tf")),
+                )
+            new_ops.append(
+                _encode_line_as_tj(
+                    line=marker_char,
+                    resolver=marker_resolver,
+                    width_cache=width_cache,
+                    page=page,
+                    font_name=marker_font,
+                    font_size=font_size,
+                ),
+            )
+            # Position body text after marker
+            if marker_font != font_name:
+                new_ops.append(
+                    ([body_font_ref, font_size], pikepdf.Operator("Tf")),
+                )
+            if pal_body_x > 0:
+                current_y = first_line_y - line_idx * line_height
+                new_ops.append(
+                    ([1, 0, 0, 1, pal_body_x, current_y], pikepdf.Operator("Tm")),
+                )
+            rest = stripped[1:]
+            if rest:
+                new_ops.append(
+                    _encode_line_as_tj(
+                        line=rest,
+                        resolver=resolver,
+                        width_cache=width_cache,
+                        page=page,
+                        font_name=font_name,
+                        font_size=font_size,
+                    ),
+                )
+            current_font = font_name
+            current_resolver = resolver
+        elif in_bullet_section and pal_body_x > 0:
+            # ── Continuation of a bullet line ─────────────────────
+            # Indent at body_after_marker_x to create hanging indent.
+            if current_font != font_name:
+                new_ops.append(
+                    ([body_font_ref, font_size], pikepdf.Operator("Tf")),
+                )
+                current_font = font_name
+                current_resolver = resolver
+            current_y = first_line_y - line_idx * line_height
+            new_ops.append(
+                ([1, 0, 0, 1, pal_body_x, current_y], pikepdf.Operator("Tm")),
+            )
+            new_ops.append(
+                _encode_line_as_tj(
+                    line=line.lstrip(),
+                    resolver=resolver,
+                    width_cache=width_cache,
+                    page=page,
+                    font_name=font_name,
+                    font_size=font_size,
+                ),
+            )
+        else:
+            # ── Regular body line ─────────────────────────────────
+            in_bullet_section = False
+            if current_font != font_name:
+                new_ops.append(
+                    ([body_font_ref, font_size], pikepdf.Operator("Tf")),
+                )
+                current_font = font_name
+                current_resolver = resolver
+            new_ops.append(
+                _encode_line_as_tj(
+                    line=line,
+                    resolver=current_resolver,
+                    width_cache=width_cache,
+                    page=page,
+                    font_name=font_name,
+                    font_size=font_size,
+                ),
+            )
+
+    # ── ET ────────────────────────────────────────────────────────
     new_ops.append(([], pikepdf.Operator("ET")))
 
     return new_ops

@@ -15,11 +15,12 @@ def validate_output_path(path: str) -> None:
 
     Raises:
         PDFEditError: If path is empty, points to an existing directory,
-            or has a parent directory that does not exist.
+            has a parent directory that does not exist, or resolves to
+            a symlink target outside the parent directory.
     """
     if not path:
         raise PDFEditError("Output path must not be empty")
-    p = Path(path)
+    p = Path(path).resolve()
     if p.is_dir():
         raise PDFEditError(f"Output path is an existing directory: {path}")
     if not p.parent.exists():
@@ -37,6 +38,6 @@ def validate_output_dir(path: str) -> None:
     """
     if not path:
         raise PDFEditError("Output directory must not be empty")
-    p = Path(path)
+    p = Path(path).resolve()
     if p.is_file():
         raise PDFEditError(f"Output directory path is an existing file: {path}")

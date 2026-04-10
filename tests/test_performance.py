@@ -63,7 +63,6 @@ def _make_batch_pdf(tmp_path: Path) -> str:
 
 @pytest.mark.benchmark
 class TestPerformance:
-
     @pytest.fixture(autouse=True)
     def setup(self, tmp_path: Path) -> None:
         self.large_pdf = _make_large_pdf(tmp_path)
@@ -110,7 +109,6 @@ class TestPerformance:
 
 @pytest.mark.benchmark
 class TestMemory:
-
     def test_memory_bounded(self, tmp_path: Path) -> None:
         """Editing a large PDF should not consume more than 500MB."""
         psutil = pytest.importorskip("psutil")

@@ -139,8 +139,12 @@ class TestMalformedPDFs:
             pass  # acceptable
 
     def test_find_on_malformed_returns_empty_or_error(self, tmp_path: Path) -> None:
-        for maker in [_make_empty_content_stream, _make_missing_resources,
-                      _make_garbled_stream, _make_null_font_ref]:
+        for maker in [
+            _make_empty_content_stream,
+            _make_missing_resources,
+            _make_garbled_stream,
+            _make_null_font_ref,
+        ]:
             pdf = maker(tmp_path)
             try:
                 matches = find(pdf, "test")
@@ -225,9 +229,7 @@ class TestNonPdfInputs:
 class TestUnicodeEdgeCases:
     """Unicode edge cases should not crash — FidelityReport should report issues."""
 
-    @pytest.mark.skipif(
-        not RESUME_PDF.exists(), reason="resume_aryan.pdf not in corpus"
-    )
+    @pytest.mark.skipif(not RESUME_PDF.exists(), reason="resume_aryan.pdf not in corpus")
     def test_replace_with_emoji(self, tmp_path: Path) -> None:
         """Emoji replacement should not crash; FidelityReport may note missing glyphs."""
         matches = find(str(RESUME_PDF), "Aryan")
@@ -259,9 +261,7 @@ class TestUnicodeEdgeCases:
             pytest.skip("'Test Document' not found")
         output = str(tmp_path / "long.pdf")
         try:
-            result = replace(
-                SIMPLE_PDF, matches[0], "A" * 10000, output, reflow=False
-            )
+            result = replace(SIMPLE_PDF, matches[0], "A" * 10000, output, reflow=False)
             assert result is not None
         except (PDFEditError, Exception):
             pass  # acceptable — may overflow

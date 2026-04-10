@@ -12,6 +12,21 @@ from pdfminer.encodingdb import EncodingDB
 logger = logging.getLogger(__name__)
 
 
+def _build_reverse_map(forward: dict[int, str]) -> dict[str, int]:
+    """Build Unicode→byte/CID reverse map, preferring the lowest code.
+
+    When multiple codes map to the same Unicode character (e.g. WinAnsi
+    maps both 0x20 and 0xAD to space), the lowest code wins.  This
+    ensures standard ASCII bytes are used for encoding.
+    """
+    reverse: dict[str, int] = {}
+    for code in sorted(forward):
+        char = forward[code]
+        if char not in reverse:
+            reverse[char] = code
+    return reverse
+
+
 class FontResolver:
     """Resolves font encoding for bidirectional byte <-> Unicode conversion.
 
@@ -78,7 +93,7 @@ class FontResolver:
         CMapParser(cmap, io.BytesIO(tu_bytes)).run()
 
         self._cid_to_unicode = dict(cmap.cid2unichr)
-        self._unicode_to_cid = {v: k for k, v in self._cid_to_unicode.items()}
+        self._unicode_to_cid = _build_reverse_map(self._cid_to_unicode)
 
         # Track max ligature length for greedy encode
         for uval in self._cid_to_unicode.values():
@@ -92,7 +107,7 @@ class FontResolver:
         self._byte_width = 1
 
         self._byte_to_unicode = dict(EncodingDB.win2unicode)
-        self._unicode_to_byte = {v: k for k, v in self._byte_to_unicode.items()}
+        self._unicode_to_byte = _build_reverse_map(self._byte_to_unicode)
 
     def _init_macRoman(self) -> None:
         """Initialize MacRomanEncoding from pdfminer's standard table."""
@@ -101,7 +116,7 @@ class FontResolver:
         self._byte_width = 1
 
         self._byte_to_unicode = dict(EncodingDB.mac2unicode)
-        self._unicode_to_byte = {v: k for k, v in self._byte_to_unicode.items()}
+        self._unicode_to_byte = _build_reverse_map(self._byte_to_unicode)
 
     def _init_custom(self, encoding_dict: pikepdf.Dictionary) -> None:
         """Initialize custom encoding with /BaseEncoding + /Differences."""
@@ -132,7 +147,7 @@ class FontResolver:
                         self._byte_to_unicode[code] = unicode_char
                     code += 1
 
-        self._unicode_to_byte = {v: k for k, v in self._byte_to_unicode.items()}
+        self._unicode_to_byte = _build_reverse_map(self._byte_to_unicode)
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -211,7 +226,7 @@ class FontResolver:
                 matched = False
                 max_len = min(self._max_ligature_len, len(text) - i)
                 for length in range(max_len, 0, -1):
-                    if text[i:i + length] in self._unicode_to_cid:
+                    if text[i : i + length] in self._unicode_to_cid:
                         i += length
                         matched = True
                         break

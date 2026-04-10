@@ -341,7 +341,7 @@ def _analyze_from_page(
         if enc_str == "/WinAnsiEncoding":
             encoding_type = "WinAnsi"
         elif enc_str == "/MacRomanEncoding":
-            encoding_type = "WinAnsi"  # Treat as WinAnsi for simplicity
+            encoding_type = "MacRoman"
         else:
             encoding_type = "Custom"
 
@@ -358,9 +358,11 @@ def _analyze_from_page(
     # Extract font binary and load with fonttools
     font_bytes, embedded_type = _extract_font_bytes(fd)
     font = TTFont(io.BytesIO(font_bytes))
-    glyph_count = len(font.getGlyphOrder())
-    font_cmap = font.getBestCmap()
-    font.close()
+    try:
+        glyph_count = len(font.getGlyphOrder())
+        font_cmap = font.getBestCmap()
+    finally:
+        font.close()
 
     return FontInfo(
         name=font_name,
@@ -451,28 +453,28 @@ def extend_subset(
     # Extract and load the embedded font
     font_bytes, _embedded_type = _extract_font_bytes(fd)
     embedded_font = TTFont(io.BytesIO(font_bytes))
-    embedded_cmap = embedded_font.getBestCmap() or {}
+    try:
+        embedded_cmap = embedded_font.getBestCmap() or {}
 
-    # Determine tier: check if ALL additional chars are in embedded font's cmap
-    tier2_needed = False
-    for ch in additional_chars:
-        if ord(ch) not in embedded_cmap:
-            tier2_needed = True
-            break
+        # Determine tier: check if ALL additional chars are in embedded font's cmap
+        tier2_needed = False
+        for ch in additional_chars:
+            if ord(ch) not in embedded_cmap:
+                tier2_needed = True
+                break
 
-    if not tier2_needed:
-        result = _extend_tier1(
-            pdf,
-            font_dict,
-            cid_font,
-            embedded_font,
-            embedded_cmap,
-            additional_chars,
-        )
+        if not tier2_needed:
+            return _extend_tier1(
+                pdf,
+                font_dict,
+                cid_font,
+                embedded_font,
+                embedded_cmap,
+                additional_chars,
+            )
+    finally:
         embedded_font.close()
-        return result
 
-    embedded_font.close()
     return _extend_tier2(
         pdf,
         font_dict,
@@ -570,13 +572,9 @@ def _extend_tier2(
     subsetter.populate(unicodes=list(all_unicodes))
     subsetter.subset(system_font)
 
-    # Serialize and replace font stream
-    bio = io.BytesIO()
-    system_font.save(bio)
-    new_font_bytes = bio.getvalue()
-    fd["/FontFile2"] = pdf.make_stream(new_font_bytes)
-
-    # Build complete CID→Unicode mapping using the new font's cmap
+    # Build complete CID→Unicode mapping using the new font's cmap.
+    # Compute all_mappings/all_widths BEFORE mutating any PDF objects so
+    # we can abort cleanly if the extension would reduce font coverage.
     new_cmap = system_font.getBestCmap() or {}
     all_mappings: dict[int, str] = {}
     all_widths: dict[int, float] = {}
@@ -615,6 +613,26 @@ def _extend_tier2(
                 raw_w = float(system_font["hmtx"].metrics[gn][0])
                 all_widths[cid] = raw_w * 1000.0 / units_per_em
 
+    # Guard: if the new mapping set covers fewer entries than the original,
+    # the extension would destroy existing font coverage (e.g., extending
+    # SymbolMT with Latin chars — the system font has none of them, so
+    # all_mappings ends up empty while the original had a bullet mapping).
+    # Abort without mutating the font to prevent CMap/W/CIDToGIDMap corruption.
+    if len(all_mappings) < len(existing_mappings):
+        system_font.close()
+        msg = (
+            f"Extension would reduce CMap coverage from "
+            f"{len(existing_mappings)} to {len(all_mappings)} entries "
+            f"for font '{ps_name}'; aborting to preserve existing mappings"
+        )
+        raise FontNotFoundError(msg)
+
+    # All checks passed — now mutate the PDF font objects.
+    # Replace embedded font stream
+    bio = io.BytesIO()
+    system_font.save(bio)
+    fd["/FontFile2"] = pdf.make_stream(bio.getvalue())
+
     # Rebuild ToUnicode CMap from scratch
     font_dict["/ToUnicode"] = pdf.make_stream(_rebuild_to_unicode_cmap(all_mappings))
 
@@ -623,7 +641,9 @@ def _extend_tier2(
 
     # Update CIDToGIDMap if it's an explicit stream (not /Identity)
     _update_cid_to_gid_map(
-        cid_font, {gid: gid for gid in all_mappings}, pdf,
+        cid_font,
+        {gid: gid for gid in all_mappings},
+        pdf,
     )
 
     # Update font descriptor metrics from system font's OS/2 table

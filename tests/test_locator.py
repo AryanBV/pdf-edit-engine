@@ -10,9 +10,11 @@ import pytest
 
 from pdf_edit_engine.locator import (
     ContentStreamInterpreter,
+    extract_bbox_text,
     find,
     get_fonts,
     get_text,
+    get_text_layout,
 )
 
 if TYPE_CHECKING:
@@ -216,3 +218,62 @@ class TestFindBasicSmoke:
         matches = find(RESUME_PDF, "Aryan")
         assert len(matches) >= 1
         assert matches[0].matched_text == "Aryan"
+
+
+class TestExtractBboxText:
+    """Tests for extract_bbox_text() gap-aware extraction."""
+
+    def test_gap_aware_no_spurious_spaces(self) -> None:
+        """Adjacent text runs should join without spaces (e.g., 'monthly' not 'month ly')."""
+        # The AJSP section contains "monthly" rendered as "month" + "ly" text runs.
+        # Find the bbox that covers the line containing "monthly".
+        blocks = get_text_layout(RESUME_PDF, page=0)
+        month_block = None
+        for b in blocks:
+            if b.text and "month" == b.text.strip():
+                month_block = b
+                break
+        assert month_block is not None, "Could not find 'month' text block"
+
+        # Extract a bbox that covers the full line
+        line_bbox = (0, month_block.y - 2, 600, month_block.y + month_block.height + 2)
+        text = extract_bbox_text(RESUME_PDF, bbox=line_bbox, page=0)
+        assert "monthly" in text, f"Expected 'monthly', got: {text!r}"
+        assert "month ly" not in text, f"Spurious space found: {text!r}"
+
+    def test_full_section_extraction(self) -> None:
+        """Extracting the AJSP section should produce 'full-stack' not 'full - stack'."""
+        blocks = get_text_layout(RESUME_PDF, page=0)
+        sorted_blocks = sorted(blocks, key=lambda b: -(b.y + b.height))
+
+        ajsp_y = lumina_y = None
+        for b in sorted_blocks:
+            t = b.text or ""
+            top = b.y + b.height
+            if "AJSP Manager" in t and ajsp_y is None:
+                ajsp_y = top
+            if "Lumina Crafts" in t and lumina_y is None:
+                lumina_y = top
+
+        assert ajsp_y is not None and lumina_y is not None
+        ajsp_blocks = [
+            b
+            for b in sorted_blocks
+            if (b.y + b.height) <= ajsp_y + 2 and (b.y + b.height) > lumina_y + 2
+        ]
+        bbox = (
+            min(b.x for b in ajsp_blocks),
+            min(b.y for b in ajsp_blocks),
+            max(b.x + b.width for b in ajsp_blocks),
+            max(b.y + b.height for b in ajsp_blocks),
+        )
+
+        text = extract_bbox_text(RESUME_PDF, bbox=bbox, page=0)
+        assert "monthly" in text, f"Expected 'monthly' in extracted text"
+        assert "month ly" not in text, f"Spurious space in 'month ly'"
+        assert "full-stack" in text or "full- stack" not in text
+
+    def test_returns_empty_for_empty_region(self) -> None:
+        """Extracting from a region with no text returns empty string."""
+        text = extract_bbox_text(RESUME_PDF, bbox=(9999, 9999, 10000, 10000), page=0)
+        assert text == ""
