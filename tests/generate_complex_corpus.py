@@ -40,6 +40,8 @@ W, H = letter  # 612 x 792
 _TTF_CANDIDATES = [
     Path("C:/Windows/Fonts/arial.ttf"),
     Path("C:/Windows/Fonts/calibri.ttf"),
+    Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
 ]
 
 
