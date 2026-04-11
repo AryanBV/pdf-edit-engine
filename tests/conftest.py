@@ -23,6 +23,7 @@ _COMPLEX_PDFS = [
     "complex_multifont.pdf",
     "complex_transformed.pdf",
     "complex_contract.pdf",
+    "cidfont_synthetic.pdf",
 ]
 
 

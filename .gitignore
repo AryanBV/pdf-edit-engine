@@ -214,9 +214,8 @@ demo_output/
 validate_output/
 diagnose_output/
 
-# Test corpus PDFs (auto-generated and manually placed — includes personal resume)
+# Test corpus PDFs (auto-generated per platform — includes personal resume)
 tests/corpus/*.pdf
-!tests/corpus/cidfont_synthetic.pdf
 
 # MCP config (contains local paths)
 .mcp.json
