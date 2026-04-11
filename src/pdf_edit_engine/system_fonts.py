@@ -110,7 +110,7 @@ def _build_font_cache() -> dict[str, str]:
     """Scan all system font files and build PostScript name → path mapping."""
     cache: dict[str, str] = {}
     for font_dir in _font_directories():
-        for ext in ("*.ttf", "*.otf", "*.ttc"):
+        for ext in ("**/*.ttf", "**/*.otf", "**/*.ttc"):
             for path in font_dir.glob(ext):
                 try:
                     if path.suffix.lower() == ".ttc":
