@@ -23,9 +23,11 @@ from pdf_edit_engine.surgeon import replace, replace_all
 from pdf_edit_engine.system_fonts import find_font
 
 CORPUS = Path(__file__).parent / "corpus"
-RESUME = CORPUS / "resume_aryan.pdf"
+RESUME = CORPUS / "Aryan_BV_Resume_2026.pdf"
 
-_need_resume = pytest.mark.skipif(not RESUME.exists(), reason="resume_aryan.pdf not in corpus")
+_need_resume = pytest.mark.skipif(
+    not RESUME.exists(), reason="Aryan_BV_Resume_2026.pdf not in corpus"
+)
 
 
 # ── TestAnalyzeSubset ────────────────────────────────────────────────────

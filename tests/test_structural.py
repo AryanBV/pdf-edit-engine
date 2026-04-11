@@ -21,15 +21,15 @@ from pdf_edit_engine.structural import (
 
 CORPUS = Path(__file__).parent / "corpus"
 SIMPLE_PDF = str(CORPUS / "reportlab_simple.pdf")
-RESUME_PDF = str(CORPUS / "resume_aryan.pdf")
+RESUME_PDF = str(CORPUS / "Aryan_BV_Resume_2026.pdf")
 
 _need_simple = pytest.mark.skipif(
     not (CORPUS / "reportlab_simple.pdf").exists(),
     reason="reportlab_simple.pdf not in corpus",
 )
 _need_resume = pytest.mark.skipif(
-    not (CORPUS / "resume_aryan.pdf").exists(),
-    reason="resume_aryan.pdf not in corpus",
+    not (CORPUS / "Aryan_BV_Resume_2026.pdf").exists(),
+    reason="Aryan_BV_Resume_2026.pdf not in corpus",
 )
 
 

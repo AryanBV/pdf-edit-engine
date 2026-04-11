@@ -15,7 +15,7 @@ from pdfminer.layout import LAParams, LTChar
 from pdf_edit_engine.locator import ContentStreamInterpreter
 
 CORPUS_DIR = Path(__file__).parent / "corpus"
-RESUME_PDF = str(CORPUS_DIR / "resume_aryan.pdf")
+RESUME_PDF = str(CORPUS_DIR / "Aryan_BV_Resume_2026.pdf")
 
 _NEW_CORPUS = [
     ("chrome_webpage.pdf", 90.0),
@@ -218,7 +218,7 @@ def _compare(
 # ── Tests ─────────────────────────────────────────────────────────────
 
 
-@pytest.mark.skipif(not Path(RESUME_PDF).exists(), reason="resume_aryan.pdf not in corpus")
+@pytest.mark.skipif(not Path(RESUME_PDF).exists(), reason="Aryan_BV_Resume_2026.pdf not in corpus")
 class TestPdfminerValidation:
     """Compare our interpreter's text extraction against pdfminer.six."""
 

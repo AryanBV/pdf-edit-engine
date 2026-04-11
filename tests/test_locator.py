@@ -21,10 +21,10 @@ if TYPE_CHECKING:
     from pdf_edit_engine.models import ContentElement
 
 CORPUS_DIR = Path(__file__).parent / "corpus"
-RESUME_PDF = str(CORPUS_DIR / "resume_aryan.pdf")
+RESUME_PDF = str(CORPUS_DIR / "Aryan_BV_Resume_2026.pdf")
 
 pytestmark = pytest.mark.skipif(
-    not Path(RESUME_PDF).exists(), reason="resume_aryan.pdf not in corpus"
+    not Path(RESUME_PDF).exists(), reason="Aryan_BV_Resume_2026.pdf not in corpus"
 )
 
 

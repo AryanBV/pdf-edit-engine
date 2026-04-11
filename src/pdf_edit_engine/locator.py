@@ -723,7 +723,7 @@ def _build_font_info(
                     tt = TTFont(_io.BytesIO(font_bytes))
                     glyph_count = len(tt.getGlyphOrder())
                     tt.close()
-                except Exception:
+                except Exception:  # noqa: BLE001 — fonttools can raise many types
                     # Fallback: count /W entries
                     if "/W" in cid_dict:
                         widths = parse_cid_widths(cid_dict)

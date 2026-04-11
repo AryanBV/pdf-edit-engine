@@ -19,7 +19,7 @@ from pdf_edit_engine.surgeon import replace
 
 CORPUS = Path(__file__).parent / "corpus"
 SIMPLE_PDF = str(CORPUS / "reportlab_simple.pdf")
-RESUME_PDF = str(CORPUS / "resume_aryan.pdf")
+RESUME_PDF = str(CORPUS / "Aryan_BV_Resume_2026.pdf")
 
 
 # ── Paragraph detection ───────────────────────────────────────────────
@@ -75,8 +75,8 @@ class TestParagraphDetection:
         assert abs(p.line_height - p.font_size * 1.2) < 0.1
 
     def test_detect_on_resume(self) -> None:
-        if not (CORPUS / "resume_aryan.pdf").exists():
-            pytest.skip("resume_aryan.pdf not in corpus")
+        if not (CORPUS / "Aryan_BV_Resume_2026.pdf").exists():
+            pytest.skip("Aryan_BV_Resume_2026.pdf not in corpus")
         paras = detect_paragraphs(RESUME_PDF, page=0)
         assert len(paras) >= 1
 

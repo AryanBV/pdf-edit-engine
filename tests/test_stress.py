@@ -19,7 +19,7 @@ from pdf_edit_engine import (
 )
 
 CORPUS_DIR = Path(__file__).parent / "corpus"
-RESUME_PDF = CORPUS_DIR / "resume_aryan.pdf"
+RESUME_PDF = CORPUS_DIR / "Aryan_BV_Resume_2026.pdf"
 CIDFONT_PDF = CORPUS_DIR / "cidfont_synthetic.pdf"
 SIMPLE_PDF = str(CORPUS_DIR / "reportlab_simple.pdf")
 
@@ -61,7 +61,7 @@ def _get_font_names(pdf_path: str) -> set[str]:
 class TestFontPreservation:
     """Prove that pdf-edit-engine preserves fonts while PyMuPDF does not."""
 
-    @pytest.mark.skipif(not RESUME_PDF.exists(), reason="resume_aryan.pdf not in corpus")
+    @pytest.mark.skipif(not RESUME_PDF.exists(), reason="Aryan_BV_Resume_2026.pdf not in corpus")
     def test_resume_font_preservation(self, tmp_path: Path) -> None:
         """Identity-H CIDFont: our edit preserves Calibri, PyMuPDF adds fonts."""
         resume = str(RESUME_PDF)
@@ -205,7 +205,7 @@ class TestRoundTrip:
             f"\n  Round-trip: original fonts={len(original_fonts)}, final fonts={len(final_fonts)}"
         )
 
-    @pytest.mark.skipif(not RESUME_PDF.exists(), reason="resume_aryan.pdf not in corpus")
+    @pytest.mark.skipif(not RESUME_PDF.exists(), reason="Aryan_BV_Resume_2026.pdf not in corpus")
     def test_round_trip_with_extension(self, tmp_path: Path) -> None:
         """Edit with a character requiring font extension, then edit again."""
         resume = str(RESUME_PDF)

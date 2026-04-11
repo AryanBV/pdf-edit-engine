@@ -13,12 +13,12 @@ from pdf_edit_engine.models import Edit, TextMatch
 from pdf_edit_engine.surgeon import batch_replace, replace, replace_all
 
 CORPUS_DIR = Path(__file__).parent / "corpus"
-RESUME_PDF = str(CORPUS_DIR / "resume_aryan.pdf")
+RESUME_PDF = str(CORPUS_DIR / "Aryan_BV_Resume_2026.pdf")
 SIMPLE_PDF = str(CORPUS_DIR / "reportlab_simple.pdf")
 MULTIPAGE_PDF = str(CORPUS_DIR / "reportlab_multipage.pdf")
 
 _need_resume = pytest.mark.skipif(
-    not Path(RESUME_PDF).exists(), reason="resume_aryan.pdf not in corpus"
+    not Path(RESUME_PDF).exists(), reason="Aryan_BV_Resume_2026.pdf not in corpus"
 )
 
 

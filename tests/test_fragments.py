@@ -11,7 +11,7 @@ from pdf_edit_engine.encoding import FontResolverCache
 from pdf_edit_engine.fragments import TJReconstructed, TJReconstructor
 
 CORPUS_DIR = Path(__file__).parent / "corpus"
-RESUME_PDF = CORPUS_DIR / "resume_aryan.pdf"
+RESUME_PDF = CORPUS_DIR / "Aryan_BV_Resume_2026.pdf"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -220,9 +220,9 @@ class TestLocateInFragments:
 # ── TestWithResumePDF ─────────────────────────────────────────────────
 
 
-@pytest.mark.skipif(not RESUME_PDF.exists(), reason="resume_aryan.pdf not in corpus")
+@pytest.mark.skipif(not RESUME_PDF.exists(), reason="Aryan_BV_Resume_2026.pdf not in corpus")
 class TestWithResumePDF:
-    """Integration tests using real TJ arrays from resume_aryan.pdf."""
+    """Integration tests using real TJ arrays from Aryan_BV_Resume_2026.pdf."""
 
     @pytest.fixture()
     def first_tj(self) -> TJReconstructed:

@@ -9,6 +9,23 @@ from typing import Any
 import pikepdf
 
 from pdf_edit_engine._pathutil import validate_output_path
+from pdf_edit_engine.errors import PDFEditError
+
+
+def _open_pdf(path: str, **kwargs: object) -> pikepdf.Pdf:
+    """Open a PDF file, translating pikepdf errors to PDFEditError."""
+    try:
+        return pikepdf.Pdf.open(path, **kwargs)  # type: ignore[arg-type]
+    except pikepdf.PasswordError:
+        raise PDFEditError("PDF is password-protected") from None
+    except pikepdf.PdfError as exc:
+        raise PDFEditError(f"Cannot open PDF: {exc}") from None
+    except FileNotFoundError:
+        raise PDFEditError(f"PDF file not found: {Path(path).name}") from None
+    except IsADirectoryError:
+        raise PDFEditError("Expected a file path, got a directory") from None
+    except PermissionError:
+        raise PDFEditError(f"Permission denied: {Path(path).name}") from None
 
 
 @dataclass(frozen=True)
@@ -38,7 +55,7 @@ def get_annotations(
     """
     path = str(Path(pdf_path).resolve())
     annotations: list[Annotation] = []
-    with pikepdf.open(path) as pdf:
+    with _open_pdf(path) as pdf:
         for page_num, page_obj in enumerate(pdf.pages):
             if page is not None and page_num != page:
                 continue
@@ -50,7 +67,7 @@ def get_annotations(
                 annot: Any = annot_ref.resolve() if hasattr(annot_ref, "resolve") else annot_ref
                 subtype = str(annot.get("/Subtype", "")).lstrip("/")
                 rect_obj: Any = annot.get("/Rect")
-                if rect_obj is None:
+                if rect_obj is None or len(rect_obj) < 4:
                     continue
                 rect = (
                     float(rect_obj[0]),
@@ -97,9 +114,14 @@ def update_annotation_uri(
     path = str(Path(pdf_path).resolve())
     out = str(Path(output_path).resolve())
     allow_overwrite = path == out
-    with pikepdf.open(path, allow_overwriting_input=allow_overwrite) as pdf:
+    with _open_pdf(path, allow_overwriting_input=allow_overwrite) as pdf:
         page_obj = pdf.pages[annot.page]
         annots_arr: Any = page_obj["/Annots"]
+        if not (0 <= annot.index < len(annots_arr)):
+            raise PDFEditError(
+                f"Annotation index {annot.index} out of bounds "
+                f"(page has {len(annots_arr)} annotations)"
+            )
         target: Any = annots_arr[annot.index]
         if hasattr(target, "resolve"):
             target = target.resolve()
@@ -125,13 +147,13 @@ def delete_annotation(
     path = str(Path(pdf_path).resolve())
     out = str(Path(output_path).resolve())
     allow_overwrite = path == out
-    with pikepdf.open(path, allow_overwriting_input=allow_overwrite) as pdf:
+    with _open_pdf(path, allow_overwriting_input=allow_overwrite) as pdf:
         page_obj = pdf.pages[annot.page]
         if "/Annots" not in page_obj:
             pdf.save(out)
             return
         annots_list: list[Any] = list(page_obj["/Annots"])  # type: ignore[call-overload]
-        if annot.index < len(annots_list):
+        if 0 <= annot.index < len(annots_list):
             annots_list.pop(annot.index)
         if annots_list:
             page_obj["/Annots"] = pdf.make_indirect(pikepdf.Array(annots_list))
@@ -158,9 +180,14 @@ def move_annotation(
     path = str(Path(pdf_path).resolve())
     out = str(Path(output_path).resolve())
     allow_overwrite = path == out
-    with pikepdf.open(path, allow_overwriting_input=allow_overwrite) as pdf:
+    with _open_pdf(path, allow_overwriting_input=allow_overwrite) as pdf:
         page_obj = pdf.pages[annot.page]
         annots_arr: Any = page_obj["/Annots"]
+        if not (0 <= annot.index < len(annots_arr)):
+            raise PDFEditError(
+                f"Annotation index {annot.index} out of bounds "
+                f"(page has {len(annots_arr)} annotations)"
+            )
         target: Any = annots_arr[annot.index]
         if hasattr(target, "resolve"):
             target = target.resolve()
@@ -190,7 +217,7 @@ def add_annotation(
     path = str(Path(pdf_path).resolve())
     out = str(Path(output_path).resolve())
     allow_overwrite = path == out
-    with pikepdf.open(path, allow_overwriting_input=allow_overwrite) as pdf:
+    with _open_pdf(path, allow_overwriting_input=allow_overwrite) as pdf:
         page_obj = pdf.pages[page]
         annot = pikepdf.Dictionary(
             {

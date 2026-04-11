@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-RESUME = "tests/corpus/resume_aryan.pdf"
+RESUME = "tests/corpus/Aryan_BV_Resume_2026.pdf"
 
 
 @pytest.fixture()

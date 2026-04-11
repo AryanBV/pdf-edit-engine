@@ -6,7 +6,7 @@ import pytest
 
 from pdf_edit_engine import TextBlock, get_text_layout
 
-RESUME = "tests/corpus/resume_aryan.pdf"
+RESUME = "tests/corpus/Aryan_BV_Resume_2026.pdf"
 SIMPLE = "tests/corpus/reportlab_simple.pdf"
 
 

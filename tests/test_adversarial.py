@@ -18,7 +18,7 @@ from pdf_edit_engine import (
 
 CORPUS_DIR = Path(__file__).parent / "corpus"
 SIMPLE_PDF = str(CORPUS_DIR / "reportlab_simple.pdf")
-RESUME_PDF = CORPUS_DIR / "resume_aryan.pdf"
+RESUME_PDF = CORPUS_DIR / "Aryan_BV_Resume_2026.pdf"
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
@@ -229,7 +229,7 @@ class TestNonPdfInputs:
 class TestUnicodeEdgeCases:
     """Unicode edge cases should not crash — FidelityReport should report issues."""
 
-    @pytest.mark.skipif(not RESUME_PDF.exists(), reason="resume_aryan.pdf not in corpus")
+    @pytest.mark.skipif(not RESUME_PDF.exists(), reason="Aryan_BV_Resume_2026.pdf not in corpus")
     def test_replace_with_emoji(self, tmp_path: Path) -> None:
         """Emoji replacement should not crash; FidelityReport may note missing glyphs."""
         matches = find(str(RESUME_PDF), "Aryan")
