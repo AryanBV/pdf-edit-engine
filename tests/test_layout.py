@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from pdf_edit_engine import TextBlock, get_text_layout
 
 RESUME = "tests/corpus/Aryan_BV_Resume_2026.pdf"
 SIMPLE = "tests/corpus/reportlab_simple.pdf"
+
+_need_resume = pytest.mark.skipif(
+    not Path(RESUME).exists(), reason="Aryan_BV_Resume_2026.pdf not in corpus"
+)
 
 
 class TestGetTextLayout:
@@ -21,10 +27,12 @@ class TestGetTextLayout:
             assert b.width > 0 or b.text.strip() == ""
             assert b.font_size > 0
 
+    @_need_resume
     def test_resume_returns_many_blocks(self) -> None:
         blocks = get_text_layout(RESUME)
         assert len(blocks) >= 20
 
+    @_need_resume
     def test_resume_sorted_by_y_then_x(self) -> None:
         blocks = get_text_layout(RESUME)
         for i in range(1, len(blocks)):
@@ -35,6 +43,7 @@ class TestGetTextLayout:
                     prev.y, abs=0.01
                 ) == curr.y
 
+    @_need_resume
     def test_page_filter(self) -> None:
         all_blocks = get_text_layout(RESUME)
         page0_blocks = get_text_layout(RESUME, page=0)
@@ -42,6 +51,7 @@ class TestGetTextLayout:
         assert all(b.page == 0 for b in page0_blocks)
         assert len(page0_blocks) <= len(all_blocks)
 
+    @_need_resume
     def test_font_info_present(self) -> None:
         blocks = get_text_layout(RESUME)
         for b in blocks:

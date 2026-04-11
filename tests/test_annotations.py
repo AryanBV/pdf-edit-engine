@@ -19,8 +19,12 @@ from pdf_edit_engine import (
 if TYPE_CHECKING:
     from pathlib import Path
 
+from pathlib import Path as _Path
 
 RESUME = "tests/corpus/Aryan_BV_Resume_2026.pdf"
+pytestmark = pytest.mark.skipif(
+    not _Path(RESUME).exists(), reason="Aryan_BV_Resume_2026.pdf not in corpus"
+)
 
 
 @pytest.fixture()
