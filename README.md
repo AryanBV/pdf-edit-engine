@@ -1,203 +1,136 @@
 # pdf-edit-engine
 
 [![PyPI](https://img.shields.io/pypi/v/pdf-edit-engine)](https://pypi.org/project/pdf-edit-engine/)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-508%20passed-brightgreen)]()
+[![CI](https://github.com/AryanBV/pdf-edit-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/AryanBV/pdf-edit-engine/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-85%25-yellowgreen)]()
 
-Format-preserving PDF text editing — edit text in existing PDFs while preserving fonts, layout, and visual fidelity.
+Format-preserving PDF text editing. Modify text in existing PDFs at the content stream level — fonts, layout, and spacing stay intact.
 
-## Why this exists
+## The problem
 
-Most open-source tools either substitute fonts during editing (losing the original appearance) or use a redact-and-replace approach that silently degrades formatting. pdf-edit-engine operates directly on PDF content stream operators to preserve the original font, size, color, and position. Every edit returns a `FidelityReport` documenting exactly what changed — no silent degradation.
+Editing text in existing PDFs is a common need — names, dates, labels, typos. But PDF was designed as a display format, not an editing format. Text is stored as positioned glyph indices, not editable strings.
 
-## Installation
+Most tools handle this in one of two ways: redact the area and re-insert text with a substitute font, or extract content to another format and re-render. Both approaches lose the original typographic fidelity.
+
+pdf-edit-engine takes a different approach:
+
+| | Redact-and-replace | pdf-edit-engine |
+|---|---|---|
+| **Method** | White out text, stamp new text | Modify content stream operators in-place |
+| **Font** | Substituted (often Helvetica) | Original font preserved |
+| **Layout** | Re-calculated | Exact original positioning |
+| **Quality feedback** | None — silent degradation | FidelityReport on every edit |
+
+## Quick start
 
 ```bash
 pip install pdf-edit-engine
 ```
 
-Requires Python 3.10+. No external binaries or API keys needed.
-
-## Quick start
+Requires Python 3.12+. No external binaries, no API keys, no network calls.
 
 ```python
-from pdf_edit_engine import find, replace, batch_replace, Edit
+from pdf_edit_engine import find, replace
 
 # Find text in a PDF
 matches = find("document.pdf", "Software Engineer")
-print(f"Found {len(matches)} matches")
 
-# Replace a single match
+# Replace with format preservation
 result = replace("document.pdf", matches[0], "Senior Engineer", "output.pdf")
-print(result.fidelity_report)
-# FidelityReport(font_preserved=True, font_substituted=None,
-#                overflow_detected=False, reflow_applied=False,
-#                glyphs_missing=[])
 
-# Batch replace multiple edits at once
+# Every edit reports exactly what happened
+report = result.fidelity_report
+report.font_preserved      # True — original font kept
+report.overflow_detected   # False — text fits in original space
+report.glyphs_missing      # [] — all characters rendered
+```
+
+## FidelityReport
+
+Every edit function returns a `FidelityReport` documenting exactly what changed:
+
+```python
+@dataclass
+class FidelityReport:
+    font_preserved: bool        # Original font kept?
+    font_substituted: str | None  # Fallback font name (if any)
+    overflow_detected: bool     # Text wider than available space?
+    reflow_applied: bool        # Paragraph reflow triggered?
+    glyphs_missing: list[str]   # Characters that couldn't be rendered
+```
+
+Automated pipelines and AI agents inspect these fields to verify edit quality programmatically — no manual PDF review needed. All edit functions also support `dry_run=True` to preview the report without writing to disk.
+
+## Comparison
+
+| | pdf-edit-engine | PyMuPDF | reportlab |
+|---|---|---|---|
+| **Approach** | Modify operators in-place | Redact + re-insert | Create new PDF |
+| **Edits existing PDFs** | Yes | Yes (destructive) | No |
+| **Font preservation** | Original kept | Substituted | N/A |
+| **Layout preservation** | Operator-level precision | Approximate | N/A |
+| **Edit verification** | FidelityReport | None | None |
+| **dry_run preview** | Yes | No | No |
+| **Font subset extension** | 2-tier (CMap + re-embed) | No | No |
+| **License** | MIT | AGPL-3.0 | BSD |
+
+## Key capabilities
+
+| Category | Functions | Description |
+|----------|-----------|-------------|
+| Search | `find`, `get_text`, `get_text_layout`, `get_fonts`, `extract_bbox_text` | Locate text with operator-level precision, extract positioned blocks |
+| Replace | `replace`, `replace_all`, `batch_replace` | Format-preserving replacement with kerning distribution |
+| Structural | `replace_block`, `batch_replace_block`, `delete_block`, `insert_text_block` | Bbox-based content block operations |
+| Fonts | `analyze_subset`, `can_render`, `extend_subset` | Two-tier font extension (CMap-only fast path + full re-embed) |
+| Reflow | `detect_paragraphs`, `reflow_paragraph` | Paragraph detection and greedy line-breaking |
+| PDF ops | `merge_pdfs`, `split_pdf`, `rotate_pages`, `encrypt_pdf`, +11 more | 15 pikepdf wrappers for document manipulation |
+| Annotations | `get_annotations`, `add_annotation`, `update_annotation_uri`, `delete_annotation`, `move_annotation` | Read, create, modify, remove annotations |
+
+All edit functions support `dry_run=True` to preview changes without writing.
+
+## Usage examples
+
+### Batch replace
+
+```python
+from pdf_edit_engine import batch_replace, Edit
+
 edits = [
     Edit(find="John Doe", replace="Jane Smith"),
     Edit(find="2024", replace="2025"),
+    Edit(find="Draft", replace="Final"),
 ]
-results = batch_replace("document.pdf", edits, "updated.pdf")
+results = batch_replace("contract.pdf", edits, "updated.pdf")
+
 for r in results:
-    print(r.success, r.font_action)  # True, 'kept'
+    assert r.success and r.fidelity_report.font_preserved
 ```
 
-## Core operations
-
-### Text search
-
-```python
-from pdf_edit_engine import find, get_text, get_fonts
-
-# Find text with operator-level precision
-matches = find("doc.pdf", "search text")
-matches = find("doc.pdf", "search text", page=0)              # specific page
-matches = find("doc.pdf", "search text", case_sensitive=False) # case-insensitive
-
-# Extract all text
-text = get_text("doc.pdf")
-text = get_text("doc.pdf", page=0)  # specific page
-
-# List fonts used
-fonts = get_fonts("doc.pdf")
-for f in fonts:
-    print(f.name, f.encoding_type, f.glyph_count)
-```
-
-### Text replacement (format-preserving)
-
-```python
-from pdf_edit_engine import find, replace, replace_all, batch_replace, Edit
-
-# Replace a single match (returned by find())
-matches = find("doc.pdf", "old text")
-result = replace("doc.pdf", matches[0], "new text", "out.pdf")
-
-# Replace all occurrences
-results = replace_all("doc.pdf", "old text", "new text", "out.pdf")
-
-# Batch replace (multiple find/replace pairs, single pass)
-edits = [Edit(find="foo", replace="bar"), Edit(find="baz", replace="qux")]
-results = batch_replace("doc.pdf", edits, "out.pdf")
-
-# Dry run — simulate without writing
-result = replace("doc.pdf", matches[0], "new text", "out.pdf", dry_run=True)
-```
-
-All edit functions return `EditResult` with:
-- `success: bool` — whether the edit was applied
-- `font_action: "kept" | "extended" | "substituted" | "failed"`
-- `fidelity_report: FidelityReport` — detailed quality report
-
-### Font management
-
-The engine uses a two-tier approach to handle fonts:
-
-**Tier 1 — CMap-only extension (fast path):** Many "subsetted" fonts contain far more glyphs than the CMap exposes. When needed glyphs exist in the embedded font but lack CMap entries, the engine adds mappings without touching the font binary.
-
-**Tier 2 — Full font extension (fallback):** When glyphs are truly missing, the engine matches to a system font and re-embeds with `--retain-gids` to preserve existing text.
+### Font analysis before editing
 
 ```python
 from pdf_edit_engine import analyze_subset, can_render
 
-# Analyze a font's embedded subset
-info = analyze_subset("doc.pdf", "F1")
-print(info.glyph_count, info.encoding_type, info.is_subset)
-
-# Check if a font can render specific text
-can_render_all, missing = can_render(info, "Hello World!")
+info = analyze_subset("document.pdf", "F1")
+ok, missing = can_render(info, "Resume — Pro Edition")
+# ok=True if all glyphs available; missing lists gaps
 ```
 
-### Text layout
+For structural editing, annotations, reflow, and all 15 PDF operations, see the [API exports](src/pdf_edit_engine/__init__.py) and [architecture docs](docs/architecture.md).
 
-```python
-from pdf_edit_engine import get_text_layout
+## How it works
 
-# Get positioned text blocks with font info
-blocks = get_text_layout("doc.pdf")
-for b in blocks:
-    print(f"({b.x:.0f}, {b.y:.0f}) {b.font_name} {b.font_size}pt: {b.text[:50]}")
+1. **Index** — `find()` interprets content stream operators (BT/ET blocks), tracking graphics state through each page
+2. **Match** — Characters assembled into a string; position-aware matching locates the target across split operators
+3. **Encode** — Replacement text encoded using the font's CID mapping (Identity-H) or byte encoding (WinAnsi), with micro-kerning distributed across glyphs to match original text width
+4. **Extend** — If new text needs glyphs not in the font's CMap, the subset is extended: CMap-only when glyphs exist in the font binary, full re-embed (with `--retain-gids`) when they don't
+5. **Reflow** — If replacement is wider than the original, the containing paragraph is reflowed with greedy line breaking
+6. **Serialize** — Modified operators re-serialized via `pikepdf.unparse_content_stream()` and saved
 
-# Filter by page
-blocks = get_text_layout("doc.pdf", page=0)
-```
-
-Each `TextBlock` contains: `text`, `x`, `y`, `width`, `height`, `font_name`, `font_size`, `page`.
-
-### Annotations
-
-```python
-from pdf_edit_engine import get_annotations, update_annotation_uri, delete_annotation
-
-# List all annotations
-annots = get_annotations("doc.pdf")
-for a in annots:
-    print(f"[{a.page}] {a.subtype} at {a.rect} → {a.uri}")
-
-# Change a link's URL
-update_annotation_uri("doc.pdf", annots[0], "https://new-url.com", "out.pdf")
-
-# Remove an annotation
-delete_annotation("doc.pdf", annots[0], "out.pdf")
-```
-
-### Paragraph reflow
-
-When replacement text is wider than the original, the engine automatically reflows the paragraph using greedy line breaking:
-
-```python
-from pdf_edit_engine import detect_paragraphs
-
-# Detect paragraph blocks on a page
-paragraphs = detect_paragraphs("doc.pdf", page=0)
-for p in paragraphs:
-    print(p.full_text[:50], f"({p.line_count} lines)")
-```
-
-Reflow is triggered automatically during `replace()` when `reflow=True` (default).
-
-### PDF operations (15 wrapper functions)
-
-Thin wrappers around pikepdf for common PDF operations:
-
-| Operation | Function | Description |
-|-----------|----------|-------------|
-| Merge | `merge_pdfs(paths, output)` | Combine multiple PDFs |
-| Split | `split_pdf(path, output_dir)` | Split into individual pages |
-| Reorder | `reorder_pages(path, order, output)` | Rearrange page order |
-| Rotate | `rotate_pages(path, pages, angle, output)` | Rotate pages (90/180/270) |
-| Delete | `delete_pages(path, pages, output)` | Remove pages |
-| Crop | `crop_pages(path, box, output)` | Crop to bounding box |
-| Metadata | `edit_metadata(path, metadata, output)` | Edit title, author, etc. |
-| Bookmark | `add_bookmark(path, title, page, output)` | Add outline entry |
-| Encrypt | `encrypt_pdf(path, owner_pw, user_pw, output)` | Password-protect |
-| Decrypt | `decrypt_pdf(path, password, output)` | Remove encryption |
-| Hyperlink | `add_hyperlink(path, page, bbox, uri, output)` | Add clickable link |
-| Highlight | `add_highlight(path, page, quad_points, output)` | Add highlight annotation |
-| Flatten | `flatten_annotations(path, output)` | Remove annotations |
-| Fill form | `fill_form(path, field_values, output)` | Fill AcroForm fields |
-| Watermark | `add_watermark(path, watermark_pdf, output)` | Add PDF underlay |
-
-## Supported operations
-
-| Operation | Status | Notes |
-|-----------|--------|-------|
-| find / replace | Stable | Identity-H (CIDFont) + WinAnsi |
-| batch_replace | Stable | Multiple edits in single pass |
-| Font extension | Stable | Tier 1 CMap + Tier 2 full re-embed |
-| Paragraph reflow | Stable | Single-paragraph, greedy line breaking |
-| get_text_layout | Stable | Position, font, size for every text block |
-| Annotations | Stable | get, update URI, delete, move |
-| 15 wrapper ops | Stable | merge, split, rotate, encrypt, etc. |
-| dry_run mode | Stable | Preview edits without writing |
-| Cross-page reflow | Not supported | Planned for v2 |
-| Image editing | Not supported | Planned for v2 |
-| Table detection | Not supported | Planned for v2 |
-
-## Architecture
+<details>
+<summary>Architecture</summary>
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -217,44 +150,50 @@ Thin wrappers around pikepdf for common PDF operations:
    └──────────┘ └────────┘ └────────┘
 ```
 
-**locator** — Text search using pdfminer.six for extraction and pikepdf for content stream correlation. Maps extracted text to specific operators and byte positions.
+**locator** — Text search using pdfminer.six for extraction and pikepdf for content stream correlation.
 
-**surgeon** — Content stream modification. Takes a `TextMatch`, builds replacement operators, handles Identity-H CID encoding, calls FontExtender if needed.
+**surgeon** — Content stream modification with Identity-H CID encoding and kerning-aware replacement.
 
-**fonts** — Font analysis and subset extension. Two-tier: CMap-only fast path when glyphs exist in embedded font, full re-embed fallback when they don't.
+**fonts** — Font analysis and subset extension. Two-tier: CMap-only fast path when glyphs exist in embedded font, full re-embed when they don't.
 
-**reflow** — Paragraph reflow for text that changes length. Uses fonttools for glyph metrics to calculate line breaks and positioning.
+**reflow** — Paragraph reflow using fonttools for glyph metrics and greedy line breaking.
 
-**wrapper** — 15 pikepdf wrapper operations (merge, split, rotate, encrypt, etc.). Thin wrappers, 5-20 lines each.
+**wrapper** — 15 pikepdf wrapper operations (merge, split, rotate, encrypt, etc.).
 
-## How it works
+</details>
 
-1. **Index** — `find()` builds a content element index by interpreting the page's content stream operators, tracking graphics state (font, position, color) through BT/ET blocks
-2. **Match** — Extracted characters are assembled into a flat string and searched with position-aware substring matching
-3. **Surgery** — `replace()` encodes new text using the font's Identity-H CID mapping, constructs replacement TJ operators, and splices them into the content stream
-4. **Font extension** — If the new text needs glyphs not in the font's CMap, the engine extends the subset (CMap-only or full re-embed)
-5. **Reflow** — If the replacement is wider, the engine detects the containing paragraph and reflows with greedy line breaking
-6. **Serialize** — Modified operators are re-serialized via `pikepdf.unparse_content_stream()` and saved
+## AI agent integration
 
-## FidelityReport
+pdf-edit-engine powers [@aryanbv/pdf-edit-mcp](https://github.com/AryanBV/pdf-edit-mcp) — a TypeScript MCP server that exposes 38 tools for AI agents to edit PDFs through the [Model Context Protocol](https://modelcontextprotocol.io).
 
-Every edit returns a `FidelityReport` documenting exactly what happened:
-
-```python
-@dataclass
-class FidelityReport:
-    font_preserved: bool        # Original font kept?
-    font_substituted: str | None  # Fallback font name (if any)
-    overflow_detected: bool     # Text wider than available space?
-    reflow_applied: bool        # Paragraph reflow triggered?
-    glyphs_missing: list[str]   # Characters that couldn't be rendered
+```
+AI Agent (Claude, GPT, etc.)
+    ↓  MCP protocol (stdio)
+pdf-edit-mcp  (TypeScript, 38 tools)
+    ↓  JSON-RPC bridge
+pdf-edit-engine  ← you are here
 ```
 
-This is the key differentiator from tools that silently degrade formatting. AI agents and automated pipelines can inspect the report to verify edit quality before accepting changes.
+Several design choices in the engine exist specifically for programmatic consumers: `FidelityReport` lets agents verify edit quality without visual inspection, `dry_run=True` lets agents preview before committing, and the structured error hierarchy (`FontNotFoundError`, `EncodingError`, `OperatorError`, `ReflowError`) enables targeted recovery logic.
 
-## Tested generators
+Install the MCP server: `npx -y @aryanbv/pdf-edit-mcp`
 
-The test suite validates against PDFs from multiple generators:
+## Performance
+
+Benchmarks on Windows 11, Python 3.12, WinAnsi PDFs:
+
+| Operation | Input | Time |
+|-----------|-------|------|
+| `get_text()` | 100-page PDF | ~0.3s |
+| `find()` | 100-page PDF, 900 matches | ~0.3s |
+| `replace()` | Single page | ~0.03s |
+| `batch_replace()` | 50 edits | ~0.1s |
+
+Identity-H PDFs (Chrome, Google Docs) may be slower due to CMap parsing. Performance scales linearly with page count. Memory stays under 500MB for 100-page operations.
+
+## Tested PDF generators
+
+CI runs on Python 3.12 and 3.13. The test suite validates against PDFs from multiple generators:
 
 | Generator | Encoding | Character Agreement |
 |-----------|----------|-------------------|
@@ -263,18 +202,17 @@ The test suite validates against PDFs from multiple generators:
 | reportlab (4 variants) | WinAnsi | 100% |
 | pikepdf (synthetic) | WinAnsi | 100% |
 
-85% code coverage.
+## Error handling
 
-## Comparison with PyMuPDF
+```
+PDFEditError (base)
+├── FontNotFoundError    — font not in PDF or not on system
+├── EncodingError        — CMap parse failure or unmappable characters
+├── OperatorError        — content stream parse/unparse failure
+└── ReflowError          — paragraph reflow failure
+```
 
-| | pdf-edit-engine | PyMuPDF (redact-and-replace) |
-|---|---|---|
-| **Approach** | Content stream surgery | Redact area, re-insert text |
-| **Font preservation** | Original font kept | Font substituted |
-| **Layout preservation** | Operator-level precision | Approximate repositioning |
-| **Fidelity reporting** | FidelityReport on every edit | Silent degradation |
-| **License** | MIT | AGPL-3.0 |
-| **Dependencies** | pikepdf + fonttools + pdfminer.six | Built-in (MuPDF C library) |
+All exceptions inherit from `PDFEditError`. Catch the base class for general error handling, or specific subclasses for targeted recovery.
 
 ## Tech stack
 
@@ -290,8 +228,8 @@ The test suite validates against PDFs from multiple generators:
 git clone https://github.com/AryanBV/pdf-edit-engine.git
 cd pdf-edit-engine
 python -m venv .venv
-.venv/Scripts/activate    # Windows
-# source .venv/bin/activate  # Linux/macOS
+source .venv/bin/activate      # Linux/macOS
+# .venv\Scripts\activate       # Windows
 pip install -e ".[dev]"
 
 make lint        # ruff check src/ tests/
@@ -300,13 +238,18 @@ make test        # pytest with coverage
 make all         # lint + typecheck + test
 ```
 
-## Known Limitations
+## Known limitations
 
-See [LIMITATIONS.md](LIMITATIONS.md) for a full list including text editing constraints, font handling caveats, encoding support, performance characteristics, and PDF compatibility notes.
+- Cross-paragraph reflow not supported — text reflows within a single paragraph only
+- Type 3 fonts (bitmap/procedural) not supported for extension
+- PDF/A compliance not maintained after editing
+- Digital signatures invalidated by any edit (inherent to PDF signatures)
+
+Full list: [LIMITATIONS.md](LIMITATIONS.md)
 
 ## Contributing
 
-Contributions welcome! Please run `make all` before submitting a PR. See [docs/architecture.md](docs/architecture.md) for module details and [docs/decisions.md](docs/decisions.md) for design rationale.
+Contributions welcome. Run `make all` before submitting a PR. See [docs/architecture.md](docs/architecture.md) for module details and [docs/decisions.md](docs/decisions.md) for design rationale.
 
 ## License
 

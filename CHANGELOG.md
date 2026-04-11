@@ -26,7 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ### Technical
 
 - Python 3.10+, pikepdf + fonttools + pdfminer.six (all MIT/MPL-2.0)
-- 508 tests, 85% coverage, mypy strict
+- 628 tests, 85% coverage, mypy strict
 - Tested against 7 PDF generators: Chrome, Google Docs, reportlab (4 variants), pikepdf synthetic
 - 100% character agreement across all tested generators
 - Zero external binaries, zero API keys, zero network calls

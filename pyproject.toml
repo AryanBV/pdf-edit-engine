@@ -44,6 +44,16 @@ Repository = "https://github.com/AryanBV/pdf-edit-engine"
 Issues = "https://github.com/AryanBV/pdf-edit-engine/issues"
 Changelog = "https://github.com/AryanBV/pdf-edit-engine/blob/main/CHANGELOG.md"
 
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "tests/",
+    "docs/",
+    ".github/",
+    "demo_swap.py",
+    "Makefile",
+    "CLAUDE.md",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
