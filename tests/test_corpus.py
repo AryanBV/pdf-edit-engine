@@ -23,12 +23,20 @@ def _load_manifest() -> list[dict[str, object]]:
 MANIFEST = _load_manifest()
 
 
+def _skip_if_missing(entry: dict[str, object]) -> str:
+    """Return pdf_path, skipping test if the corpus PDF is absent."""
+    pdf_path = str(CORPUS_DIR / str(entry["filename"]))
+    if not Path(pdf_path).exists():
+        pytest.skip(f"{entry['filename']} not in corpus")
+    return pdf_path
+
+
 # ── Parametrized tests (6 PDFs x 4 tests) ─────────────────────────────
 
 
 @pytest.mark.parametrize("entry", MANIFEST, ids=lambda e: str(e["filename"]))
 def test_get_text_contains_expected(entry: dict[str, object]) -> None:
-    pdf_path = str(CORPUS_DIR / str(entry["filename"]))
+    pdf_path = _skip_if_missing(entry)
     text = get_text(pdf_path)
     expected = str(entry["expected_text"])
     assert expected in text, f"Expected {expected!r} in get_text output for {entry['filename']}"
@@ -36,14 +44,14 @@ def test_get_text_contains_expected(entry: dict[str, object]) -> None:
 
 @pytest.mark.parametrize("entry", MANIFEST, ids=lambda e: str(e["filename"]))
 def test_get_fonts_not_empty(entry: dict[str, object]) -> None:
-    pdf_path = str(CORPUS_DIR / str(entry["filename"]))
+    pdf_path = _skip_if_missing(entry)
     fonts = get_fonts(pdf_path)
     assert len(fonts) >= 1, f"Expected at least 1 font in {entry['filename']}"
 
 
 @pytest.mark.parametrize("entry", MANIFEST, ids=lambda e: str(e["filename"]))
 def test_find_expected_text(entry: dict[str, object]) -> None:
-    pdf_path = str(CORPUS_DIR / str(entry["filename"]))
+    pdf_path = _skip_if_missing(entry)
     expected = str(entry["expected_text"])
     matches = find(pdf_path, expected)
     assert len(matches) >= 1, f"Expected at least 1 match for {expected!r} in {entry['filename']}"
@@ -54,7 +62,7 @@ def test_find_expected_text(entry: dict[str, object]) -> None:
 
 @pytest.mark.parametrize("entry", MANIFEST, ids=lambda e: str(e["filename"]))
 def test_no_garbled_output(entry: dict[str, object]) -> None:
-    pdf_path = str(CORPUS_DIR / str(entry["filename"]))
+    pdf_path = _skip_if_missing(entry)
     text = get_text(pdf_path)
     for ch in text:
         assert (
