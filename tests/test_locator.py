@@ -230,7 +230,7 @@ class TestExtractBboxText:
         blocks = get_text_layout(RESUME_PDF, page=0)
         month_block = None
         for b in blocks:
-            if b.text and "month" == b.text.strip():
+            if b.text and b.text.strip() == "month":
                 month_block = b
                 break
         assert month_block is not None, "Could not find 'month' text block"
@@ -269,8 +269,8 @@ class TestExtractBboxText:
         )
 
         text = extract_bbox_text(RESUME_PDF, bbox=bbox, page=0)
-        assert "monthly" in text, f"Expected 'monthly' in extracted text"
-        assert "month ly" not in text, f"Spurious space in 'month ly'"
+        assert "monthly" in text, "Expected 'monthly' in extracted text"
+        assert "month ly" not in text, "Spurious space in 'month ly'"
         assert "full-stack" in text or "full- stack" not in text
 
     def test_returns_empty_for_empty_region(self) -> None:

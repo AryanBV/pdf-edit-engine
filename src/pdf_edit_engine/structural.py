@@ -7,6 +7,7 @@ regions rather than text matches, enabling paragraph-level editing.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -998,20 +999,17 @@ def _replace_block_on_page(
 
     # Extend marker fonts
     for char, mfont in list(palette.marker_fonts.items()):
-        if mfont != clean_name:
-            if not _extend_font(pdf, page_obj, mfont, char):
-                del palette.marker_fonts[char]  # degrade: drop this marker
+        if mfont != clean_name and not _extend_font(pdf, page_obj, mfont, char):
+            del palette.marker_fonts[char]  # degrade: drop this marker
 
     # Build resolvers for ALL palette fonts
     extra_resolvers: dict[str, FontResolver] = {}
     for fn in {palette.heading_font, *palette.marker_fonts.values()} - {None, clean_name}:
-        try:
+        with contextlib.suppress(KeyError, TypeError):
             extra_resolvers[fn] = _resolver_cache.get_resolver(
                 page_obj,
                 fn.lstrip("/"),
             )
-        except (KeyError, TypeError):
-            pass
 
     # ── Phase 3: Break text into lines (indent-aware) ────────────────
     bbox_width = bbox[2] - bbox[0]
