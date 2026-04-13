@@ -429,6 +429,10 @@ def _apply_single_replacement(
             tier = extend_subset(pdf, page, font_name, "".join(missing))
             # Evict stale resolver so _get_font_resolver re-parses
             _resolver_cache.evict(page, font_name)
+            # Evict stale width cache entry: extend_subset adds new CIDs
+            # to /W, but _width_cache holds the pre-extension dict and
+            # would return DEFAULT_WIDTH (600) for newly-added CIDs.
+            _width_cache._cache.pop(font_name, None)  # noqa: SLF001
             resolver = _get_font_resolver(page, font_name)
             can_enc_after, still_missing = resolver.can_encode(new_text)
             if not can_enc_after:
@@ -545,6 +549,35 @@ def _apply_single_replacement(
                 op_replacement_map[op_idx] = ""
             elif n <= _MERGE_THRESHOLD:
                 deferred.append(op_idx)
+
+        # All-narrow fallback (ARY-276): if the match consists entirely of
+        # narrow operators with no wide anchor to merge into, collapse
+        # everything into the first operator.  Word and Chrome emit large-
+        # font titles as per-glyph Tm+Tj operator pairs — each individual
+        # Tm is sized for the original glyph advance, so leaving those
+        # operators independent creates visible gaps between rendered
+        # character clusters after replacement.  Routing the entire match
+        # through one anchor lets PDF text flow past the original operator
+        # boundaries (text is not clipped by operator boundaries), and the
+        # cleared non-anchor operators render against their original Tm
+        # positions with empty strings — harmless.
+        if deferred and last_multi is None and len(deferred) >= 2:
+            anchor = deferred[0]
+            # Compute the full visual span from the anchor's first char to
+            # the last matched char so _encode_with_kerning gets the
+            # correct target width (sum of per-op glyph widths alone
+            # misses the inter-operator Tm spacing that positions them).
+            first_ch = chars_by_op[anchor][0]
+            last_op = deferred[-1]
+            last_ch = chars_by_op[last_op][-1]
+            full_span = (last_ch.page_x + last_ch.width) - first_ch.page_x
+            anchor_width = sum(ch.width for ch in chars_by_op[anchor])
+            for s in deferred[1:]:
+                op_replacement_map[anchor] = op_replacement_map.get(
+                    anchor, ""
+                ) + op_replacement_map.get(s, "")
+                op_replacement_map[s] = ""
+            merged_width_bonus[anchor] = max(0.0, full_span - anchor_width)
 
     # For merged operators, compute the target width as the Tm gap to the next
     # non-empty operator.  sum(ch.width) misses inter-operator spacing that the

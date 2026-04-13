@@ -613,6 +613,34 @@ def _extend_tier2(
                 raw_w = float(system_font["hmtx"].metrics[gn][0])
                 all_widths[cid] = raw_w * 1000.0 / units_per_em
 
+    # Guard (ARY-276): Tier 2 replaces the embedded font file, which
+    # invalidates every pre-existing CID in the content stream unless the
+    # new font assigns the SAME GID to each pre-existing Unicode
+    # character.  If any CID would be renumbered, abort loudly instead
+    # of silently corrupting existing text ("1ova ,ndustries" symptom).
+    misaligned: list[tuple[int, str, int]] = []
+    for old_cid, old_ustr in existing_mappings.items():
+        if len(old_ustr) != 1:
+            continue  # ligatures handled via the len>1 branch above
+        cp = ord(old_ustr)
+        if cp not in new_cmap:
+            continue  # coverage-loss guard below catches this
+        new_glyph_name = new_cmap[cp]
+        new_gid = system_font.getGlyphID(new_glyph_name)
+        if new_gid != old_cid:
+            misaligned.append((old_cid, old_ustr, new_gid))
+    if misaligned:
+        system_font.close()
+        sample = misaligned[:3]
+        msg = (
+            f"Tier 2 extension would renumber {len(misaligned)} "
+            f"pre-existing CIDs in '{ps_name}' (e.g. {sample}); "
+            f"aborting to prevent content-stream corruption. "
+            f"Extend the font in place or provide a pre-aligned "
+            f"full_font_path."
+        )
+        raise FontNotFoundError(msg)
+
     # Guard: if the new mapping set covers fewer entries than the original,
     # the extension would destroy existing font coverage (e.g., extending
     # SymbolMT with Latin chars — the system font has none of them, so
