@@ -328,6 +328,132 @@ def _collect_component_names(
     return order
 
 
+def _append_glyph_to_font(
+    embedded: TTFont,
+    system: TTFont,
+    glyph_name: str,
+) -> int:
+    """Append a single glyph (by name) from system to embedded at a fresh GID.
+
+    Low-level helper for ``_inject_glyph_in_place``. Assumes both fonts
+    are TrueType with compatible upem (caller validates). Updates glyf,
+    hmtx, glyph order, and maxp.numGlyphs. Strips hinting from the
+    injected copy so it does not reference the source font's
+    fpgm/prep/cvt tables (which are not present in the destination).
+
+    Args:
+        embedded: Destination TTFont.
+        system: Source TTFont.
+        glyph_name: Glyph name to copy (must exist in system["glyf"]).
+
+    Returns:
+        The new GID assigned in embedded.
+    """
+    import copy
+
+    system_glyph = system["glyf"][glyph_name]
+    new_glyph = copy.deepcopy(system_glyph)
+    _strip_glyph_hinting(new_glyph)
+
+    # Assigning to glyf[name] auto-appends the name to the glyph order
+    # when the name is new. hmtx assignment does not.
+    embedded["glyf"][glyph_name] = new_glyph
+
+    advance, lsb = system["hmtx"][glyph_name]
+    embedded["hmtx"][glyph_name] = (advance, lsb)
+
+    order = list(embedded.getGlyphOrder())
+    embedded["maxp"].numGlyphs = len(order)
+    return order.index(glyph_name)
+
+
+def _inject_glyph_in_place(
+    embedded: TTFont,
+    system: TTFont,
+    ch: str,
+) -> int:
+    """Append a system-font glyph into an embedded TTFont at a new GID.
+
+    Copies the glyph outline and hmtx entry for a single Unicode
+    character ``ch`` from ``system`` into ``embedded``. For composite
+    glyphs, recursively injects component glyphs first. Strips hinting
+    bytecode from injected glyphs.
+
+    Updates the embedded font's ``glyf``, ``hmtx``, internal ``cmap``,
+    ``glyph order``, and ``maxp.numGlyphs``. Does NOT modify the PDF
+    font dictionary or ToUnicode/W — that is the caller's responsibility.
+
+    Args:
+        embedded: Destination TTFont (the embedded subset from /FontFile2).
+        system: Source TTFont (full system font).
+        ch: Single Unicode character to inject (e.g., "Z" or "é").
+
+    Returns:
+        The new GID assigned to the injected glyph in ``embedded``.
+
+    Raises:
+        FontNotFoundError: If the character is absent from ``system``,
+            if the fonts have mismatched ``unitsPerEm``, if ``embedded``
+            is not TrueType (``glyf`` table missing), or if a composite
+            component is missing from both fonts.
+    """
+    if "glyf" not in embedded:
+        raise FontNotFoundError(
+            "embedded font is not TrueType (no glyf table); "
+            "Tier 1.5 requires TrueType — CFF not supported"
+        )
+    if "glyf" not in system:
+        raise FontNotFoundError(
+            "system font is not TrueType (no glyf table); Tier 1.5 requires TrueType"
+        )
+    embedded_upem = embedded["head"].unitsPerEm
+    system_upem = system["head"].unitsPerEm
+    if embedded_upem != system_upem:
+        raise FontNotFoundError(
+            f"unitsPerEm mismatch: embedded={embedded_upem}, "
+            f"system={system_upem}. Tier 1.5 does not rescale outlines."
+        )
+
+    system_cmap = system.getBestCmap() or {}
+    cp = ord(ch)
+    if cp not in system_cmap:
+        raise FontNotFoundError(f"character {ch!r} (U+{cp:04X}) not in system font cmap")
+    glyph_name = system_cmap[cp]
+    system_glyph = system["glyf"][glyph_name]
+
+    # Recursively inject composite components (leaves first)
+    components = _collect_component_names(system_glyph, system)
+    for comp_name in components:
+        if comp_name in list(embedded.getGlyphOrder()):
+            continue
+        if comp_name not in system["glyf"].glyphs:
+            raise FontNotFoundError(f"composite component {comp_name!r} missing from system font")
+        _append_glyph_to_font(embedded, system, comp_name)
+
+    # Inject the top-level glyph (caller ensures it is not already present)
+    if glyph_name in list(embedded.getGlyphOrder()):
+        # Glyph name already in embedded font; just update cmap below
+        new_gid = list(embedded.getGlyphOrder()).index(glyph_name)
+    else:
+        new_gid = _append_glyph_to_font(embedded, system, glyph_name)
+
+    # Update embedded cmap: Unicode -> glyph name (BMP Unicode table preferred)
+    updated = False
+    for table in embedded["cmap"].tables:
+        if table.platformID == 3 and table.platEncID == 1:
+            table.cmap[cp] = glyph_name
+            updated = True
+            break
+    if not updated:
+        for table in embedded["cmap"].tables:
+            if table.isUnicode():
+                table.cmap[cp] = glyph_name
+                updated = True
+                break
+
+    return new_gid
+
+
 def _detect_postscript_name(fd: pikepdf.Object) -> str:
     """Extract PostScript name from a font descriptor."""
     name_obj = fd.get("/FontName")

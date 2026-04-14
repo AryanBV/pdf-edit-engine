@@ -541,3 +541,103 @@ class TestTier1_5GlyphInjection:
             assert len(names) >= 1, f"composite {composite_name!r} returned no components"
         finally:
             font.close()
+
+    def test_inject_glyph_in_place_simple_latin(self, tmp_path: Path) -> None:
+        """Inject 'Z' from system font into a subset that lacks it."""
+        from fontTools.ttLib import TTFont
+
+        from pdf_edit_engine.fonts import _inject_glyph_in_place
+
+        ttf = _find_ttf_for_cidfont()
+        if ttf is None:
+            pytest.skip("no TTF font available")
+
+        src = tmp_path / "in.pdf"
+        assert _build_identity_h_pdf(
+            src,
+            title_text="Acme",
+            title_pattern="single_tj",
+            extra_corpus="",
+        )
+        with pikepdf.Pdf.open(str(src)) as pdf:
+            fd = pdf.pages[0]["/Resources"]["/Font"]["/F1"]["/DescendantFonts"][0][
+                "/FontDescriptor"
+            ]
+            embedded_bytes = bytes(fd["/FontFile2"].read_bytes())
+            embedded = TTFont(io.BytesIO(embedded_bytes))
+            system = TTFont(str(ttf))
+            try:
+                assert 0x5A not in (embedded.getBestCmap() or {})
+
+                original_count = len(embedded.getGlyphOrder())
+                new_gid = _inject_glyph_in_place(embedded, system, "Z")
+
+                assert new_gid == original_count
+                assert len(embedded.getGlyphOrder()) == original_count + 1
+                assert 0x5A in (embedded.getBestCmap() or {})
+
+                buf = io.BytesIO()
+                embedded.save(buf)
+                reloaded = TTFont(io.BytesIO(buf.getvalue()))
+                try:
+                    assert 0x5A in (reloaded.getBestCmap() or {})
+                finally:
+                    reloaded.close()
+            finally:
+                embedded.close()
+                system.close()
+
+    def test_inject_glyph_rejects_upem_mismatch(self, tmp_path: Path) -> None:
+        """If embedded and system upem differ, abort with FontNotFoundError."""
+        from fontTools.ttLib import TTFont
+
+        from pdf_edit_engine.errors import FontNotFoundError
+        from pdf_edit_engine.fonts import _inject_glyph_in_place
+
+        ttf = _find_ttf_for_cidfont()
+        if ttf is None:
+            pytest.skip("no TTF font available")
+
+        src = tmp_path / "in.pdf"
+        assert _build_identity_h_pdf(src, title_text="Acme", title_pattern="single_tj")
+        with pikepdf.Pdf.open(str(src)) as pdf:
+            fd = pdf.pages[0]["/Resources"]["/Font"]["/F1"]["/DescendantFonts"][0][
+                "/FontDescriptor"
+            ]
+            embedded = TTFont(io.BytesIO(bytes(fd["/FontFile2"].read_bytes())))
+            system = TTFont(str(ttf))
+            try:
+                system["head"].unitsPerEm = embedded["head"].unitsPerEm + 1
+                with pytest.raises(FontNotFoundError, match="unitsPerEm"):
+                    _inject_glyph_in_place(embedded, system, "Z")
+            finally:
+                embedded.close()
+                system.close()
+
+    def test_inject_glyph_rejects_missing_char(self, tmp_path: Path) -> None:
+        """Character not in the system font cmap must abort."""
+        from fontTools.ttLib import TTFont
+
+        from pdf_edit_engine.errors import FontNotFoundError
+        from pdf_edit_engine.fonts import _inject_glyph_in_place
+
+        ttf = _find_ttf_for_cidfont()
+        if ttf is None:
+            pytest.skip("no TTF font available")
+
+        src = tmp_path / "in.pdf"
+        assert _build_identity_h_pdf(src, title_text="Acme", title_pattern="single_tj")
+        with pikepdf.Pdf.open(str(src)) as pdf:
+            fd = pdf.pages[0]["/Resources"]["/Font"]["/F1"]["/DescendantFonts"][0][
+                "/FontDescriptor"
+            ]
+            embedded = TTFont(io.BytesIO(bytes(fd["/FontFile2"].read_bytes())))
+            system = TTFont(str(ttf))
+            try:
+                if 0xE000 in (system.getBestCmap() or {}):
+                    pytest.skip("system font has U+E000 — pick another sentinel")
+                with pytest.raises(FontNotFoundError, match="not in system font"):
+                    _inject_glyph_in_place(embedded, system, "\ue000")
+            finally:
+                embedded.close()
+                system.close()
