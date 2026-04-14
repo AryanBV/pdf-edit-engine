@@ -412,3 +412,59 @@ class TestSystemFonts:
         # Even if font not found, return type is str | None
         result = find_font("Arial")
         assert result is None or isinstance(result, str)
+
+
+# ── ARY-278: Tier 1.5 in-place glyph injection ───────────────────────────
+
+import io  # noqa: E402
+
+from tests._identity_h_fixture import (  # noqa: E402
+    _build_identity_h_pdf,
+    _find_ttf_for_cidfont,
+    _no_ttf,
+    _title_match,
+)
+
+
+@_no_ttf
+class TestTier1_5GlyphInjection:
+    """ARY-278: Tier 1.5 in-place glyph injection (replaces buggy Tier 2)."""
+
+    def test_ttfont_roundtrip_smoke(self, tmp_path: Path) -> None:
+        """fontTools must load -> save the embedded TTF without corruption.
+
+        Fail-fast checkpoint for the whole Tier 1.5 approach. If fontTools
+        cannot round-trip a /FontFile2 subset, everything downstream is moot.
+        """
+        from fontTools.ttLib import TTFont
+
+        src = tmp_path / "in.pdf"
+        assert _build_identity_h_pdf(
+            src,
+            title_text="Acme",
+            title_pattern="single_tj",
+            extra_corpus="Nova",
+        )
+        with pikepdf.Pdf.open(str(src)) as pdf:
+            font_obj = pdf.pages[0]["/Resources"]["/Font"]["/F1"]
+            cid_font_obj = font_obj["/DescendantFonts"][0]
+            fd = cid_font_obj["/FontDescriptor"]
+            raw_font_bytes = bytes(fd["/FontFile2"].read_bytes())
+
+            embedded = TTFont(io.BytesIO(raw_font_bytes))
+            original_glyph_count = len(embedded.getGlyphOrder())
+
+            buf = io.BytesIO()
+            embedded.save(buf)
+            roundtripped = buf.getvalue()
+            embedded.close()
+
+            # Reload the round-tripped font — if save() corrupted it, this fails
+            reloaded = TTFont(io.BytesIO(roundtripped))
+            try:
+                assert len(reloaded.getGlyphOrder()) == original_glyph_count
+                # Sanity: cmap is intact
+                cmap = reloaded.getBestCmap() or {}
+                assert ord("A") in cmap
+            finally:
+                reloaded.close()
