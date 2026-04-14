@@ -468,3 +468,76 @@ class TestTier1_5GlyphInjection:
                 assert ord("A") in cmap
             finally:
                 reloaded.close()
+
+    def test_strip_glyph_hinting_simple_glyph(self) -> None:
+        """_strip_glyph_hinting must zero out a glyph's program bytecode."""
+        from fontTools.ttLib import TTFont
+
+        from pdf_edit_engine.fonts import _strip_glyph_hinting
+
+        ttf = _find_ttf_for_cidfont()
+        if ttf is None:
+            pytest.skip("no TTF font available")
+        font = TTFont(str(ttf))
+        try:
+            glyph = font["glyf"]["A"]
+            _strip_glyph_hinting(glyph)
+            after_bytes = (
+                getattr(glyph.program, "bytecode", b"") or b"" if hasattr(glyph, "program") else b""
+            )
+            assert len(after_bytes) == 0
+        finally:
+            font.close()
+
+    def test_collect_component_names_simple_glyph(self) -> None:
+        """A simple glyph (non-composite) must return an empty component list."""
+        from fontTools.ttLib import TTFont
+
+        from pdf_edit_engine.fonts import _collect_component_names
+
+        ttf = _find_ttf_for_cidfont()
+        if ttf is None:
+            pytest.skip("no TTF font available")
+        font = TTFont(str(ttf))
+        try:
+            glyph = font["glyf"]["A"]  # 'A' is simple in Arial/Liberation/DejaVu
+            names = _collect_component_names(glyph, font)
+            assert names == []
+        finally:
+            font.close()
+
+    def test_collect_component_names_composite_glyph(self) -> None:
+        """A composite glyph (accented char) must return its component chain."""
+        from fontTools.ttLib import TTFont
+
+        from pdf_edit_engine.fonts import _collect_component_names
+
+        ttf = _find_ttf_for_cidfont()
+        if ttf is None:
+            pytest.skip("no TTF font available")
+        font = TTFont(str(ttf))
+        try:
+            # Try common composite glyph names
+            candidates = [
+                "Aacute",
+                "Eacute",
+                "Adieresis",
+                "Aring",
+                "agrave",
+                "eacute",
+            ]
+            composite = None
+            composite_name = None
+            for name in candidates:
+                if name in font["glyf"].glyphs:
+                    g = font["glyf"][name]
+                    if g.isComposite():
+                        composite = g
+                        composite_name = name
+                        break
+            if composite is None:
+                pytest.skip("no recognized composite glyph in font — skipping")
+            names = _collect_component_names(composite, font)
+            assert len(names) >= 1, f"composite {composite_name!r} returned no components"
+        finally:
+            font.close()

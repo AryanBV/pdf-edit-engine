@@ -270,6 +270,64 @@ def _update_cid_to_gid_map(
     logger.info("Updated CIDToGIDMap stream with %d new entries", len(new_mappings))
 
 
+def _strip_glyph_hinting(glyph: object) -> None:
+    """Replace a glyph's TrueType hinting program with an empty program.
+
+    Injected glyphs from a system font carry hinting bytecode that
+    references the source font's fpgm/prep/cvt tables. Those tables
+    are not in the destination (embedded) font, so the hinting would
+    fail at render time. Stripping the hinting produces an unhinted
+    glyph that renders correctly at typical text sizes (9pt+).
+
+    Args:
+        glyph: A fontTools Glyph object (simple or composite).
+    """
+    from fontTools.ttLib.tables import ttProgram  # type: ignore[import-untyped]
+
+    empty = ttProgram.Program()
+    empty.fromBytecode(b"")
+    if hasattr(glyph, "program"):
+        glyph.program = empty
+
+
+def _collect_component_names(
+    glyph: object,
+    font: TTFont,
+    _seen: set[str] | None = None,
+) -> list[str]:
+    """Recursively enumerate component glyph names for a composite glyph.
+
+    Composite TrueType glyphs (common for accented Latin) reference child
+    glyphs by name. To inject a composite into a new font, the child
+    glyphs must also be present. Walks the composite graph and returns
+    every referenced component name in injection order (leaves first,
+    roots last). Returns an empty list for simple (non-composite) glyphs.
+
+    Args:
+        glyph: A fontTools Glyph object.
+        font: The TTFont the glyph belongs to (for recursive lookups).
+        _seen: Internal visited set to prevent cycles.
+
+    Returns:
+        Deduplicated list of component glyph names in injection order.
+    """
+    if _seen is None:
+        _seen = set()
+    if not hasattr(glyph, "isComposite") or not glyph.isComposite():
+        return []
+    order: list[str] = []
+    for component in glyph.components:
+        name = component.glyphName
+        if name in _seen:
+            continue
+        _seen.add(name)
+        if name in font["glyf"].glyphs:
+            sub = font["glyf"][name]
+            order.extend(_collect_component_names(sub, font, _seen))
+        order.append(name)
+    return order
+
+
 def _detect_postscript_name(fd: pikepdf.Object) -> str:
     """Extract PostScript name from a font descriptor."""
     name_obj = fd.get("/FontName")
