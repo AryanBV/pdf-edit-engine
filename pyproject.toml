@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pdf-edit-engine"
-version = "0.1.0"
+version = "0.1.1"
 description = "Format-preserving PDF text editing — edit text in existing PDFs while preserving fonts, layout, and visual fidelity"
 readme = "README.md"
 license = "MIT"
