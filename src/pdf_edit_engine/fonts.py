@@ -339,7 +339,7 @@ def _collect_component_names(
     if not hasattr(glyph, "isComposite") or not glyph.isComposite():
         return []
     order: list[str] = []
-    for component in glyph.components:
+    for component in glyph.components:  # type: ignore[attr-defined]
         name = component.glyphName
         if name in _seen:
             continue

@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pikepdf
 import pytest
 
 from pdf_edit_engine.locator import find
-from pdf_edit_engine.models import TextMatch
+
+if TYPE_CHECKING:
+    from pdf_edit_engine.models import TextMatch
 
 
 def _find_ttf_for_cidfont() -> Path | None:

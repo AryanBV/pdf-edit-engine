@@ -395,7 +395,6 @@ class TestOutputValidation:
 
 from tests._identity_h_fixture import (  # noqa: E402
     _build_identity_h_pdf,
-    _find_ttf_for_cidfont,
     _no_ttf,
     _title_match,
 )
