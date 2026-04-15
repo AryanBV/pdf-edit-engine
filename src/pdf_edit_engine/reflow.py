@@ -696,8 +696,14 @@ def _build_replacement_ops(
         heading_font is not None and heading_font in extra and first_char not in marker_fonts
     )
 
-    current_font = heading_font if use_heading else font_name
-    current_resolver = extra[heading_font] if use_heading else resolver
+    current_font: str
+    current_resolver: FontResolver
+    if use_heading and heading_font is not None:
+        current_font = heading_font
+        current_resolver = extra[heading_font]
+    else:
+        current_font = font_name
+        current_resolver = resolver
     new_ops.append(
         ([pikepdf.Name("/" + current_font), font_size], pikepdf.Operator("Tf")),
     )

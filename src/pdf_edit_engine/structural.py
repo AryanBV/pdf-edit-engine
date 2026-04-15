@@ -188,7 +188,12 @@ def _build_style_palette(
             continue
         font_counts: Counter[str] = Counter()
         for e in significant:
-            font_counts[e.graphics_state.font_name] += 1
+            name = e.graphics_state.font_name
+            if name is None:
+                continue
+            font_counts[name] += 1
+        if not font_counts:
+            continue
         dominant = font_counts.most_common(1)[0][0]
         if dominant != body_font:
             heading_font = dominant
@@ -204,14 +209,16 @@ def _build_style_palette(
         if not text:
             continue
         stripped = text.strip()
+        leftmost_font_name = leftmost.graphics_state.font_name
         if (
             len(stripped) == 1
             and not stripped.isspace()
-            and leftmost.graphics_state.font_name != body_font
-            and leftmost.graphics_state.font_name != heading_font
+            and leftmost_font_name is not None
+            and leftmost_font_name != body_font
+            and leftmost_font_name != heading_font
             and stripped not in marker_fonts
         ):
-            marker_fonts[stripped] = leftmost.graphics_state.font_name
+            marker_fonts[stripped] = leftmost_font_name
 
     # ── Marker indentation: x-positions of markers and body after markers ─
     marker_x = 0.0
@@ -372,14 +379,15 @@ def _sync_annotations_in_bbox(
         delta_y: Vertical shift to apply (positive = up in PDF coords).
         new_text: The replacement text (used to detect orphaned annotations).
     """
-    annots = page_obj.get("/Annots")
-    if not annots:
+    annots_obj = page_obj.get("/Annots")
+    if not annots_obj:
         return
+    annots: list[pikepdf.Object] = list(annots_obj)  # type: ignore[call-overload]
     new_lower = new_text.lower()
     to_remove: list[int] = []
     for idx, annot in enumerate(annots):
         try:
-            rect = [float(r) for r in annot["/Rect"]]
+            rect = [float(r) for r in annot["/Rect"]]  # type: ignore[attr-defined]
         except (KeyError, TypeError):
             continue
         # Check vertical overlap with bbox
@@ -389,7 +397,7 @@ def _sync_annotations_in_bbox(
         # Determine if annotation is orphaned: extract keywords from URI
         # and check if any appear in the replacement text.
         a_dict = annot.get("/A")
-        uri = str(a_dict.get("/URI", "")) if a_dict else ""
+        uri = str(a_dict.get("/URI", "")) if a_dict else ""  # type: ignore[call-overload]
         if uri and new_lower:
             # Extract meaningful keywords from last URI path segment
             path = uri.rstrip("/").rsplit("/", 1)[-1]
@@ -410,7 +418,7 @@ def _sync_annotations_in_bbox(
             ]
         )
         bs = annot.get("/BS")
-        if bs is not None and float(bs.get("/W", 1)) == 0:
+        if bs is not None and float(bs.get("/W", 1)) == 0:  # type: ignore[call-overload]
             annot["/BS"] = pikepdf.Dictionary(
                 {
                     "/W": 0.5,
@@ -1004,7 +1012,10 @@ def _replace_block_on_page(
 
     # Build resolvers for ALL palette fonts
     extra_resolvers: dict[str, FontResolver] = {}
-    for fn in {palette.heading_font, *palette.marker_fonts.values()} - {None, clean_name}:
+    all_font_names: set[str | None] = {palette.heading_font, *palette.marker_fonts.values()}
+    for fn in all_font_names - {None, clean_name}:
+        if fn is None:
+            continue  # narrow for mypy; set difference should have removed None
         with contextlib.suppress(KeyError, TypeError):
             extra_resolvers[fn] = _resolver_cache.get_resolver(
                 page_obj,
@@ -1064,6 +1075,7 @@ def _replace_block_on_page(
     caller_line_height = line_height is not None
     if not caller_line_height:
         line_height = _detect_line_height(matched_elems, font_size)
+    assert line_height is not None  # narrowed by the branch above
     bbox_height = bbox[3] - bbox[1]
     text_height = len(lines) * line_height
     overflow_delta = text_height - bbox_height
@@ -1311,6 +1323,7 @@ def batch_replace_block(
         if sequential:
             # ── Sequential mode ──────────────────────────────────
             # Bboxes = removal only.  Text positioned by layout algorithm.
+            assert section_gap is not None and line_height is not None
             prev_last_line_y: float | None = None
 
             for orig_idx, (bbox, new_text) in indexed:
@@ -1353,7 +1366,7 @@ def batch_replace_block(
                         for e in _build_index(page_obj, page_number)
                         if e.type == "text" and e.bbox[3] < region_bottom
                     ]
-                    if below_elems:
+                    if below_elems and prev_last_line_y is not None:
                         next_y = max(e.bbox[3] for e in below_elems)
                         actual_gap = prev_last_line_y - next_y
                         if actual_gap > section_gap:
