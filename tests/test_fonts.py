@@ -641,3 +641,55 @@ class TestTier1_5GlyphInjection:
             finally:
                 embedded.close()
                 system.close()
+
+    def test_tier2_narrow_subset_succeeds(self, tmp_path: Path) -> None:
+        """End-to-end: narrow subset replacement must succeed via Tier 1.5."""
+        from pdf_edit_engine.locator import get_text
+        from pdf_edit_engine.surgeon import replace
+
+        src = tmp_path / "in.pdf"
+        out = tmp_path / "out.pdf"
+        # Narrow subset: omit N, I, v, d, u, s, w, W from the embedded cmap
+        assert _build_identity_h_pdf(
+            src,
+            title_text="Acme Corporation",
+            title_pattern="single_tj",
+            extra_corpus="",
+            omit_chars_from_subset="NIvduswW",
+        )
+        match = _title_match(str(src), "Acme Corporation")
+        result = replace(str(src), match, "Nova Industries", str(out))
+        assert result.success is True, (
+            f"Tier 1.5 must succeed, got font_action={result.font_action} "
+            f"missing={result.fidelity_report.glyphs_missing}"
+        )
+        text = get_text(str(out))
+        assert "Nova Industries" in text
+
+    def test_tier2_narrow_subset_preserves_untouched_text(self, tmp_path: Path) -> None:
+        """Injection must not corrupt pre-existing text on the same page."""
+        from pdf_edit_engine.locator import get_text
+        from pdf_edit_engine.surgeon import replace
+
+        src = tmp_path / "in.pdf"
+        out = tmp_path / "out.pdf"
+        # Body line uses ONLY chars that are in the narrow subset (all chars
+        # from "Acme Corporation"). If Tier 1.5 corrupts the font, the body's
+        # pre-existing CIDs would map to wrong glyphs in extracted text.
+        # The body is at 12pt, so _title_match picks the 24pt title match.
+        assert _build_identity_h_pdf(
+            src,
+            title_text="Acme Corporation",
+            body_text="Acme Corporation at top",
+            title_pattern="single_tj",
+            extra_corpus="",
+            omit_chars_from_subset="NIvduswW",
+        )
+        match = _title_match(str(src), "Acme Corporation")
+        result = replace(str(src), match, "Nova Industries", str(out))
+        assert result.success is True
+        text = get_text(str(out))
+        assert "Nova Industries" in text
+        # Body text must survive the font mutation untouched.
+        # After title replacement, body line still reads "Acme Corporation at top".
+        assert "Acme Corporation at top" in text, f"body text corrupted after injection: {text!r}"

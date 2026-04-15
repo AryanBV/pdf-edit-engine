@@ -721,157 +721,107 @@ def _extend_tier2(
     additional_chars: str,
     full_font_path: str | Path | None,
 ) -> str:
-    """Full font extension — re-subset from system font with new characters."""
-    from fontTools.subset import Options, Subsetter  # type: ignore[import-untyped]
+    """Tier 1.5 in-place glyph injection (root fix for ARY-276 Mode 2).
 
+    Rather than replacing the embedded font file with a subset of the
+    system font (which renumbers pre-existing CIDs and corrupts
+    unrelated content-stream text), this function loads the existing
+    embedded TTFont and APPENDS missing glyphs into its glyf table at
+    fresh GIDs. Pre-existing CIDs remain valid because only the tail
+    of the glyph order changes.
+
+    For each appended glyph:
+    - The glyph outline is deep-copied from the system font
+    - Hinting bytecode is stripped (the source font's fpgm/prep/cvt
+      tables are not available in the embedded subset)
+    - Composite glyph components are injected recursively (leaves first)
+    - The embedded font's glyf, hmtx, internal cmap, glyph order, and
+      maxp.numGlyphs are updated
+    - The embedded font is re-serialized back into /FontFile2
+
+    Then, using the existing Tier 1 helpers, the PDF-level ToUnicode,
+    /W, and /CIDToGIDMap entries are added for the new CIDs
+    (CID == new GID under Identity-H).
+
+    Returns ``"full_extension"`` for backward compatibility with existing
+    tests and callers; the string is unchanged from the legacy Tier 2
+    contract even though the underlying strategy is now additive.
+
+    Args:
+        pdf: Open pikepdf.Pdf (mutated in place).
+        font_dict: The top-level Type0 font dictionary.
+        cid_font: The CIDFontType2 descendant font dictionary.
+        fd: The FontDescriptor dictionary.
+        additional_chars: Unicode characters to add.
+        full_font_path: Optional explicit system font path override.
+
+    Raises:
+        FontNotFoundError: If the system font cannot be found, the
+            embedded font is not TrueType, upem does not match, a
+            character is absent from the system font, or a composite
+            component is missing from both fonts.
+    """
     from pdf_edit_engine.system_fonts import find_font
 
-    # Get PostScript name for system font lookup
     raw_ps_name = _detect_postscript_name(fd)
     ps_name = _strip_subset_prefix(raw_ps_name)
 
-    # Find system font
     system_path = str(full_font_path) if full_font_path is not None else find_font(ps_name)
-
     if system_path is None or not Path(system_path).is_file():
         msg = f"System font not found for '{ps_name}'. Install the font or provide full_font_path."
         raise FontNotFoundError(msg)
 
-    # Collect all needed Unicode codepoints: existing + new
-    existing_mappings = _parse_existing_tounicode(font_dict)
-    existing_unicodes: set[int] = set()
-    for _cid, ustr in existing_mappings.items():
-        for ch in ustr:
-            existing_unicodes.add(ord(ch))
-    new_unicodes = {ord(ch) for ch in additional_chars}
-    all_unicodes = existing_unicodes | new_unicodes
+    # Load the embedded font (so we can extend it in place)
+    embedded_bytes = bytes(fd["/FontFile2"].read_bytes())
+    embedded = TTFont(io.BytesIO(embedded_bytes))
+    system = TTFont(system_path)
+    try:
+        units_per_em = embedded["head"].unitsPerEm
+        new_cmap_entries: dict[int, str] = {}
+        new_w_entries: dict[int, float] = {}
 
-    # Subset the system font with retain_gids
-    system_font = TTFont(system_path)
-    options = Options()
-    options.retain_gids = True
-    options.ignore_missing_unicodes = True
+        for ch in additional_chars:
+            cp = ord(ch)
+            # Skip if already in the embedded cmap (defensive — caller
+            # should have routed through Tier 1 first).
+            if cp in (embedded.getBestCmap() or {}):
+                continue
+            new_gid = _inject_glyph_in_place(embedded, system, ch)
 
-    subsetter = Subsetter(options=options)
-    subsetter.populate(unicodes=list(all_unicodes))
-    subsetter.subset(system_font)
+            new_cmap_entries[new_gid] = ch
+            # Width comes from the newly-injected glyph's hmtx entry
+            # (which we just copied from the system font).
+            glyph_name = (system.getBestCmap() or {})[cp]
+            raw_w = float(system["hmtx"][glyph_name][0])
+            new_w_entries[new_gid] = raw_w * 1000.0 / units_per_em
 
-    # Build complete CID→Unicode mapping using the new font's cmap.
-    # Compute all_mappings/all_widths BEFORE mutating any PDF objects so
-    # we can abort cleanly if the extension would reduce font coverage.
-    new_cmap = system_font.getBestCmap() or {}
-    all_mappings: dict[int, str] = {}
-    all_widths: dict[int, float] = {}
-    units_per_em = system_font["head"].unitsPerEm
+        if not new_cmap_entries:
+            # Every requested char was already in the embedded cmap —
+            # nothing to do at the font level. Caller's PDF-level
+            # metadata is already up to date via Tier 1 or a previous
+            # extension.
+            return "full_extension"
 
-    glyph_order = system_font.getGlyphOrder()
+        # Re-serialize the extended embedded font and replace /FontFile2.
+        buf = io.BytesIO()
+        embedded.save(buf)
+        fd["/FontFile2"] = pdf.make_stream(buf.getvalue())
 
-    for cp in sorted(all_unicodes):
-        ch = chr(cp)
-        if cp in new_cmap:
-            glyph_name = new_cmap[cp]
-            gid = system_font.getGlyphID(glyph_name)
-            # Identity-H: CID = GID
-            all_mappings[gid] = ch
-            # Width from hmtx, normalized to PDF 1/1000-em scale
-            if "hmtx" in system_font and glyph_name in system_font["hmtx"].metrics:
-                raw_w = float(system_font["hmtx"].metrics[glyph_name][0])
-                all_widths[gid] = raw_w * 1000.0 / units_per_em
-            else:
-                all_widths[gid] = 600.0
-
-    # Preserve ligature entries from original ToUnicode CMap.
-    # Ligatures map one CID to multiple Unicode chars (e.g., CID 302 → "fi").
-    # The single-char rebuild above only creates 1:1 mappings, losing ligatures.
-    for cid, ustr in existing_mappings.items():
-        if (
-            len(ustr) > 1
-            and cid not in all_mappings
-            and cid < len(glyph_order)
-            and glyph_order[cid] != ".notdef"
-        ):
-            gn = glyph_order[cid]
-            all_mappings[cid] = ustr
-            # Get width from hmtx for this glyph
-            if "hmtx" in system_font and gn in system_font["hmtx"].metrics:
-                raw_w = float(system_font["hmtx"].metrics[gn][0])
-                all_widths[cid] = raw_w * 1000.0 / units_per_em
-
-    # Guard (ARY-276): Tier 2 replaces the embedded font file, which
-    # invalidates every pre-existing CID in the content stream unless the
-    # new font assigns the SAME GID to each pre-existing Unicode
-    # character.  If any CID would be renumbered, abort loudly instead
-    # of silently corrupting existing text ("1ova ,ndustries" symptom).
-    misaligned: list[tuple[int, str, int]] = []
-    for old_cid, old_ustr in existing_mappings.items():
-        if len(old_ustr) != 1:
-            continue  # ligatures handled via the len>1 branch above
-        cp = ord(old_ustr)
-        if cp not in new_cmap:
-            continue  # coverage-loss guard below catches this
-        new_glyph_name = new_cmap[cp]
-        new_gid = system_font.getGlyphID(new_glyph_name)
-        if new_gid != old_cid:
-            misaligned.append((old_cid, old_ustr, new_gid))
-    if misaligned:
-        system_font.close()
-        sample = misaligned[:3]
-        msg = (
-            f"Tier 2 extension would renumber {len(misaligned)} "
-            f"pre-existing CIDs in '{ps_name}' (e.g. {sample}); "
-            f"aborting to prevent content-stream corruption. "
-            f"Extend the font in place or provide a pre-aligned "
-            f"full_font_path."
+        # Apply PDF-level metadata updates using Tier 1 helpers.
+        _append_to_unicode_cmap(font_dict, new_cmap_entries, pdf)
+        _append_w_entries(cid_font, new_w_entries)
+        _update_cid_to_gid_map(
+            cid_font,
+            {cid: cid for cid in new_cmap_entries},
+            pdf,
         )
-        raise FontNotFoundError(msg)
 
-    # Guard: if the new mapping set covers fewer entries than the original,
-    # the extension would destroy existing font coverage (e.g., extending
-    # SymbolMT with Latin chars — the system font has none of them, so
-    # all_mappings ends up empty while the original had a bullet mapping).
-    # Abort without mutating the font to prevent CMap/W/CIDToGIDMap corruption.
-    if len(all_mappings) < len(existing_mappings):
-        system_font.close()
-        msg = (
-            f"Extension would reduce CMap coverage from "
-            f"{len(existing_mappings)} to {len(all_mappings)} entries "
-            f"for font '{ps_name}'; aborting to preserve existing mappings"
+        logger.info(
+            "Tier 1.5 (in-place glyph injection) from %s: %d new glyph(s) appended",
+            system_path,
+            len(new_cmap_entries),
         )
-        raise FontNotFoundError(msg)
-
-    # All checks passed — now mutate the PDF font objects.
-    # Replace embedded font stream
-    bio = io.BytesIO()
-    system_font.save(bio)
-    fd["/FontFile2"] = pdf.make_stream(bio.getvalue())
-
-    # Rebuild ToUnicode CMap from scratch
-    font_dict["/ToUnicode"] = pdf.make_stream(_rebuild_to_unicode_cmap(all_mappings))
-
-    # Rebuild /W array from scratch
-    cid_font["/W"] = _rebuild_w_array(all_widths)
-
-    # Update CIDToGIDMap if it's an explicit stream (not /Identity)
-    _update_cid_to_gid_map(
-        cid_font,
-        {gid: gid for gid in all_mappings},
-        pdf,
-    )
-
-    # Update font descriptor metrics from system font's OS/2 table
-    # Normalize to PDF 1/1000-em scale (same as /W widths)
-    if "OS/2" in system_font:
-        os2 = system_font["OS/2"]
-        fd["/Ascent"] = int(os2.sTypoAscender * 1000 / units_per_em)
-        fd["/Descent"] = int(os2.sTypoDescender * 1000 / units_per_em)
-        if hasattr(os2, "sCapHeight"):
-            fd["/CapHeight"] = int(os2.sCapHeight * 1000 / units_per_em)
-
-    system_font.close()
-
-    logger.info(
-        "Tier 2 (full extension) from %s: %d total characters",
-        system_path,
-        len(all_mappings),
-    )
-    return "full_extension"
+        return "full_extension"
+    finally:
+        embedded.close()
+        system.close()
