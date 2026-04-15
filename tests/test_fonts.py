@@ -705,6 +705,38 @@ class TestTier1_5GlyphInjection:
         assert "F1" not in cache._cache  # noqa: SLF001
         cache.evict("F99")  # no-op for missing key — must not raise
 
+    def test_tier1_extension_dedup_cmap_entries(self, tmp_path: Path) -> None:
+        """Repeat extend_subset must not duplicate CMap bfchar lines on disk.
+
+        Checks the raw ToUnicode stream bytes, not the parsed dict —
+        duplicate bfchar lines still produce a logically-correct parse
+        (last write wins) but cause O(n × extensions) on-disk bloat.
+        """
+        src = tmp_path / "in.pdf"
+        assert _build_identity_h_pdf(
+            src,
+            title_text="Acme",
+            title_pattern="single_tj",
+            extra_corpus="Z",
+        )
+        with pikepdf.Pdf.open(str(src), allow_overwriting_input=True) as pdf:
+            page = pdf.pages[0]
+            extend_subset(pdf, page, "F1", "Z")
+            font_dict = pdf.pages[0]["/Resources"]["/Font"]["/F1"]
+            stream_after_first = bytes(font_dict["/ToUnicode"].read_bytes())
+            size_1 = len(stream_after_first)
+
+            # Second call with same char — must be a true no-op
+            extend_subset(pdf, page, "F1", "Z")
+            font_dict = pdf.pages[0]["/Resources"]["/Font"]["/F1"]
+            stream_after_second = bytes(font_dict["/ToUnicode"].read_bytes())
+            size_2 = len(stream_after_second)
+
+            assert size_2 == size_1, (
+                f"ToUnicode stream grew from {size_1} to {size_2} bytes "
+                f"on repeat call — duplicate bfchar lines appended"
+            )
+
     def test_resolver_cache_shared_font_cross_page_evict(self, tmp_path: Path) -> None:
         """Pages sharing a font via indirect ref must share one cache entry.
 

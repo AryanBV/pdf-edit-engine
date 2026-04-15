@@ -121,6 +121,11 @@ def _append_to_unicode_cmap(
 ) -> None:
     """Append new CID→Unicode entries to the ToUnicode CMap stream.
 
+    Deduplicates against existing CIDs: entries whose CID is already
+    mapped in the current CMap with the same Unicode value are silently
+    skipped. Prevents O(n × extensions) on-disk bloat from repeated
+    ``extend_subset`` calls on the same font.
+
     Adds a new bfchar block before ``endcmap`` — does NOT splice into
     existing blocks (avoids fragile CMap parsing).
 
@@ -132,6 +137,14 @@ def _append_to_unicode_cmap(
     if not new_mappings:
         return
 
+    # Dedup: drop entries whose CID is already mapped to the same value.
+    # Preserves existing mappings when the caller passes duplicates;
+    # allows legitimate overrides (CID mapped to a different char).
+    existing = _parse_existing_tounicode(font_dict)
+    deduped = {cid: ustr for cid, ustr in new_mappings.items() if existing.get(cid) != ustr}
+    if not deduped:
+        return
+
     raw = font_dict["/ToUnicode"].read_bytes().decode("latin-1")
     endcmap_pos = raw.rfind("endcmap")
     if endcmap_pos < 0:
@@ -139,14 +152,13 @@ def _append_to_unicode_cmap(
         return
 
     # Build bfchar block(s), max 100 entries per block per PDF spec
-    entries = list(new_mappings.items())
+    entries = list(deduped.items())
     blocks: list[str] = []
     for chunk_start in range(0, len(entries), 100):
         chunk = entries[chunk_start : chunk_start + 100]
         lines = [f"{len(chunk)} beginbfchar"]
         for cid, ustr in chunk:
             cid_hex = f"<{cid:04X}>"
-            # Encode each Unicode character as 4-digit hex
             uni_hex = "<" + "".join(f"{ord(ch):04X}" for ch in ustr) + ">"
             lines.append(f"{cid_hex} {uni_hex}")
         lines.append("endbfchar")
@@ -201,6 +213,10 @@ def _append_w_entries(
 ) -> None:
     """Append new CID width entries to the /W array.
 
+    Deduplicates against existing entries: CIDs already present with
+    the same width are silently skipped. Prevents /W array bloat from
+    repeated ``extend_subset`` calls.
+
     Args:
         cid_font: The CIDFont dictionary containing /W.
         new_widths: Dict of {CID: width_in_font_units} to add.
@@ -208,11 +224,18 @@ def _append_w_entries(
     if not new_widths:
         return
 
+    from pdf_edit_engine.widths import parse_cid_widths
+
+    existing_widths = parse_cid_widths(pikepdf.Dictionary(cid_font))  # type: ignore[arg-type]
+    deduped = {cid: w for cid, w in new_widths.items() if existing_widths.get(cid) != w}
+    if not deduped:
+        return
+
     existing: list[object] = []
     if "/W" in cid_font:
         existing = list(cid_font["/W"])  # type: ignore[call-overload]
 
-    for cid, width in sorted(new_widths.items()):
+    for cid, width in sorted(deduped.items()):
         existing.append(cid)
         existing.append(pikepdf.Array([width]))
 
