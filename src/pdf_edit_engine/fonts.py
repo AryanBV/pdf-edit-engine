@@ -328,6 +328,36 @@ def _collect_component_names(
     return order
 
 
+def _pad_glyph_order(embedded: TTFont, target_length: int) -> None:
+    """Pad ``embedded.glyphOrder`` up to ``target_length`` with empty glyphs.
+
+    Used by Tier 1.5 when the font's ToUnicode CMap references CIDs
+    beyond the current glyph order length. Padding each slot with an
+    empty simple glyph (zero contours, zero advance) preserves the
+    slot numbering so subsequent injections land at safe, unused GIDs
+    without colliding with existing CMap CIDs.
+
+    Each padding slot gets a unique glyph name so fontTools does not
+    alias multiple GIDs to the same glyph.
+
+    Args:
+        embedded: Destination TTFont.
+        target_length: Desired glyph order length after padding.
+            If the current length is already >= target_length, this
+            is a no-op.
+    """
+    from fontTools.ttLib.tables._g_l_y_f import Glyph  # type: ignore[import-untyped]
+
+    current = len(embedded.getGlyphOrder())
+    for gid in range(current, target_length):
+        placeholder = f"_ary278_pad_{gid:05X}"
+        empty_glyph = Glyph()
+        empty_glyph.numberOfContours = 0
+        embedded["glyf"][placeholder] = empty_glyph
+        embedded["hmtx"][placeholder] = (0, 0)
+    embedded["maxp"].numGlyphs = len(embedded.getGlyphOrder())
+
+
 def _append_glyph_to_font(
     embedded: TTFont,
     system: TTFont,
@@ -640,31 +670,48 @@ def extend_subset(
     try:
         embedded_cmap = embedded_font.getBestCmap() or {}
 
-        # Determine tier: check if ALL additional chars are in embedded font's cmap
-        tier2_needed = False
+        # Split additional_chars into two groups:
+        #   tier1_chars  - glyph already in embedded font, only needs a
+        #                  /ToUnicode + /W + /CIDToGIDMap entry
+        #   tier15_chars - glyph missing from embedded font, needs full
+        #                  in-place injection (Tier 1.5)
+        tier1_chars: list[str] = []
+        tier15_chars: list[str] = []
+        seen: set[str] = set()
         for ch in additional_chars:
-            if ord(ch) not in embedded_cmap:
-                tier2_needed = True
-                break
+            if ch in seen:
+                continue
+            seen.add(ch)
+            if ord(ch) in embedded_cmap:
+                tier1_chars.append(ch)
+            else:
+                tier15_chars.append(ch)
 
-        if not tier2_needed:
-            return _extend_tier1(
+        # Apply Tier 1 for chars whose glyph is already in the embedded
+        # font (no font-file change needed).
+        if tier1_chars:
+            _extend_tier1(
                 pdf,
                 font_dict,
                 cid_font,
                 embedded_font,
                 embedded_cmap,
-                additional_chars,
+                "".join(tier1_chars),
             )
     finally:
         embedded_font.close()
+
+    # Tier 1.5 handles the remaining chars whose glyphs are absent from
+    # the embedded font. If there are none, we are done with Tier 1.
+    if not tier15_chars:
+        return "cmap_only"
 
     return _extend_tier2(
         pdf,
         font_dict,
         cid_font,
         fd,
-        additional_chars,
+        "".join(tier15_chars),
         full_font_path,
     )
 
@@ -779,6 +826,18 @@ def _extend_tier2(
         units_per_em = embedded["head"].unitsPerEm
         new_cmap_entries: dict[int, str] = {}
         new_w_entries: dict[int, float] = {}
+
+        # Compute a collision-free starting GID for new glyphs.
+        # Under Identity-H, CID == GID, so the new GID must be above
+        # BOTH the current glyph order length AND any CID already used
+        # by the ToUnicode CMap (which, for some synthetic/retain_gids
+        # fonts, references CIDs beyond the embedded font's glyph
+        # count). Pad the glyph order with unique .notdef placeholders
+        # up to that point so fontTools preserves the slot numbering.
+        existing_cmap_cids = _parse_existing_tounicode(font_dict).keys()
+        max_existing_cid = max(existing_cmap_cids, default=-1)
+        safe_start = max(len(embedded.getGlyphOrder()), max_existing_cid + 1)
+        _pad_glyph_order(embedded, safe_start)
 
         for ch in additional_chars:
             cp = ord(ch)

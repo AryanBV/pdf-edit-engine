@@ -258,9 +258,13 @@ class FontResolver:
 
 
 class FontResolverCache:
-    """Cache FontResolver instances per PDF to avoid re-parsing font dicts.
+    """Cache FontResolver instances per font dict to avoid re-parsing.
 
-    Uses the page object's PDF object generation pair and font name as key.
+    Keyed by the FONT DICT's object generation pair (not the page's), so
+    pages that share a font via indirect reference resolve to the same
+    cached instance. Evicting on any one page clears the entry for every
+    page that references the same font dict — critical after
+    ``extend_subset`` mutates a shared font (ARY-278).
     """
 
     def __init__(self) -> None:
@@ -270,10 +274,27 @@ class FontResolverCache:
         """Discard all cached FontResolver instances."""
         self._cache.clear()
 
+    def _make_key(
+        self,
+        page: pikepdf.Page,
+        font_name: str,
+    ) -> tuple[int, int, str]:
+        """Compute the cache key from the font dict's objgen.
+
+        Shared fonts (indirect references from multiple pages) all
+        resolve to the same ``(font_obj_gen, font_name)`` key.
+        """
+        font_key = font_name if font_name.startswith("/") else f"/{font_name}"
+        font_obj = page["/Resources"]["/Font"][font_key]
+        try:
+            objgen = font_obj.objgen
+        except AttributeError:
+            objgen = (0, 0)  # inline (direct) font dict — rare
+        return (objgen[0], objgen[1], font_name)
+
     def evict(self, page: pikepdf.Page, font_name: str) -> None:
-        """Remove a specific cached resolver (e.g. after font extension)."""
-        objgen: tuple[int, int] = page.obj.objgen
-        key = (objgen[0], objgen[1], font_name)
+        """Remove a cached resolver (clears all pages sharing the font)."""
+        key = self._make_key(page, font_name)
         self._cache.pop(key, None)
 
     def get_resolver(
@@ -288,10 +309,10 @@ class FontResolverCache:
             font_name: Font resource name (e.g., 'F1', without '/').
 
         Returns:
-            A FontResolver instance (cached per page+font).
+            A FontResolver instance. Pages sharing the font via
+            indirect reference share one cached instance.
         """
-        objgen: tuple[int, int] = page.obj.objgen
-        key = (objgen[0], objgen[1], font_name)
+        key = self._make_key(page, font_name)
         if key not in self._cache:
             font_key = font_name if font_name.startswith("/") else f"/{font_name}"
             font_obj = page["/Resources"]["/Font"][font_key]

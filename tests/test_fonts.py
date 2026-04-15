@@ -704,3 +704,46 @@ class TestTier1_5GlyphInjection:
         cache.evict("F1")
         assert "F1" not in cache._cache  # noqa: SLF001
         cache.evict("F99")  # no-op for missing key — must not raise
+
+    def test_resolver_cache_shared_font_cross_page_evict(self, tmp_path: Path) -> None:
+        """Pages sharing a font via indirect ref must share one cache entry.
+
+        After ARY-278 re-keys FontResolverCache by font dict objgen,
+        two pages whose /Resources/Font points to the same indirect
+        Type0 font object share a single resolver instance. Evicting
+        on one page clears it for every page that references the same
+        font.
+        """
+        from pdf_edit_engine.encoding import FontResolverCache
+
+        src = tmp_path / "in.pdf"
+        assert _build_identity_h_pdf(
+            src,
+            title_text="Acme",
+            title_pattern="single_tj",
+            extra_corpus="Nova",
+        )
+        # Duplicate page 0 to create a second page sharing /Resources
+        with pikepdf.Pdf.open(str(src), allow_overwriting_input=True) as pdf:
+            p1 = pdf.pages[0]
+            p2_dict = pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/Page"),
+                    "/MediaBox": p1["/MediaBox"],
+                    "/Resources": p1["/Resources"],
+                    "/Contents": p1["/Contents"],
+                }
+            )
+            pdf.pages.append(pikepdf.Page(p2_dict))
+            pdf.save(str(src))
+
+        with pikepdf.Pdf.open(str(src)) as pdf:
+            cache = FontResolverCache()
+            r1 = cache.get_resolver(pdf.pages[0], "F1")
+            r2 = cache.get_resolver(pdf.pages[1], "F1")
+            assert r1 is r2, "shared font must resolve to same cached instance"
+            cache.evict(pdf.pages[0], "F1")
+            r2_after = cache.get_resolver(pdf.pages[1], "F1")
+            assert r2_after is not r1, (
+                "evict on one page must clear entries for every page referencing the same font dict"
+            )
