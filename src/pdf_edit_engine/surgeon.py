@@ -416,6 +416,17 @@ def _apply_single_replacement(
     """
     from typing import Literal as Lit
 
+    # Always derive the resolver from the match's own font. Callers such
+    # as replace_all() iterate over matches on a page and may pass in a
+    # resolver from the previous iteration that belongs to a different
+    # font. Trusting that stale resolver would cause cross-font CID
+    # pollution: can_encode() would validate against font A, no extension
+    # would run for font B, and _modify_tj_operator() would write font
+    # A's CIDs into font B's content-stream operator. Fetching from the
+    # cache here is cheap when the match reuses the previous font.
+    match_font_name = match.characters[0].font_name
+    resolver = _get_font_resolver(page, match_font_name)
+
     # Check encodability
     can_enc, missing = resolver.can_encode(new_text)
     font_action: Lit["kept", "extended", "substituted", "failed"] = "kept"

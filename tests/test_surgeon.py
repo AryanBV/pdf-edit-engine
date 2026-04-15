@@ -562,3 +562,110 @@ class TestCIDFontReplace:
         )
         text = get_text(str(out))
         assert "Nova Industries" in text, f"Tier 1.5 output corrupted: {text!r}"
+
+
+@_no_ttf
+class TestCrossFontResolverReuse:
+    """Regression tests for cross-font resolver pollution in replace_all.
+
+    Discovered during 0.1.1 release verification against a real Chrome PDF
+    with four Identity-H fonts on the same page. ``replace_all``'s per-page
+    loop was pre-fetching one resolver from the first match and reusing it
+    for every subsequent match on that page. When matches used different
+    fonts, ``_apply_single_replacement`` validated encodability against the
+    stale resolver (``can_encode=True`` because the *wrong* font happened to
+    have the chars), skipped extension, and wrote the stale font's CIDs into
+    the match's content-stream operator. Symptom: extracted text showed
+    ``"ova ndustries"`` for matches rendered in a font that genuinely lacked
+    ``N``/``I`` glyphs, because the emitted CIDs only mapped to those letters
+    in the *other* font's ToUnicode CMap.
+
+    Fix: ``_apply_single_replacement`` now always calls
+    ``_get_font_resolver(page, match.characters[0].font_name)`` at the top of
+    the function, discarding the caller-supplied resolver.
+    """
+
+    def test_apply_single_replacement_refetches_match_font(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The function must fetch a fresh resolver from the match's font,
+        even if the caller passes a resolver for a different font."""
+        from unittest.mock import MagicMock
+
+        from pdf_edit_engine import surgeon
+
+        src = tmp_path / "src.pdf"
+        assert _build_identity_h_pdf(
+            src,
+            title_pattern="single_tj",
+            title_text="Acme Corporation",
+            body_text="body",
+            extra_corpus="Nova Industries",
+        )
+        match = _title_match(str(src), "Acme Corporation")
+        match_font = match.characters[0].font_name
+
+        real_get = surgeon._get_font_resolver
+        calls: list[str] = []
+
+        def tracking_get(page: pikepdf.Page, font_name: str) -> object:
+            calls.append(font_name)
+            return real_get(page, font_name)
+
+        monkeypatch.setattr(surgeon, "_get_font_resolver", tracking_get)
+
+        # Deliberately stale resolver: a MagicMock that pretends any text
+        # is encodable. Without the fix, _apply_single_replacement would
+        # trust it and never refetch.
+        wrong_resolver = MagicMock()
+        wrong_resolver.can_encode.return_value = (True, [])
+        wrong_resolver.byte_width = 2
+
+        pdf = pikepdf.Pdf.open(str(src))
+        try:
+            page = pdf.pages[match.page_number]
+            ops = list(pikepdf.parse_content_stream(page))
+            result, _ = surgeon._apply_single_replacement(
+                pdf,
+                page,
+                ops,
+                match,
+                "Nova Industries",
+                wrong_resolver,
+                surgeon._width_cache,
+                dry_run=True,
+            )
+        finally:
+            pdf.close()
+
+        assert match_font in calls, (
+            f"_apply_single_replacement did not refetch the resolver for "
+            f"the match's font ({match_font}). Cross-font pollution regression. "
+            f"Observed calls: {calls}"
+        )
+        assert result.success, f"Replacement failed via refetched resolver: {result}"
+
+    def test_replace_all_real_chrome_pdf_if_available(self, tmp_path: Path) -> None:
+        """End-to-end guard: real Chrome PDF with 4 Identity-H fonts per page.
+
+        Skipped when the fixture is absent (CI). When present, verifies that
+        ``replace_all`` produces no Mode-1 or Mode-2 garble tokens, proving
+        the cross-font resolver pollution is fixed on the exact PDF that
+        surfaced the bug.
+        """
+        real_pdf = Path(__file__).parent.parent / ".claude" / "Acme Corporation —Chrome.pdf"
+        if not real_pdf.exists():
+            pytest.skip("real Chrome PDF not present (see ARY-280 for corpus commit)")
+
+        out = tmp_path / "chrome_out.pdf"
+        results = replace_all(str(real_pdf), "Acme Corporation", "Nova Industries", str(out))
+        assert len(results) == 6
+        assert all(r.success for r in results), [(r.success, r.font_action) for r in results]
+
+        text = get_text(str(out))
+        assert text.count("Nova Industries") >= 4, text[:400]
+        assert "Acme Corporation" not in text
+        for tok in ("ova ndustries", "1ova", "1ndustries", ",ndustries", "$ndustries"):
+            assert tok not in text, f"Mode-2 garble token {tok!r} in output"
+        for tok in ("N o v a", "No v a", "In d u s"):
+            assert tok not in text, f"Mode-1 garble token {tok!r} in output"
