@@ -401,8 +401,6 @@ from tests._identity_h_fixture import (  # noqa: E402
 )
 
 
-
-
 @_no_ttf
 class TestCIDFontReplace:
     """ARY-276 regression tests: Identity-H CIDFont replacement fidelity."""
@@ -531,13 +529,24 @@ class TestCIDFontReplace:
         assert "Nova Industries" in text
         assert "body data" in text
 
-    def test_tier2_misalignment_aborts_cleanly(self, tmp_path: Path) -> None:
-        """ARY-276 F2: Tier 2 extension must fail loudly, not silently corrupt."""
+    def test_tier2_narrow_subset_remaps_cleanly(self, tmp_path: Path) -> None:
+        """ARY-278: Tier 1.5 extends narrow subsets cleanly.
+
+        Previously (ARY-276) this test accepted either silent corruption
+        OR clean failure, because the old Tier 2 subset-and-replace
+        strategy silently broke pre-existing CIDs whenever system-font
+        GIDs did not match the original embedded subset's CIDs.
+
+        After ARY-278, Tier 1.5 appends missing glyphs to the existing
+        embedded font in place, preserving every pre-existing CID. The
+        replacement must now SUCCEED with clean text — no silent
+        corruption, no loud abort.
+        """
         src = tmp_path / "in.pdf"
         out = tmp_path / "out.pdf"
-        # Deliberately omit 'N' from the subset AND from extra_corpus so
-        # the embedded font's cmap does not cover 'N'.  Replacement
-        # with "Nova" will need to trigger Tier 2 extension.
+        # Narrow subset: omit N, I, v, d, u, s, w, W from the embedded
+        # font's internal cmap. The replacement text needs some of
+        # these, forcing Tier 1.5 to inject from the system font.
         ok = _build_identity_h_pdf(
             src,
             title_pattern="single_tj",
@@ -548,15 +557,9 @@ class TestCIDFontReplace:
 
         match = _title_match(str(src), "Acme Corporation")
         result = replace(str(src), match, "Nova Industries", str(out))
-        # The guard should cause a clean failure — either:
-        #   - resolver raised KeyError during encode (before extension)
-        #     and the fallback path returned success=False, OR
-        #   - Tier 2 alignment guard raised FontNotFoundError,
-        #     handled at surgeon.py:454 → success=False, font_action="failed"
-        # In any case, NO silent corruption, and the output either does
-        # not exist or does not contain silently-wrong glyphs.
-        if result.success:
-            text = get_text(str(out))
-            assert "Nova Industries" in text, f"silent corruption: got {text!r}"
-        else:
-            assert result.font_action == "failed"
+        assert result.success is True, (
+            f"Tier 1.5 must succeed, got font_action={result.font_action} "
+            f"missing={result.fidelity_report.glyphs_missing}"
+        )
+        text = get_text(str(out))
+        assert "Nova Industries" in text, f"Tier 1.5 output corrupted: {text!r}"
