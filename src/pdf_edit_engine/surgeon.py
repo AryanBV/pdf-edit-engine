@@ -432,7 +432,7 @@ def _apply_single_replacement(
             # Evict stale width cache entry: extend_subset adds new CIDs
             # to /W, but _width_cache holds the pre-extension dict and
             # would return DEFAULT_WIDTH (600) for newly-added CIDs.
-            _width_cache._cache.pop(font_name, None)  # noqa: SLF001
+            _width_cache.evict(font_name)
             resolver = _get_font_resolver(page, font_name)
             can_enc_after, still_missing = resolver.can_encode(new_text)
             if not can_enc_after:

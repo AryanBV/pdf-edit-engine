@@ -87,6 +87,16 @@ class GlyphWidthCache:
         """Discard all cached width tables."""
         self._cache.clear()
 
+    def evict(self, font_name: str) -> None:
+        """Drop cached widths for a single font (e.g. after extend_subset).
+
+        Use this when a font's ``/W`` array was mutated (new glyphs added
+        via Tier 1 or Tier 1.5 extension) so that the next ``get_width``
+        call re-parses the fresh ``/W`` data instead of returning
+        ``DEFAULT_WIDTH`` for newly-added CIDs.
+        """
+        self._cache.pop(font_name, None)
+
     def get_width(
         self,
         page: pikepdf.Page,

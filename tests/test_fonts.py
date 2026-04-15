@@ -693,3 +693,14 @@ class TestTier1_5GlyphInjection:
         # Body text must survive the font mutation untouched.
         # After title replacement, body line still reads "Acme Corporation at top".
         assert "Acme Corporation at top" in text, f"body text corrupted after injection: {text!r}"
+
+    def test_glyph_width_cache_evict_public(self) -> None:
+        """GlyphWidthCache.evict drops cached widths for a single font."""
+        from pdf_edit_engine.widths import GlyphWidthCache
+
+        cache = GlyphWidthCache()
+        cache._cache["F1"] = {5: 500.0}  # noqa: SLF001
+        assert "F1" in cache._cache  # noqa: SLF001
+        cache.evict("F1")
+        assert "F1" not in cache._cache  # noqa: SLF001
+        cache.evict("F99")  # no-op for missing key — must not raise
