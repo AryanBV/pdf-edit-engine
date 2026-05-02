@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pdf-edit-engine"
-version = "0.1.1"
+version = "0.1.2"
 description = "Format-preserving PDF text editing — edit text in existing PDFs while preserving fonts, layout, and visual fidelity"
 readme = "README.md"
 license = "MIT"
@@ -25,11 +25,19 @@ dependencies = [
     "pikepdf>=9.0.0,<11",
     "fonttools>=4.50.0,<5",
     "pdfminer.six>=20231228,<20270000",
+    # CVE-2026-41066: lxml < 6.1.0 has default-on XXE that lets untrusted
+    # XML/XMP input read local files. pikepdf is a transitive consumer
+    # of lxml when parsing XMP metadata streams, so a hostile PDF could
+    # exploit this against this library. Pin the floor explicitly to
+    # document the security requirement; pikepdf itself does not pin it.
+    "lxml>=6.1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
+    # CVE-2025-71176: pytest <9.0.3 has a /tmp/pytest-of-{user} race
+    # that allows local DoS / privilege escalation. Dev-only.
+    "pytest>=9.0.3",
     "pytest-cov",
     "ruff>=0.4.0",
     "mypy>=1.10",
@@ -49,7 +57,6 @@ exclude = [
     "tests/",
     "docs/",
     ".github/",
-    "demo_swap.py",
     "Makefile",
     "CLAUDE.md",
 ]
@@ -62,13 +69,39 @@ src = ["src"]
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "TCH"]
 
+[tool.ruff.lint.per-file-ignores]
+# Tests need pragmatic relaxations:
+# SLF001 — accessing _private from tests (e.g. _has_symlink_in_path).
+# PLR2004 — magic numbers in fixtures.
+# BLE001 — broad except in defensive try-blocks that just skip the test.
+"tests/**/*.py" = ["SLF001", "PLR2004", "BLE001"]
+
 [tool.mypy]
 strict = true
 packages = ["pdf_edit_engine"]
 
+[tool.coverage.run]
+source = ["pdf_edit_engine"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+# Hold the line at the v0.1.2 audit baseline (audit-findings-v0.1.2.md
+# reports 85% line coverage). 80% gives 5pp headroom for honest
+# refactors while preventing silent erosion.
+fail_under = 80
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# Default-exclude `slow` so per-PR runs stay fast (the two clean-install
+# probes in test_stress.py rebuild the wheel and add ~60s). Opt back in
+# with `pytest -m slow` (run by one matrix cell of CI; see ci.yml).
+addopts = "-m 'not slow'"
 markers = [
     "benchmark: performance benchmark tests",
     "slow: slow tests (clean install, etc.)",

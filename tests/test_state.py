@@ -203,20 +203,15 @@ class TestColor:
         t.process_operator("rg", [1.0, 0.0, 0.0])
         assert t.fill_color == (1.0, 0.0, 0.0)
 
-    def test_RG_stroke_rgb(self) -> None:
-        t = GraphicsStateTracker()
-        t.process_operator("RG", [0.0, 0.0, 1.0])
-        assert t.stroke_color == (0.0, 0.0, 1.0)
+    # Stroke-state operators (G, RG, K, SCN) are intentionally
+    # not tracked — every engine consumer reads only fill_color.
+    # Stroke tracking was removed in v0.1.2 cleanup. The tests
+    # for "RG_stroke_rgb" / "K_stroke_cmyk" went with it.
 
     def test_k_fill_cmyk(self) -> None:
         t = GraphicsStateTracker()
         t.process_operator("k", [0.0, 0.0, 0.0, 1.0])
         assert t.fill_color == (0.0, 0.0, 0.0, 1.0)
-
-    def test_K_stroke_cmyk(self) -> None:
-        t = GraphicsStateTracker()
-        t.process_operator("K", [1.0, 0.0, 0.0, 0.0])
-        assert t.stroke_color == (1.0, 0.0, 0.0, 0.0)
 
 
 class TestSnapshot:
@@ -226,7 +221,6 @@ class TestSnapshot:
         t = GraphicsStateTracker()
         t.process_operator("cm", [1.0, 0.0, 0.0, 1.0, 50.0, 100.0])
         t.process_operator("rg", [1.0, 0.0, 0.0])
-        t.process_operator("RG", [0.0, 1.0, 0.0])
         t.process_operator("BT", [])
         t.process_operator("Tf", ["/F1", 12.0])
         t.process_operator("Tm", [1.0, 0.0, 0.0, 1.0, 72.0, 700.0])
@@ -235,7 +229,6 @@ class TestSnapshot:
         assert isinstance(snap, GraphicsStateSnapshot)
         assert snap.ctm == (1.0, 0.0, 0.0, 1.0, 50.0, 100.0)
         assert snap.fill_color == (1.0, 0.0, 0.0)
-        assert snap.stroke_color == (0.0, 1.0, 0.0)
         assert snap.font_name == "F1"
         assert snap.font_size == 12.0
         assert snap.text_matrix == (1.0, 0.0, 0.0, 1.0, 72.0, 700.0)
@@ -344,7 +337,6 @@ class TestProperties:
         assert t.font_name is None
         assert t.font_size == 0.0
         assert t.fill_color is None
-        assert t.stroke_color is None
         assert t.text_rendering_mode == 0
 
     def test_text_rendering_mode(self) -> None:

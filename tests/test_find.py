@@ -23,11 +23,6 @@ pytestmark = pytest.mark.skipif(
 class TestFind:
     """Core tests for find() text search."""
 
-    def test_find_name(self) -> None:
-        matches = find(RESUME_PDF, "Aryan")
-        assert len(matches) >= 1
-        assert matches[0].matched_text == "Aryan"
-
     def test_find_case_insensitive(self) -> None:
         matches = find(RESUME_PDF, "aryan", case_sensitive=False)
         assert len(matches) >= 1
@@ -54,9 +49,8 @@ class TestFind:
         matches = find(RESUME_PDF, "nonexistent text xyz")
         assert matches == []
 
-    def test_find_empty_string(self) -> None:
-        matches = find(RESUME_PDF, "")
-        assert matches == []
+    # test_find_empty_string removed — strict subset of
+    # tests/invariants/test_d_1_find_empty.py.
 
     def test_find_page_zero(self) -> None:
         matches = find(RESUME_PDF, "Aryan", page=0)

@@ -605,12 +605,17 @@ class TestCrossFontResolverReuse:
         match = _title_match(str(src), "Acme Corporation")
         match_font = match.characters[0].font_name
 
+        from pdf_edit_engine.encoding import FontResolverCache
+        from pdf_edit_engine.widths import GlyphWidthCache
+
         real_get = surgeon._get_font_resolver
         calls: list[str] = []
 
-        def tracking_get(page: pikepdf.Page, font_name: str) -> object:
+        def tracking_get(
+            page: pikepdf.Page, font_name: str, resolver_cache: FontResolverCache
+        ) -> object:
             calls.append(font_name)
-            return real_get(page, font_name)
+            return real_get(page, font_name, resolver_cache)
 
         monkeypatch.setattr(surgeon, "_get_font_resolver", tracking_get)
 
@@ -620,6 +625,10 @@ class TestCrossFontResolverReuse:
         wrong_resolver = MagicMock()
         wrong_resolver.can_encode.return_value = (True, [])
         wrong_resolver.byte_width = 2
+
+        # Per-call caches, mirroring the public-entrypoint contract (ARY-283).
+        resolver_cache = FontResolverCache()
+        width_cache = GlyphWidthCache()
 
         pdf = pikepdf.Pdf.open(str(src))
         try:
@@ -632,7 +641,8 @@ class TestCrossFontResolverReuse:
                 match,
                 "Nova Industries",
                 wrong_resolver,
-                surgeon._width_cache,
+                width_cache,
+                resolver_cache,
                 dry_run=True,
             )
         finally:
@@ -669,3 +679,115 @@ class TestCrossFontResolverReuse:
             assert tok not in text, f"Mode-2 garble token {tok!r} in output"
         for tok in ("N o v a", "No v a", "In d u s"):
             assert tok not in text, f"Mode-1 garble token {tok!r} in output"
+
+
+@_no_ttf
+class TestNarrowSubsetReplacement:
+    """Regression test for ARY-282: replacing text with characters outside
+    the embedded subset on a narrow Identity-H PDF must succeed end-to-end.
+
+    Historical context: ``_calculate_new_width`` raises ``KeyError`` when
+    ``resolver.encode`` meets a glyph absent from the embedded cmap, and
+    the caller catches it to set ``needs_reflow=False``. The simple-replace
+    path then runs, performs font extension in ``_apply_single_replacement``,
+    and produces a correct replacement. The ARY-282 concern — that reflow
+    was "silently disabled" — is benign for same-width replacements (the
+    common case); simple-replace handles both encoding and placement.
+
+    This test asserts the visible-behaviour invariant: the replacement
+    succeeds, the output contains the new text, and the font action
+    reflects that extension happened (``extended`` or ``kept``).
+    """
+
+    def test_narrow_subset_replacement_succeeds_via_simple_replace(self, tmp_path: Path) -> None:
+        src = tmp_path / "in.pdf"
+        out = tmp_path / "out.pdf"
+        # Build an Identity-H PDF whose embedded cmap OMITS chars needed by
+        # the replacement text.
+        ok = _build_identity_h_pdf(
+            src,
+            title_pattern="single_tj",
+            title_text="Acme Corp",
+            body_text="body",
+            extra_corpus="",
+            omit_chars_from_subset="NIWLdu",
+        )
+        assert ok
+
+        match = _title_match(str(src), "Acme Corp")
+        # Similar-width replacement needing omitted glyphs.
+        result = replace(str(src), match, "Nova Industries", str(out), reflow=True)
+        assert result.success, f"ARY-282 regression: {result}"
+        assert result.font_action == "extended", (
+            f"ARY-282: font extension expected; got font_action={result.font_action}"
+        )
+        text = get_text(str(out))
+        assert "Nova Industries" in text, f"ARY-282: output missing replacement: {text!r}"
+
+
+class TestModuleCacheOwnership:
+    """Regression tests for ARY-283: module-level cache deletion.
+
+    After the v0.1.2 refactor, neither ``surgeon`` nor ``structural`` is
+    allowed to hold a module-level ``FontResolverCache`` or
+    ``GlyphWidthCache``.  Each public entrypoint now constructs its own
+    caches at entry and threads them through helpers as explicit params,
+    eliminating any cross-module staleness hazard.
+    """
+
+    def test_surgeon_has_no_module_level_caches(self) -> None:
+        from pdf_edit_engine import surgeon
+
+        for attr in ("_resolver_cache", "_width_cache", "_cached_pdf_path"):
+            assert not hasattr(surgeon, attr), (
+                f"surgeon.{attr} must not exist — Phase 1 (ARY-283) "
+                f"removed all module-level cache state"
+            )
+
+    def test_structural_has_no_module_level_caches(self) -> None:
+        from pdf_edit_engine import structural
+
+        assert not hasattr(structural, "_resolver_cache"), (
+            "structural._resolver_cache must not exist — Phase 1 (ARY-283) "
+            "removed all module-level cache state"
+        )
+
+    def test_sequential_public_calls_share_no_state(self, tmp_path: Path) -> None:
+        """Two back-to-back public calls on the same PDF must succeed
+        independently.  The original ARY-283 concern was that mutations
+        by one module would leave stale caches in another; with per-call
+        caches this is structurally impossible to reproduce, and
+        sequential calls should round-trip cleanly.
+        """
+        src = tmp_path / "in.pdf"
+        mid = tmp_path / "mid.pdf"
+        out = tmp_path / "out.pdf"
+        assert _build_identity_h_pdf(
+            src,
+            title_pattern="single_tj",
+            title_text="Acme Corporation",
+            body_text="body",
+            extra_corpus="Nova Industries Corp",
+        )
+
+        # First public call: replace → first output
+        m1 = _title_match(str(src), "Acme Corporation")
+        r1 = replace(str(src), m1, "Nova Industries", str(mid))
+        assert r1.success, f"first call failed: {r1}"
+
+        # Second public call: replace on the first call's output — must
+        # open a fresh pdf, build its own caches, and succeed without
+        # any stale state from call #1.
+        m2 = _title_match(str(mid), "Nova Industries")
+        r2 = replace(str(mid), m2, "Acme Co.", str(out))
+        assert r2.success, f"second call failed: {r2}"
+
+        # Shorter-than-original replacement keeps the text on one line
+        # (no reflow-driven wrap). The invariant under test is simply:
+        # both public calls produced a correct output. All three of
+        # "Acme Co." present, "Nova Industries" gone, "Acme Corporation"
+        # gone — proves no stale-state carry-over between calls.
+        text = get_text(str(out))
+        assert "Acme Co." in text, text
+        assert "Nova Industries" not in text
+        assert "Acme Corporation" not in text

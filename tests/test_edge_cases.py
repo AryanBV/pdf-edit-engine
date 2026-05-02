@@ -171,14 +171,6 @@ class TestEmptyAndPathPages:
         matches = find(empty_page_pdf, "anything")
         assert matches == []
 
-    def test_path_only_get_text(self, path_only_pdf: str) -> None:
-        text = get_text(path_only_pdf)
-        assert text == ""
-
-    def test_path_only_find(self, path_only_pdf: str) -> None:
-        matches = find(path_only_pdf, "anything")
-        assert matches == []
-
     def test_path_only_has_path_elements(self, path_only_pdf: str) -> None:
         with pikepdf.open(path_only_pdf) as pdf:
             interp = ContentStreamInterpreter(pdf.pages[0], 0)

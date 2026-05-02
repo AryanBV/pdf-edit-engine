@@ -44,6 +44,23 @@ _METRIC_EQUIVALENTS: dict[str, list[str]] = {
 }
 
 
+def _strip_subset_prefix(ps_name: str) -> str:
+    """Remove a 6-letter PDF subset prefix (e.g. ``ABCDEF+Calibri-Bold``).
+
+    PDF embedders prepend a six uppercase-letter prefix + '+' to subsetted
+    PostScript names. Lookups against the operating system want the
+    underlying font name, not the prefixed form. This helper is the
+    single source of truth for that normalization; ``find_font`` applies
+    it on every lookup so that callers (including ``fonts._extend_tier2``)
+    do not have to remember to pre-strip.
+    """
+    if len(ps_name) > 7 and ps_name[6] == "+":
+        prefix = ps_name[:6]
+        if prefix.isalpha() and prefix.isupper():
+            return ps_name[7:]
+    return ps_name
+
+
 def _font_directories() -> list[Path]:
     """Return platform-specific system font directories."""
     system = platform.system()
@@ -141,34 +158,51 @@ def _build_font_cache() -> dict[str, str]:
 def find_font(postscript_name: str) -> str | None:
     """Find a system font file matching the given PostScript name.
 
-    Uses a two-pass strategy for speed:
-    1. Fast pass: filename heuristic (covers ~80% of cases instantly).
-    2. Slow pass: full nameID-6 scan of all system fonts (cached after first run).
+    Backward-compatible thin wrapper over :func:`_find_font_with_origin`
+    that drops the substitution-name component. Exists because the
+    public-ish ``find_font`` signature has been ``str -> str | None``
+    since v0.1.0; callers that need to know whether a metric-equivalent
+    was used should call ``_find_font_with_origin`` instead.
+    """
+    found = _find_font_with_origin(postscript_name)
+    return None if found is None else found[0]
 
-    If no exact match is found, tries metrically similar fallback fonts.
 
-    Args:
-        postscript_name: PostScript name from the PDF (e.g., 'Calibri-Bold').
+def _find_font_with_origin(postscript_name: str) -> tuple[str, str | None] | None:
+    """Like :func:`find_font` but reports whether a metric equivalent was used.
+
+    INV-C-4 plumbing: when the requested font is absent and a metric
+    equivalent is substituted (Calibri → Carlito, Arial →
+    LiberationSans, …), the caller needs to know so it can surface the
+    substitution through ``FidelityReport.font_substituted``. Returning
+    only the resolved path (the v0.1.1 ``find_font`` contract) makes the
+    substitution invisible.
 
     Returns:
-        Absolute path to the font file, or None if not found.
+        ``None`` if no font found; otherwise ``(path, substituted_name)``
+        where ``substituted_name`` is ``None`` if the exact font was
+        located on the host or the PostScript name of the metric
+        equivalent that was used (e.g. ``"Carlito-Regular"``).
     """
     global _FONT_CACHE  # noqa: PLW0603
 
-    # Fast pass — filename heuristic
+    postscript_name = _strip_subset_prefix(postscript_name)
+
+    # Fast pass — filename heuristic. Always returns the exact name
+    # (see _fast_lookup which verifies the embedded nameID-6).
     fast = _fast_lookup(postscript_name)
     if fast is not None:
-        return fast
+        return (fast, None)
 
-    # Slow pass — full scan (cached)
     if _FONT_CACHE is None:
         logger.info("Building system font cache (one-time scan)...")
         _FONT_CACHE = _build_font_cache()
 
     if postscript_name in _FONT_CACHE:
-        return _FONT_CACHE[postscript_name]
+        return (_FONT_CACHE[postscript_name], None)
 
-    # Fallback — try metric equivalents
+    # Metric-equivalent fallback. Record which equivalent was used
+    # so the caller can surface it through the FidelityReport.
     equivalents = _METRIC_EQUIVALENTS.get(postscript_name, [])
     for equiv_name in equivalents:
         if equiv_name in _FONT_CACHE:
@@ -177,6 +211,6 @@ def find_font(postscript_name: str) -> str | None:
                 equiv_name,
                 postscript_name,
             )
-            return _FONT_CACHE[equiv_name]
+            return (_FONT_CACHE[equiv_name], equiv_name)
 
     return None

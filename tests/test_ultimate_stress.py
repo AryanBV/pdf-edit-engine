@@ -498,10 +498,10 @@ class TestEncryptDecryptWorkflow:
         assert "Roundtrip Content" in text
 
     def test_wrong_password_raises(self, tmp_path: Path) -> None:
-        """Wrong password should raise, not crash."""
+        """Wrong password → PDFEditError (pikepdf.PasswordError translated by INV-L-1)."""
         enc = gen_encrypted_pdf(tmp_path)
         dec = str(tmp_path / "bad_dec.pdf")
-        with pytest.raises((PDFEditError, pikepdf.PasswordError)):
+        with pytest.raises(PDFEditError):
             decrypt_pdf(enc, "wrongpass", dec)
 
     def test_empty_password_works(self, tmp_path: Path) -> None:
@@ -653,33 +653,26 @@ class TestFormFieldTypes:
 class TestDegenerate:
     """Robustness tests for degenerate/malformed inputs."""
 
-    def test_zero_font_size_no_crash(self, tmp_path: Path) -> None:
-        """get_text/find on zero-font-size PDF should not crash."""
+    def test_zero_font_size_extracts_text(self, tmp_path: Path) -> None:
+        """Zero font size affects rendering only — content stream still parses
+        and text is extractable from the operators."""
         pdf = gen_zero_font_size_pdf(tmp_path)
-        try:
-            text = get_text(pdf)
-            assert isinstance(text, str)
-        except PDFEditError:
-            pass  # Acceptable
+        text = get_text(pdf)
+        assert "ZeroSizeText" in text
 
-    def test_degenerate_ctm_no_crash(self, tmp_path: Path) -> None:
-        """Zero-determinant CTM should not crash."""
+    def test_degenerate_ctm_extracts_text(self, tmp_path: Path) -> None:
+        """Zero-determinant CTM collapses rendered glyphs to a point but the
+        Tj operator's literal string survives extraction unchanged."""
         pdf = gen_degenerate_ctm_pdf(tmp_path)
-        try:
-            text = get_text(pdf)
-            assert isinstance(text, str)
-        except PDFEditError:
-            pass
+        text = get_text(pdf)
+        assert "Zero CTM text" in text
 
-    def test_text_outside_mediabox(self, tmp_path: Path) -> None:
-        """Text at extreme coordinates should still be extractable."""
+    def test_text_outside_mediabox_extracts_text(self, tmp_path: Path) -> None:
+        """Text drawn at coordinates outside the MediaBox is invisible when
+        rendered but still present in the content stream, so get_text returns it."""
         pdf = gen_text_outside_mediabox_pdf(tmp_path)
-        try:
-            text = get_text(pdf)
-            # Text may or may not be extracted, but should not crash
-            assert isinstance(text, str)
-        except PDFEditError:
-            pass
+        text = get_text(pdf)
+        assert "OutOfBoundsText" in text
 
     def test_very_long_line_get_text(self, tmp_path: Path) -> None:
         """10,000-character line should be extracted."""
@@ -693,23 +686,22 @@ class TestDegenerate:
         matches = find(pdf, "A" * 100)
         assert len(matches) >= 1
 
-    def test_no_fonts_pdf(self, tmp_path: Path) -> None:
-        """Fontless PDF should return empty result or clean error."""
+    def test_no_fonts_pdf_returns_empty(self, tmp_path: Path) -> None:
+        """Content stream references /F1 but /Resources has no /Font dict.
+        The locator logs a 'Cannot resolve font F1' warning and skips the
+        unresolvable text element, returning an empty string rather than
+        crashing."""
         pdf = gen_no_fonts_pdf(tmp_path)
-        try:
-            text = get_text(pdf)
-            assert isinstance(text, str)
-        except (PDFEditError, Exception):
-            pass  # Any clean exception is acceptable
+        text = get_text(pdf)
+        assert text == ""
 
-    def test_damaged_font_stream(self, tmp_path: Path) -> None:
-        """Garbage font data should produce error or partial extraction."""
+    def test_damaged_font_stream_extracts_text(self, tmp_path: Path) -> None:
+        """Type1 font with garbage /FontFile2 bytes: the literal Tj string is
+        a simple-encoding ASCII payload, so get_text returns the operator's
+        text without ever needing to parse the corrupt font binary."""
         pdf = gen_damaged_font_stream_pdf(tmp_path)
-        try:
-            text = get_text(pdf)
-            assert isinstance(text, str)
-        except (PDFEditError, Exception):
-            pass  # Any clean exception is acceptable
+        text = get_text(pdf)
+        assert "DamagedFontText" in text
 
     def test_overlapping_text_both_found(self, tmp_path: Path) -> None:
         """find() should return matches for both overlapping strings."""

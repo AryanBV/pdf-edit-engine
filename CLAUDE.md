@@ -20,12 +20,21 @@ TextLocator ──→ OperatorSurgeon ──→ FontExtender
                   ReflowEngine ← fonttools (metrics only)
 ```
 
-**Data flow** (replace operation): locator.find() → TextMatch → surgeon checks font →
+**Data flow** (replace operation): locator.find() → TextMatch → surgeon validates the
+match via `_assert_match_addressable` (refuses stale matches with OperatorError) →
 fonts.can_render() → surgeon replaces operators → fonts.extend_subset() if needed →
 serialize via pikepdf. Every edit returns a FidelityReport.
 
-**Models**: TextCharacter, TextMatch, EditResult, FidelityReport, FontInfo, Edit,
-ContentElement (wide index of ALL content stream elements), GraphicsStateSnapshot.
+**Models**: TextCharacter, TextMatch, EditResult (with `__post_init__` enforcing
+INV-J-3: overflow_detected ⇒ overflow warning), FidelityReport, FontInfo, Edit,
+ContentElement (wide index of ALL content stream elements), GraphicsStateSnapshot,
+Paragraph, TextBlock. `models.py` is data-only **except for dataclass `__post_init__`
+contract guards** that enforce documented cross-field invariants — those belong with
+the model they constrain.
+
+**PDF I/O entry**: `_pathutil.open_pdf` is the single canonical entry point for opening
+a PDF. Every public API path routes through it. Raw `pikepdf.Pdf.open` calls outside
+this module are an architectural violation that breaks INV-L-1 (translated exceptions).
 
 ## Dependency Rules
 
@@ -34,10 +43,14 @@ ContentElement (wide index of ALL content stream elements), GraphicsStateSnapsho
 | locator  | ✓       |           | ✓            |
 | surgeon  | ✓       |           |              |
 | fonts    | ✓       | ✓         |              |
-| reflow   |         | ✓         |              |
+| reflow   | ✓       | ✓         |              |
+| structural | ✓     | (via reflow) |           |
 | wrapper  | ✓       |           |              |
 
-Do NOT cross these boundaries. No module imports another module's libraries.
+`reflow` writes content streams (pikepdf) using widths measured by
+fonttools. `structural` orchestrates locator + reflow + surgeon helpers
+for bbox-based edits and inherits their dependencies. Do NOT introduce
+pdfminer.six anywhere outside `locator`.
 
 ## Coding Conventions
 
@@ -70,7 +83,14 @@ python -m pytest tests/test_locator.py  # single file
   ranges AND array-of-arrays variants).
 - **Glyph displacement**: `tx = ((w0 - Tj/1000) * Tfs + Tc + Tw) * Th`
 - **Font extension fast path**: CMap-only extension when "subset" already has all glyphs —
-  just add CID→GID mappings and update /W widths. Full re-embed only when glyphs missing.
+  just add CID→GID mappings and update /W widths. **Tier 1.5 in-place glyph injection**
+  (NOT full re-embed; ARY-278) when glyphs missing. The legacy v0.1.0 retain-gids
+  subset-and-replace strategy is gone — it renumbered pre-existing CIDs and corrupted
+  unrelated text.
+- **Path-traversal validation**: `_pathutil.validate_output_path` refuses paths that
+  traverse a symlink or junction (compares `os.path.realpath` to `os.path.abspath`,
+  case-normalized). Catches POSIX symlinks AND Windows directory junctions. Pre-fix
+  `Path.resolve()`-followed-by-`is_symlink()` was dead code.
 
 ## Docs
 

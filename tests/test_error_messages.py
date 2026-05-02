@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pikepdf
 import pytest
 
 from pdf_edit_engine import (
@@ -31,22 +30,23 @@ class TestFileErrors:
     """File-related error messages should be clear."""
 
     def test_non_pdf_file(self) -> None:
-        """Passing a non-PDF file should give a clear error."""
+        """Passing a non-PDF file should give a clear error (PDFEditError per INV-L-1)."""
         readme = str(PROJECT_ROOT / "README.md")
-        with pytest.raises((PDFEditError, Exception)):
+        with pytest.raises(PDFEditError):
             get_text(readme)
 
     def test_nonexistent_file(self) -> None:
-        with pytest.raises((FileNotFoundError, PDFEditError)):
+        """Missing file → PDFEditError (translated by _pathutil.open_pdf, INV-L-1)."""
+        with pytest.raises(PDFEditError):
             get_text("absolutely_does_not_exist_xyz.pdf")
 
     def test_output_to_invalid_path(self, tmp_path: Path) -> None:
-        """Writing to a path with nonexistent parent directory."""
+        """Writing to a path with nonexistent parent → PDFEditError (validate_output_path)."""
         matches = find(SIMPLE_PDF, "Test Document")
         if not matches:
             pytest.skip("Test Document not found")
         bad_output = str(tmp_path / "nonexistent" / "deeply" / "nested" / "output.pdf")
-        with pytest.raises((OSError, PDFEditError)):
+        with pytest.raises(PDFEditError):
             replace(SIMPLE_PDF, matches[0], "new", bad_output)
 
 
@@ -57,13 +57,10 @@ class TestEncryptedPdfErrors:
     """Encrypted PDF operations should produce clear error messages."""
 
     def test_encrypted_pdf_without_password(self, tmp_path: Path) -> None:
-        """Opening encrypted PDF without password should mention encryption."""
+        """Encrypted PDF without password → PDFEditError mentioning encryption (INV-M-1)."""
         encrypted = str(tmp_path / "encrypted.pdf")
         encrypt_pdf(SIMPLE_PDF, "owner123", "user123", encrypted)
-        with pytest.raises(
-            (PDFEditError, pikepdf.PasswordError, Exception),
-            match=r"(?i)password|encrypted|Password",
-        ):
+        with pytest.raises(PDFEditError, match=r"(?i)password|encrypted"):
             get_text(encrypted)
 
 
@@ -117,14 +114,10 @@ class TestCrossPdfErrors:
     """Using a match from one PDF on another should not silently corrupt."""
 
     def test_stale_match_does_not_crash(self, tmp_path: Path) -> None:
-        """TextMatch from pdf_a applied to pdf_b — should not crash."""
+        """TextMatch from pdf_a applied to pdf_b → PDFEditError (INV-B-3 stale-match guard)."""
         matches_a = find(SIMPLE_PDF, "Test Document")
         if not matches_a:
             pytest.skip("Test Document not found in reportlab_simple")
         output = str(tmp_path / "stale.pdf")
-        try:
+        with pytest.raises(PDFEditError):
             replace(TABLE_PDF, matches_a[0], "Stale", output)
-            # If it succeeds without error, output should be a valid PDF
-            pikepdf.Pdf.open(output).close()
-        except (PDFEditError, IndexError, Exception):
-            pass  # acceptable — stale refs detected

@@ -394,3 +394,143 @@ class TestEdgeCases:
         assert result.success
         text = get_text(output)
         assert "Section two" in text
+
+
+class TestBuildParagraphSpaceThreshold:
+    """ARY-277: `_build_paragraph` used to join adjacent text elements with
+    a phantom space when their gap exceeded ``font_size * 0.25``.
+
+    For a 12pt Arial-like font, the natural space width is ~3pt, so 0.25 *
+    font_size was effectively one full space width — not the "half-space
+    threshold" the code comment claimed. Glyph-side-bearing gaps
+    (e.g. a comma's ~0.15-0.2 * font_size offset from the preceding word)
+    exceeded the threshold and emitted a phantom space.
+
+    After tightening to 0.125 * font_size, typical punctuation-adjacency
+    gaps stay below threshold while legitimate word-boundary gaps (real
+    spaces in the content stream) still exceed it.
+    """
+
+    def _make_element(
+        self,
+        text: str,
+        start_x: float,
+        end_x_offset: float,
+        y: float = 100.0,
+        font_name: str = "F1",
+        font_size: float = 12.0,
+    ) -> object:
+        """Build a minimal text ContentElement for unit testing."""
+        from pdf_edit_engine.models import ContentElement, GraphicsStateSnapshot
+
+        # Spread characters evenly across the width
+        char_w = (end_x_offset - start_x) / max(len(text), 1)
+        chars = [
+            TextCharacter(
+                unicode_char=c,
+                page_x=start_x + i * char_w,
+                page_y=y,
+                width=char_w,
+                height=font_size,
+                font_name=font_name,
+                font_size=font_size,
+                color=(0.0,),
+                operator_index=i,
+                byte_position=i * 2,
+                tj_fragment_index=None,
+            )
+            for i, c in enumerate(text)
+        ]
+        state = GraphicsStateSnapshot(
+            ctm=(1, 0, 0, 1, 0, 0),
+            fill_color=(0.0,),
+            font_name=font_name,
+            font_size=font_size,
+            text_matrix=(1, 0, 0, 1, start_x, y),
+        )
+        return ContentElement(
+            type="text",
+            page=0,
+            operator_range=(0, 1),
+            bbox=(start_x, y - 2, end_x_offset, y + font_size),
+            graphics_state=state,
+            text_content=text,
+            characters=chars,
+        )
+
+    def test_small_gap_does_not_emit_phantom_space(self) -> None:
+        """A gap equal to 0.18 * font_size (typical comma left-bearing) must
+        NOT trigger a space insertion between two adjacent elements."""
+        from pdf_edit_engine.reflow import _build_paragraph
+
+        # Post-ARY-277 threshold is 0.125 * font_size = 1.5pt for 12pt font.
+        # A 1.0pt gap between word and trailing comma (< threshold) must
+        # produce NO phantom space.
+        elem_a = self._make_element("Konstantinidis", start_x=100.0, end_x_offset=184.0)
+        elem_b = self._make_element(",", start_x=185.0, end_x_offset=188.0)  # 1.0pt gap
+        tight = _build_paragraph([elem_a, elem_b])
+        assert tight.full_text == "Konstantinidis,", (
+            f"ARY-277 regression: 1.0pt gap between word and comma must NOT "
+            f"emit a phantom space. Got: {tight.full_text!r}"
+        )
+
+    def test_real_space_gap_does_emit_space(self) -> None:
+        """A gap equal to a full space width MUST still trigger space
+        insertion — we must not over-tighten the threshold."""
+        from pdf_edit_engine.reflow import _build_paragraph
+
+        # 12pt font; gap = 4pt (~1/3 of font_size) is well above any
+        # reasonable space-width threshold and represents a real word
+        # boundary in a content stream.
+        elem_a = self._make_element("Hello", start_x=100.0, end_x_offset=130.0)
+        elem_b = self._make_element("world", start_x=134.0, end_x_offset=164.0)
+
+        paragraph = _build_paragraph([elem_a, elem_b])
+        assert paragraph.full_text == "Hello world", (
+            f"Word-boundary gap MUST emit a space. Got: {paragraph.full_text!r}"
+        )
+
+
+class TestReflowOverflowShift:
+    """ARY-277 followup: when reflow_paragraph produces more lines than the
+    original paragraph occupied, content below the paragraph is shifted
+    down by (extra_lines × line_height) before the replacement ops are
+    spliced. Prior behaviour: extra lines wrote on top of whatever was
+    below, creating visual overlap and garbled extracted text.
+
+    This test exercises the CLEAN case (multi-line reflow with standalone
+    content below). The narrow-single-line paragraph with inline
+    continuation (the `Sarah Johnson, stated: ...` Acme Word-PDF case)
+    remains a known limitation tracked for v0.1.3 — see CHANGELOG.
+    """
+
+    def test_wide_paragraph_overflow_shifts_content_below(self, tmp_path: Path) -> None:
+        """When replacement adds a line to a wide paragraph, downstream
+        content must remain readable (not overwritten by the extra
+        reflowed line)."""
+        out = tmp_path / "out.pdf"
+        # reportlab_simple has "Section two has numbers..." body
+        # followed by terminating content. Replace "Section two" with
+        # enough text to force at least one extra reflow line.
+        matches = find(SIMPLE_PDF, "Section two")
+        assert matches
+        long_repl = (
+            "Section two is a much much much much much much much much "
+            "much much much much much longer section header"
+        )
+        result = replace(
+            SIMPLE_PDF,
+            matches[0],
+            long_repl,
+            str(out),
+            reflow=True,
+        )
+        assert result.success, result
+        text = get_text(str(out))
+        # Post-shift invariant: the original "numbers" body text that
+        # followed "Section two" must still be readable (not overwritten
+        # by the extended reflow output).
+        assert "numbers" in text, (
+            f"Shift-overflow regression: content below the reflowed paragraph "
+            f"was overwritten. Extracted text: {text!r}"
+        )

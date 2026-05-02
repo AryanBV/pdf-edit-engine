@@ -6,11 +6,12 @@ import logging
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import pikepdf
+from fontTools.ttLib import TTLibError  # type: ignore[import-untyped]
 
-from pdf_edit_engine.encoding import FontResolver, FontResolverCache
+from pdf_edit_engine._pathutil import open_pdf
 from pdf_edit_engine.errors import EncodingError, FontNotFoundError, ReflowError
 from pdf_edit_engine.models import (
     ContentElement,
@@ -21,12 +22,24 @@ from pdf_edit_engine.models import (
 )
 from pdf_edit_engine.widths import (
     DEFAULT_WIDTH,
-    GlyphWidthCache,
     parse_cid_widths,
     parse_simple_widths,
 )
 
+if TYPE_CHECKING:
+    from pdf_edit_engine.encoding import FontResolver, FontResolverCache
+
 logger = logging.getLogger(__name__)
+
+# Exception tuple for font-extension failures that should degrade to an
+# EditResult failure instead of propagating. Kept as a single constant so
+# all three call sites (reflow_paragraph, structural._extend_font,
+# structural.insert_text_block) stay aligned — the prior asymmetry where
+# reflow caught OSError but structural caught OperatorError was an
+# inconsistency that let a deleted/permission-denied system font take
+# down replace_block while degrading gracefully in reflow (ultrareview
+# bug_002).
+_FONT_EXTEND_FAIL_EXCS = (FontNotFoundError, EncodingError, OSError, TTLibError)
 
 # Parsed content stream ops — using Any mirrors surgeon.py convention.
 _Ops = list[Any]
@@ -244,7 +257,23 @@ def _build_paragraph(
     # Full text: join elements using position-aware spacing so that
     # adjacent elements (gap < half a space width) are joined without
     # extra space, matching pdfminer's extraction output.
-    space_width = font_size * 0.25  # approximate half-space threshold
+    #
+    # Threshold history (ARY-277): the original value was
+    # ``font_size * 0.25`` with a comment claiming "half-space
+    # threshold". For a typical Western font a full space is ~250
+    # font units of 1000-em = ~0.25 * font_size. So 0.25 * font_size
+    # was actually one FULL space width, which allowed normal-width
+    # glyph-side-bearing gaps (e.g. a comma's ~0.15 * font_size
+    # offset from the preceding word) to exceed the threshold and
+    # emit a phantom space token. When ``reflow_paragraph`` then
+    # tokenised on spaces, the comma became its own token and could
+    # be orphaned on the next line.
+    #
+    # Tightening to ``font_size * 0.125`` (≈ half of typical space
+    # width) keeps word-boundary gaps above threshold (real spaces
+    # in content streams render as ≥ space-width gaps between
+    # elements) while keeping punctuation-adjacency gaps below it.
+    space_width = font_size * 0.125
     line_texts: list[str] = []
     for line in lines:
         text_parts: list[str] = []
@@ -282,13 +311,11 @@ def _build_paragraph(
 
 def _detect_paragraphs_from_index(
     elements: list[ContentElement],
-    page_width: float = 612.0,
 ) -> list[Paragraph]:
     """Detect paragraphs from a pre-built content element index.
 
     Args:
         elements: Full content element index for a page.
-        page_width: Page width in points (for margin calculations).
 
     Returns:
         List of detected Paragraph objects.
@@ -374,7 +401,7 @@ def detect_paragraphs(
     from pdf_edit_engine.locator import _build_index
 
     resolved = str(Path(pdf_path).resolve())
-    pdf = pikepdf.Pdf.open(resolved)
+    pdf = open_pdf(resolved)
     try:
         if page >= len(pdf.pages):
             msg = f"Page {page} out of range (PDF has {len(pdf.pages)} pages)"
@@ -382,8 +409,7 @@ def detect_paragraphs(
 
         page_obj = pdf.pages[page]
         elements = _build_index(page_obj, page, resolved)
-        page_width = float(page_obj.MediaBox[2]) if page_obj.MediaBox else 612.0
-        return _detect_paragraphs_from_index(elements, page_width)
+        return _detect_paragraphs_from_index(elements)
     finally:
         pdf.close()
 
@@ -573,15 +599,11 @@ def _expand_to_bt_et(
 def _encode_line_as_tj(
     line: str,
     resolver: FontResolver,
-    width_cache: GlyphWidthCache | None,
-    page: pikepdf.Page | None,
-    font_name: str,
-    font_size: float,
 ) -> tuple[list[Any], Any]:
     """Encode a line of text into a content stream text operator.
 
     For CIDFonts: produces a TJ operator with per-glyph String items,
-    matching how surgeon.py constructs replacement operators.  This
+    matching how surgeon.py constructs replacement operators. This
     ensures PDF viewers advance each glyph individually using the
     font's /W table rather than interpreting one long byte string.
 
@@ -590,10 +612,6 @@ def _encode_line_as_tj(
     Args:
         line: Text for this line.
         resolver: FontResolver for encoding.
-        width_cache: GlyphWidthCache for per-glyph width lookups (CID only).
-        page: PDF page for width lookup (CID only).
-        font_name: Font resource name.
-        font_size: Font size in points.
 
     Returns:
         Tuple of (operands, operator) for a Tj or TJ instruction.
@@ -661,10 +679,6 @@ def _build_replacement_ops(
     Returns:
         List of (operands, operator) tuples for the replacement block.
     """
-    width_cache: GlyphWidthCache | None = None
-    if resolver.is_cid_font and page is not None:
-        width_cache = GlyphWidthCache()
-
     extra = extra_resolvers or {}
     body_font_ref = pikepdf.Name("/" + font_name)
     new_ops: list[tuple[list[Any], Any]] = []
@@ -732,10 +746,6 @@ def _build_replacement_ops(
         _encode_line_as_tj(
             line=lines[0],
             resolver=current_resolver,
-            width_cache=width_cache,
-            page=page,
-            font_name=current_font,
-            font_size=font_size,
         ),
     )
 
@@ -783,10 +793,6 @@ def _build_replacement_ops(
                 _encode_line_as_tj(
                     line=marker_char,
                     resolver=marker_resolver,
-                    width_cache=width_cache,
-                    page=page,
-                    font_name=marker_font,
-                    font_size=font_size,
                 ),
             )
             # Position body text after marker
@@ -805,10 +811,6 @@ def _build_replacement_ops(
                     _encode_line_as_tj(
                         line=rest,
                         resolver=resolver,
-                        width_cache=width_cache,
-                        page=page,
-                        font_name=font_name,
-                        font_size=font_size,
                     ),
                 )
             current_font = font_name
@@ -830,10 +832,6 @@ def _build_replacement_ops(
                 _encode_line_as_tj(
                     line=line.lstrip(),
                     resolver=resolver,
-                    width_cache=width_cache,
-                    page=page,
-                    font_name=font_name,
-                    font_size=font_size,
                 ),
             )
         else:
@@ -849,10 +847,6 @@ def _build_replacement_ops(
                 _encode_line_as_tj(
                     line=line,
                     resolver=current_resolver,
-                    width_cache=width_cache,
-                    page=page,
-                    font_name=font_name,
-                    font_size=font_size,
                 ),
             )
 
@@ -873,6 +867,7 @@ def reflow_paragraph(
     new_text: str,
     font_resolver: FontResolver,
     font_ref: pikepdf.Object,
+    resolver_cache: FontResolverCache | None = None,
 ) -> EditResult:
     """Replace matched text within a paragraph, reflow, and rewrite operators.
 
@@ -887,11 +882,33 @@ def reflow_paragraph(
         new_text: Replacement text.
         font_resolver: FontResolver for the paragraph's font.
         font_ref: Raw font reference from page Resources.
+        resolver_cache: Caller-owned cache. After font extension we evict and
+            re-fetch through this cache so the caller sees the updated
+            resolver state on subsequent matches (ARY-283). When ``None``
+            (the backward-compatible default for pre-0.1.2 external
+            callers), a fresh per-call cache is constructed internally —
+            the per-call ownership invariant still holds, it just isn't
+            visible to the caller.
 
     Returns:
         EditResult with fidelity report (reflow_applied=True).
     """
-    from typing import Literal as Lit
+    # Preserve the 0.1.1 public signature. When the caller does not pass a
+    # cache, construct one internally — per-call ownership is maintained.
+    from pdf_edit_engine.encoding import FontResolverCache as _FontResolverCache
+
+    if resolver_cache is None:
+        resolver_cache = _FontResolverCache()
+
+    # INV-B-3 contract: reflow_paragraph is a public API entry that
+    # consumes a TextMatch. Refuse stale matches so the caller cannot
+    # silently reflow with operator_refs that no longer point at
+    # match.matched_text. The single-helper-per-entry pattern in
+    # surgeon.py is replicated here for defense in depth.
+    from pdf_edit_engine.surgeon import _assert_match_addressable
+
+    _ops_for_validation = list(pikepdf.parse_content_stream(page))
+    _assert_match_addressable(_ops_for_validation, match, font_resolver)
 
     # 1. Substitute text in paragraph, then join lines for proper reflow.
     # The \n in full_text are artifacts of element grouping, not hard breaks.
@@ -909,18 +926,28 @@ def reflow_paragraph(
 
     # 3. Check encoding on the actual line content, extend font if needed
     all_line_text = " ".join(lines)
-    font_action: Lit["kept", "extended", "substituted", "failed"] = "kept"
+    font_action: Literal["kept", "extended", "substituted", "failed"] = "kept"
     can_enc, missing = font_resolver.can_encode(all_line_text)
+    # INV-C-4 plumbing: capture metric-equivalent substitution events.
+    substitution_log: list[str] = []
 
     if not can_enc:
         try:
             from pdf_edit_engine.fonts import extend_subset
 
             font_name = paragraph.font_name
-            extend_subset(pdf, page, font_name, "".join(missing))
-            # Refresh resolver after extension
-            cache = FontResolverCache()
-            font_resolver = cache.get_resolver(page, font_name)
+            extend_subset(
+                pdf,
+                page,
+                font_name,
+                "".join(missing),
+                substitution_log=substitution_log,
+            )
+            # Refresh resolver through the caller's cache: evict the stale
+            # entry so the next caller (and our re-fetch below) sees the
+            # post-extension font state. See ARY-283.
+            resolver_cache.evict(page, font_name)
+            font_resolver = resolver_cache.get_resolver(page, font_name)
             can_enc_after, still_missing = font_resolver.can_encode(all_line_text)
             if not can_enc_after:
                 return EditResult(
@@ -941,7 +968,7 @@ def reflow_paragraph(
                 "Font extension succeeded for %d missing chars during reflow",
                 len(missing),
             )
-        except (FontNotFoundError, EncodingError, OSError):
+        except _FONT_EXTEND_FAIL_EXCS:
             logger.warning("Font extension failed during reflow", exc_info=True)
             return EditResult(
                 success=False,
@@ -967,7 +994,80 @@ def reflow_paragraph(
     # 6. Get fill color from paragraph's first element
     fill_color = paragraph.elements[0].graphics_state.fill_color
 
-    # 7. Build replacement operators
+    # 7. Overflow shift — when the replacement produces more lines than
+    # the original paragraph occupied, shift content below the paragraph
+    # down to make room. Without this, the extra lines land on top of
+    # whatever was already there and the visible output garbles (the
+    # actual ARY-277 symptom: "Konstantinidis" ending up mid-paragraph
+    # of unrelated text because its second reflow line overlapped
+    # a different paragraph's y-band).
+    extra_lines = len(lines) - paragraph.line_count
+    overflow = extra_lines > 0
+    shift_warnings: list[str] = []
+    if overflow:
+        # Import locally to avoid cross-module boundary noise at import
+        # time. structural owns the shift primitive; we borrow it.
+        from pdf_edit_engine.locator import _build_index as _reflow_build_index
+        from pdf_edit_engine.structural import _shift_content_below_inplace
+
+        requested_shift = extra_lines * paragraph.line_height
+        shift_amount = requested_shift
+        # y_threshold is the bottom edge of the paragraph; everything
+        # below that is shifted.
+        paragraph_bottom_y = (
+            paragraph.first_line_y
+            - (paragraph.line_count - 1) * paragraph.line_height
+            - (paragraph.font_size * 0.25)
+        )
+        # Page-bottom clamp — mirrors structural._replace_block_on_page so
+        # an overflow that would push content below MediaBox[1] is either
+        # clamped (content sits at the page edge) or suppressed
+        # (no room available). Either way the user gets a warning
+        # instead of silently-lost content (ultrareview merged_bug_003).
+        mediabox = page.get("/MediaBox")
+        if mediabox is not None:
+            page_bottom = float(mediabox[1])
+            elements_below = [
+                e
+                for e in _reflow_build_index(page, paragraph.elements[0].page)
+                if e.bbox[1] < paragraph_bottom_y
+            ]
+            if elements_below:
+                lowest_y = min(e.bbox[1] for e in elements_below)
+                max_safe_shift = lowest_y - page_bottom
+                if max_safe_shift <= 0:
+                    shift_warnings.append(
+                        f"Overflow shift suppressed — no room below paragraph "
+                        f"(wanted {requested_shift:.1f}pt, page has 0pt available)",
+                    )
+                    shift_amount = 0.0
+                elif requested_shift > max_safe_shift:
+                    shift_warnings.append(
+                        f"Overflow shift clamped from {requested_shift:.1f}pt "
+                        f"to {max_safe_shift:.1f}pt to keep content on-page",
+                    )
+                    shift_amount = max_safe_shift
+            else:
+                # Nothing below the paragraph to shift — no collision risk.
+                shift_amount = 0.0
+
+        if shift_amount > 0:
+            shift_warnings.extend(
+                _shift_content_below_inplace(
+                    pdf,
+                    page,
+                    paragraph.elements[0].page,
+                    paragraph_bottom_y,
+                    shift_amount,
+                )
+            )
+            # Re-parse ops after the shift mutated page.Contents. The shift
+            # modifies operand values, not operator counts, so our
+            # paragraph.operator_indices and removal_indices (derived from
+            # the pre-shift build_index) stay valid.
+            ops = list(pikepdf.parse_content_stream(page))
+
+    # 8. Build replacement operators
     replacement = _build_replacement_ops(
         lines=lines,
         font_name=paragraph.font_name,
@@ -980,7 +1080,7 @@ def reflow_paragraph(
         page=page,
     )
 
-    # 8. Splice: remove old operators, insert replacement
+    # 9. Splice: remove old operators, insert replacement
     removal_set = set(removal_indices)
     insert_pos = min(removal_set)
     new_ops: _Ops = []
@@ -992,15 +1092,13 @@ def reflow_paragraph(
         if i not in removal_set:
             new_ops.append(op)
 
-    # 9. Write back content stream
+    # 10. Write back content stream
     new_stream = pikepdf.unparse_content_stream(new_ops)
     page.Contents = pdf.make_stream(new_stream)
 
-    # 10. Overflow detection
-    overflow = len(lines) > paragraph.line_count
-
-    # 11. Warnings
-    warnings: list[str] = []
+    # 11. Warnings — propagate shift warnings from step 7 so callers see
+    # page-boundary overflows and clamps instead of silently-lost content.
+    warnings: list[str] = list(shift_warnings)
     fonts_in_para = {e.characters[0].font_name for e in paragraph.elements if e.characters}
     if len(fonts_in_para) > 1:
         warnings.append("Mixed-font paragraph: reflowed using single font")
@@ -1013,7 +1111,8 @@ def reflow_paragraph(
         warnings=warnings,
         fidelity_report=FidelityReport(
             font_preserved=True,
-            font_substituted=None,
+            # INV-C-4: surface metric-equivalent if any was used.
+            font_substituted=substitution_log[0] if substitution_log else None,
             overflow_detected=overflow,
             reflow_applied=True,
             glyphs_missing=[],

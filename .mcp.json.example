@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "pdf-edit-mcp": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/absolute/path/to/pdf-edit-mcp/dist/index.js"],
+      "env": {
+        "PDF_EDIT_PYTHON": "/absolute/path/to/python"
+      }
+    }
+  }
+}

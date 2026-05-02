@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import logging
-import pathlib
 from collections import defaultdict
-from typing import Any
+from typing import Any, Literal
 
 import pikepdf
 
-from pdf_edit_engine._pathutil import validate_output_path
+from pdf_edit_engine._pathutil import open_pdf, validate_output_path
 from pdf_edit_engine.encoding import FontResolver, FontResolverCache
 from pdf_edit_engine.errors import (
     EncodingError,
@@ -34,37 +33,141 @@ logger = logging.getLogger(__name__)
 # Using Any avoids fighting pikepdf's pybind11 typing.
 _Ops = list[Any]
 
-# ── Module-level caches ─────────────────────────────────────────────────
+
+# ── Cache ownership policy (ARY-283) ─────────────────────────────────────
 #
-# Singletons that persist across calls for same-PDF performance.
-# Cleared automatically when the public API detects a different PDF path.
-
-_width_cache = GlyphWidthCache()
-_resolver_cache = FontResolverCache()
-_cached_pdf_path: str | None = None
-
-
-def _ensure_caches_for_pdf(pdf_path: str) -> None:
-    """Clear module-level caches if the PDF path has changed.
-
-    Prevents cross-PDF leaks: GlyphWidthCache keys on font resource
-    names (e.g. ``"F1"``) which are PDF-local — different PDFs reuse
-    the same names for different fonts.
-    """
-    global _cached_pdf_path  # noqa: PLW0603
-    resolved = str(pathlib.Path(pdf_path).resolve())
-    if resolved != _cached_pdf_path:
-        _cached_pdf_path = resolved
-        _width_cache.clear()
-        _resolver_cache.clear()
+# This module holds NO cache state. Each public entrypoint (`replace`,
+# `replace_all`, `batch_replace`) constructs a fresh `FontResolverCache`
+# and `GlyphWidthCache` at entry and threads both through all internal
+# helpers as explicit parameters. Two reasons:
+#
+#   1. Coherency.  When `extend_subset` mutates a font, only the cache
+#      that evicts sees a fresh resolver. Threading a single cache per
+#      call avoids any cross-module staleness between `surgeon` and
+#      `structural`.
+#   2. Thread-safety.  Fresh per-call caches are trivially isolated.
+#
+# The ephemeral cost (one font-parse per public call) is negligible at
+# typical edit volumes and was previously absorbed by invalidation
+# boilerplate (`_ensure_caches_for_pdf`, `_cached_pdf_path`) anyway.
 
 
 # ── Private helpers ──────────────────────────────────────────────────────
 
 
-def _get_font_resolver(page: pikepdf.Page, font_name: str) -> FontResolver:
+def _get_font_resolver(
+    page: pikepdf.Page,
+    font_name: str,
+    resolver_cache: FontResolverCache,
+) -> FontResolver:
     """Build a FontResolver for the given font on the page."""
-    return _resolver_cache.get_resolver(page, font_name)
+    return resolver_cache.get_resolver(page, font_name)
+
+
+def _assert_match_addressable(
+    ops: _Ops,
+    match: TextMatch,
+    resolver: FontResolver,
+) -> None:
+    """INV-B-3 contract enforcement.
+
+    A ``TextMatch`` returned from :func:`pdf_edit_engine.find` captures
+    ``(operator_index, byte_position, tj_fragment_index)`` triples that
+    point into the content-stream snapshot at the moment of the find.
+    If the caller mutates the PDF (e.g. ``replace_all``) and then re-uses
+    a previously-collected match against the new file, those indices
+    silently address into operators whose text has changed — ``replace``
+    would dutifully splice over the wrong bytes.
+
+    This guard runs at every public-API entry point that consumes a
+    ``TextMatch`` (``surgeon.replace``, ``reflow.reflow_paragraph``).
+    On stale input it raises ``OperatorError`` with a re-run-find()
+    instruction; on fresh input it is essentially free (a single op
+    lookup + one byte-slice decode).
+
+    Args:
+        ops: Parsed content-stream instructions for the match's page.
+        match: The ``TextMatch`` to validate.
+        resolver: ``FontResolver`` for the match's font, used to decode
+            the captured byte-slice back to its Unicode character.
+
+    Raises:
+        OperatorError: If any character in ``match`` no longer resolves
+            to its recorded ``unicode_char`` against the current ops.
+    """
+    if not match.characters:
+        return  # empty match cannot be addressable
+
+    bw = resolver.byte_width
+    first = match.characters[0]
+    op_idx = first.operator_index
+    if op_idx < 0 or op_idx >= len(ops):
+        raise OperatorError(
+            f"Stale TextMatch: operator index {op_idx} out of range "
+            f"(content stream has {len(ops)} ops). The PDF appears to "
+            f"have been modified since find() was called — re-run find() "
+            f"against the current PDF state."
+        )
+    inst = ops[op_idx]
+    operator = str(inst.operator if hasattr(inst, "operator") else inst[1])
+    operands = inst.operands if hasattr(inst, "operands") else inst[0]
+    if operator not in ("Tj", "TJ", "'", '"'):
+        raise OperatorError(
+            f"Stale TextMatch: operator at index {op_idx} is {operator!r}; "
+            f"expected a text-showing operator (Tj/TJ). Re-run find() "
+            f"against the current PDF state."
+        )
+
+    # Recover the raw bytes at the recorded fragment.
+    raw: bytes | None = None
+    try:
+        if operator == "TJ":
+            tj_items = list(operands[0])
+            if first.tj_fragment_index is None:
+                return  # legacy match without fragment indexing — skip
+            count = 0
+            for item in tj_items:
+                if isinstance(item, pikepdf.String):
+                    if count == first.tj_fragment_index:
+                        raw = bytes(item)
+                        break
+                    count += 1
+        else:
+            # Tj / ' / " — single string operand
+            raw = bytes(operands[0])
+    except (IndexError, AttributeError, TypeError) as exc:
+        raise OperatorError(
+            f"Stale TextMatch: failed to read operand at op {op_idx} "
+            f"({type(exc).__name__}). Re-run find()."
+        ) from exc
+
+    if raw is None:
+        raise OperatorError(
+            f"Stale TextMatch: tj_fragment_index "
+            f"{first.tj_fragment_index} not found in op {op_idx}. "
+            f"Re-run find()."
+        )
+
+    bp = first.byte_position
+    if bp < 0 or bp + bw > len(raw):
+        raise OperatorError(
+            f"Stale TextMatch: byte_position {bp} out of range for "
+            f"operand of length {len(raw)} at op {op_idx}. Re-run find()."
+        )
+    try:
+        decoded = resolver.decode(raw[bp : bp + bw])
+    except KeyError as exc:
+        raise OperatorError(
+            f"Stale TextMatch: bytes at op {op_idx} byte {bp} cannot be "
+            f"decoded by the current font ({exc}). Re-run find()."
+        ) from exc
+    if decoded != first.unicode_char:
+        raise OperatorError(
+            f"Stale TextMatch: op {op_idx} now decodes to "
+            f"{decoded!r}, expected {first.unicode_char!r}. The PDF was "
+            f"modified since find() was called — re-run find() against "
+            f"the current PDF state."
+        )
 
 
 def _nth_string_index(tj_items: list[object], frag_idx: int) -> int:
@@ -316,6 +419,13 @@ def _calculate_new_width(
 
     Returns:
         Total width in page-space units.
+
+    Raises:
+        KeyError: When *new_text* contains characters the resolver
+            cannot encode. The caller is responsible for handling
+            this (either by extending the font or by skipping the
+            width-based reflow decision — see ARY-282 in CHANGELOG
+            for the decision rationale).
     """
     total = 0.0
     encoded = resolver.encode(new_text)
@@ -392,6 +502,7 @@ def _apply_single_replacement(
     new_text: str,
     resolver: FontResolver,
     width_cache: GlyphWidthCache,
+    resolver_cache: FontResolverCache,
     dry_run: bool,
 ) -> tuple[EditResult, FontResolver]:
     """Core replacement logic shared by replace() and replace_all().
@@ -406,7 +517,8 @@ def _apply_single_replacement(
         match: The text match to replace.
         new_text: Replacement text.
         resolver: FontResolver for the match's font.
-        width_cache: Glyph width cache.
+        width_cache: Glyph width cache (mutated on eviction).
+        resolver_cache: Font resolver cache (mutated on eviction).
         dry_run: If True, skip actual modifications.
 
     Returns:
@@ -414,8 +526,6 @@ def _apply_single_replacement(
         after font extension — callers should use the returned resolver
         for subsequent operations.
     """
-    from typing import Literal as Lit
-
     # Always derive the resolver from the match's own font. Callers such
     # as replace_all() iterate over matches on a page and may pass in a
     # resolver from the previous iteration that belongs to a different
@@ -425,11 +535,15 @@ def _apply_single_replacement(
     # A's CIDs into font B's content-stream operator. Fetching from the
     # cache here is cheap when the match reuses the previous font.
     match_font_name = match.characters[0].font_name
-    resolver = _get_font_resolver(page, match_font_name)
+    resolver = _get_font_resolver(page, match_font_name, resolver_cache)
 
     # Check encodability
     can_enc, missing = resolver.can_encode(new_text)
-    font_action: Lit["kept", "extended", "substituted", "failed"] = "kept"
+    font_action: Literal["kept", "extended", "substituted", "failed"] = "kept"
+    # INV-C-4: collect metric-equivalent substitution events from
+    # extend_subset so the resulting EditResult can surface the
+    # substitution via FidelityReport.font_substituted.
+    substitution_log: list[str] = []
 
     if not can_enc:
         # Attempt automatic font extension
@@ -437,14 +551,20 @@ def _apply_single_replacement(
             from pdf_edit_engine.fonts import extend_subset
 
             font_name = match.characters[0].font_name
-            tier = extend_subset(pdf, page, font_name, "".join(missing))
+            tier = extend_subset(
+                pdf,
+                page,
+                font_name,
+                "".join(missing),
+                substitution_log=substitution_log,
+            )
             # Evict stale resolver so _get_font_resolver re-parses
-            _resolver_cache.evict(page, font_name)
+            resolver_cache.evict(page, font_name)
             # Evict stale width cache entry: extend_subset adds new CIDs
-            # to /W, but _width_cache holds the pre-extension dict and
+            # to /W, but width_cache holds the pre-extension dict and
             # would return DEFAULT_WIDTH (600) for newly-added CIDs.
-            _width_cache.evict(font_name)
-            resolver = _get_font_resolver(page, font_name)
+            width_cache.evict(font_name)
+            resolver = _get_font_resolver(page, font_name, resolver_cache)
             can_enc_after, still_missing = resolver.can_encode(new_text)
             if not can_enc_after:
                 return EditResult(
@@ -688,7 +808,8 @@ def _apply_single_replacement(
         font_action=font_action,
         fidelity_report=FidelityReport(
             font_preserved=True,
-            font_substituted=None,
+            # INV-C-4: surface the metric-equivalent name (if any).
+            font_substituted=substitution_log[0] if substitution_log else None,
             overflow_detected=overflow,
             reflow_applied=False,
             glyphs_missing=[],
@@ -856,10 +977,15 @@ def replace(
         PDFEditError: If the PDF is encrypted.
         OperatorError: If operator references are stale or invalid.
     """
-    _ensure_caches_for_pdf(pdf_path)
     if not dry_run:
         validate_output_path(output_path)
-    pdf = pikepdf.Pdf.open(pdf_path)
+
+    # Per-call caches (ARY-283): every public entrypoint owns its caches
+    # and threads them to helpers; no module-level shared state.
+    resolver_cache = FontResolverCache()
+    width_cache = GlyphWidthCache()
+
+    pdf = open_pdf(pdf_path)
     try:
         if pdf.is_encrypted:
             raise PDFEditError("Cannot edit encrypted PDF")
@@ -871,7 +997,17 @@ def replace(
 
         page = pdf.pages[match.page_number]
         font_name = match.characters[0].font_name
-        resolver = _get_font_resolver(page, font_name)
+        resolver = _get_font_resolver(page, font_name, resolver_cache)
+
+        # INV-B-3: refuse stale TextMatch input. Parse the current
+        # content-stream and verify that match.operator_refs still
+        # address the recorded matched_text. If the PDF was mutated
+        # since find() was called, operator indices may now point at
+        # unrelated text — silently splicing over them would corrupt
+        # the output. The parsed ops are reused below for the simple-
+        # replace path, so this validation is essentially free.
+        ops = list(pikepdf.parse_content_stream(page))
+        _assert_match_addressable(ops, match, resolver)
 
         # Check if reflow is needed: replacement wider than original
         if reflow:
@@ -883,12 +1019,20 @@ def replace(
                     font_name,
                     match.characters[0].font_size,
                     resolver,
-                    _width_cache,
+                    width_cache,
                 )
-                # Only reflow if meaningfully wider (>1pt avoids trivial diffs)
+                # Only reflow if meaningfully wider (>1pt avoids trivial diffs).
                 needs_reflow = new_width > old_width + 1.0
             except (KeyError, EncodingError, FontNotFoundError):
-                # Encoding failure — skip reflow, let simple replacement handle it
+                # Encoding failure (KeyError from resolver.encode when the
+                # replacement needs glyphs outside the embedded subset) or
+                # width-lookup failure — route to simple replacement, which
+                # has its own extension path in _apply_single_replacement.
+                # This is ARY-282 design: when we cannot cheaply compute
+                # new_width, we defer the decision to simple-replace rather
+                # than unconditionally triggering reflow (reflow would
+                # invalidate operator_refs of subsequent matches in
+                # replace_all's multi-match-per-page loop).
                 needs_reflow = False
             if needs_reflow:
                 try:
@@ -900,11 +1044,7 @@ def replace(
                     )
 
                     elements = _build_index(page, match.page_number)
-                    page_width = float(page.MediaBox[2]) if page.MediaBox else 612.0
-                    paragraphs = _detect_paragraphs_from_index(
-                        elements,
-                        page_width,
-                    )
+                    paragraphs = _detect_paragraphs_from_index(elements)
                     para = find_paragraph_for_match(paragraphs, match)
 
                     if para is not None:
@@ -918,6 +1058,7 @@ def replace(
                             new_text,
                             resolver,
                             font_ref,
+                            resolver_cache,
                         )
                         if result.success and not dry_run:
                             pdf.save(output_path)
@@ -929,8 +1070,7 @@ def replace(
                         exc_info=True,
                     )
 
-        ops = list(pikepdf.parse_content_stream(page))
-
+        # ops already parsed above for the addressability check; reuse it.
         result, _ = _apply_single_replacement(
             pdf,
             page,
@@ -938,7 +1078,8 @@ def replace(
             match,
             new_text,
             resolver,
-            _width_cache,
+            width_cache,
+            resolver_cache,
             dry_run,
         )
 
@@ -960,11 +1101,13 @@ def _try_reflow_match(
     page_num: int,
     match: TextMatch,
     new_text: str,
+    resolver_cache: FontResolverCache,
+    width_cache: GlyphWidthCache,
 ) -> EditResult | None:
     """Attempt reflow for a single match.  Returns EditResult on success, None on failure."""
     try:
         font_name = match.characters[0].font_name
-        resolver = _get_font_resolver(page, font_name)
+        resolver = _get_font_resolver(page, font_name, resolver_cache)
         old_width = sum(ch.width for ch in match.characters)
         new_width = _calculate_new_width(
             new_text,
@@ -972,7 +1115,7 @@ def _try_reflow_match(
             font_name,
             match.characters[0].font_size,
             resolver,
-            _width_cache,
+            width_cache,
         )
         if new_width <= old_width + 1.0:
             return None  # not meaningfully wider
@@ -985,15 +1128,16 @@ def _try_reflow_match(
         )
 
         elements = _build_index(page, page_num)
-        page_width = float(page.MediaBox[2]) if page.MediaBox else 612.0
-        paragraphs = _detect_paragraphs_from_index(elements, page_width)
+        paragraphs = _detect_paragraphs_from_index(elements)
         para = find_paragraph_for_match(paragraphs, match)
         if para is None:
             return None
 
         font_key = font_name if font_name.startswith("/") else f"/{font_name}"
         font_ref = page["/Resources"]["/Font"][font_key]
-        result = reflow_paragraph(pdf, page, para, match, new_text, resolver, font_ref)
+        result = reflow_paragraph(
+            pdf, page, para, match, new_text, resolver, font_ref, resolver_cache
+        )
         return result if result.success else None
     except (ReflowError, OperatorError, EncodingError, FontNotFoundError, KeyError, ValueError):
         logger.warning("Reflow failed, falling back to simple replacement", exc_info=True)
@@ -1022,7 +1166,6 @@ def replace_all(
     Returns:
         List of EditResult objects, one per match.
     """
-    _ensure_caches_for_pdf(pdf_path)
     if not dry_run:
         validate_output_path(output_path)
     from pdf_edit_engine.locator import find
@@ -1031,7 +1174,11 @@ def replace_all(
     if not matches:
         return []
 
-    pdf = pikepdf.Pdf.open(pdf_path)
+    # Per-call caches (ARY-283)
+    resolver_cache = FontResolverCache()
+    width_cache = GlyphWidthCache()
+
+    pdf = open_pdf(pdf_path)
     try:
         if pdf.is_encrypted:
             raise PDFEditError("Cannot edit encrypted PDF")
@@ -1051,6 +1198,7 @@ def replace_all(
             resolver = _get_font_resolver(
                 page,
                 matches_by_page[page_num][0].characters[0].font_name,
+                resolver_cache,
             )
 
             # Sort matches in reverse operator order to preserve indices
@@ -1072,6 +1220,8 @@ def replace_all(
                         page_num,
                         m,
                         replacement,
+                        resolver_cache,
+                        width_cache,
                     )
                     if reflow_result is not None:
                         page_results.append(reflow_result)
@@ -1089,7 +1239,8 @@ def replace_all(
                         m,
                         replacement,
                         resolver,
-                        _width_cache,
+                        width_cache,
+                        resolver_cache,
                         dry_run,
                     )
                 except OperatorError:
@@ -1143,12 +1294,15 @@ def batch_replace(
     Returns:
         List of EditResult objects, one per edit.
     """
-    _ensure_caches_for_pdf(pdf_path)
     if not dry_run:
         validate_output_path(output_path)
     from pdf_edit_engine.locator import find
 
-    pdf = pikepdf.Pdf.open(pdf_path)
+    # Per-call caches (ARY-283)
+    resolver_cache = FontResolverCache()
+    width_cache = GlyphWidthCache()
+
+    pdf = open_pdf(pdf_path)
     try:
         if pdf.is_encrypted:
             raise PDFEditError("Cannot edit encrypted PDF")
@@ -1201,7 +1355,9 @@ def batch_replace(
 
                 # Attempt reflow for the first qualifying match per page
                 if reflow and not dry_run and not page_reflowed:
-                    reflow_result = _try_reflow_match(pdf, page, page_num, m, repl)
+                    reflow_result = _try_reflow_match(
+                        pdf, page, page_num, m, repl, resolver_cache, width_cache
+                    )
                     if reflow_result is not None:
                         edit_results[edit_idx].append(reflow_result)
                         used_ops_by_page[page_num].update(m.operator_refs)
@@ -1210,7 +1366,7 @@ def batch_replace(
                         ops = list(pikepdf.parse_content_stream(page))
                         continue
 
-                resolver = _get_font_resolver(page, m.characters[0].font_name)
+                resolver = _get_font_resolver(page, m.characters[0].font_name, resolver_cache)
                 try:
                     result, resolver = _apply_single_replacement(
                         pdf,
@@ -1219,7 +1375,8 @@ def batch_replace(
                         m,
                         repl,
                         resolver,
-                        _width_cache,
+                        width_cache,
+                        resolver_cache,
                         dry_run,
                     )
                 except OperatorError:
@@ -1267,12 +1424,13 @@ def batch_replace(
 
 
 def _invalidate_locator_cache() -> None:
-    """Clear the locator module's content element cache and surgeon caches."""
-    global _cached_pdf_path  # noqa: PLW0603
+    """Clear the locator module's content element cache after a content-stream edit.
+
+    The locator is the only remaining shared cache across public calls —
+    this module's resolver/width caches live for the duration of one
+    public call and are garbage-collected when it returns.
+    """
     from pdf_edit_engine import locator
 
     locator._cached_path = None  # noqa: SLF001
     locator._cached_elements = {}  # noqa: SLF001
-    _cached_pdf_path = None
-    _width_cache.clear()
-    _resolver_cache.clear()

@@ -1,0 +1,30 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    # Group runtime + dev deps separately so security floors
+    # (lxml>=6.1.0, pytest>=9.0.3) stay reviewable in isolation.
+    groups:
+      runtime:
+        patterns:
+          - "pikepdf"
+          - "fonttools"
+          - "pdfminer.six"
+          - "lxml"
+      dev:
+        patterns:
+          - "pytest*"
+          - "ruff"
+          - "mypy"
+          - "reportlab"
+          - "psutil"
+          - "pip-audit"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3

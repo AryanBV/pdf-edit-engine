@@ -75,11 +75,8 @@ class TestReplaceBlock:
         assert result.success
         assert result.fidelity_report.overflow_detected
 
-    def test_replace_block_empty_bbox(self, tmp_path: Path) -> None:
-        """Replacing in an empty region returns failure gracefully."""
-        out = str(tmp_path / "empty.pdf")
-        result = replace_block(SIMPLE_PDF, 0, (0, 0, 1, 1), "text", out)
-        assert not result.success
+    # test_replace_block_empty_bbox removed — strict subset of
+    # tests/invariants/test_f_1_replace_block_empty_clears.py.
 
     def test_replace_block_returns_edit_result(self, tmp_path: Path) -> None:
         """Result includes original and new text."""
@@ -328,11 +325,9 @@ class TestBatchReplaceBlock:
         assert "expanded" in text
         assert "Still correct" in text
 
-    def test_batch_empty_list(self, tmp_path: Path) -> None:
-        """Empty replacements returns empty list."""
-        out = str(tmp_path / "empty.pdf")
-        results = batch_replace_block(SIMPLE_PDF, 0, [], out)
-        assert results == []
+    # test_batch_empty_list removed — strict subset of
+    # tests/invariants/test_f_3_batch_replace_block_empty.py
+    # (which additionally asserts no output file is created).
 
 
 # ── TestShiftContent ─────────────────────────────────────────────────

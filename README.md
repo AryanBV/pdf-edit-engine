@@ -4,7 +4,8 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://github.com/AryanBV/pdf-edit-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/AryanBV/pdf-edit-engine/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-85%25-yellowgreen)]()
+[![Coverage](https://img.shields.io/badge/coverage-88%25-yellowgreen)]()
+[![Audit suite](https://img.shields.io/badge/invariants-81%20probes-blueviolet)]()
 
 Format-preserving PDF text editing. Modify text in existing PDFs at the content stream level — fonts, layout, and spacing stay intact.
 
@@ -61,7 +62,7 @@ class FidelityReport:
     glyphs_missing: list[str]   # Characters that couldn't be rendered
 ```
 
-Automated pipelines and AI agents inspect these fields to verify edit quality programmatically — no manual PDF review needed. All edit functions also support `dry_run=True` to preview the report without writing to disk.
+Automated pipelines and AI agents inspect these fields to verify edit quality programmatically — no manual PDF review needed. The text-replace functions (`replace`, `replace_all`, `batch_replace`) support `dry_run=True` to preview the report without writing to disk.
 
 ## Comparison
 
@@ -83,12 +84,12 @@ Automated pipelines and AI agents inspect these fields to verify edit quality pr
 | Search | `find`, `get_text`, `get_text_layout`, `get_fonts`, `extract_bbox_text` | Locate text with operator-level precision, extract positioned blocks |
 | Replace | `replace`, `replace_all`, `batch_replace` | Format-preserving replacement with kerning distribution |
 | Structural | `replace_block`, `batch_replace_block`, `delete_block`, `insert_text_block` | Bbox-based content block operations |
-| Fonts | `analyze_subset`, `can_render`, `extend_subset` | Two-tier font extension (CMap-only fast path + full re-embed) |
+| Fonts | `analyze_subset`, `can_render`, `extend_subset` | Two-tier font extension (CMap-only fast path + Tier 1.5 in-place glyph injection) |
 | Reflow | `detect_paragraphs`, `reflow_paragraph` | Paragraph detection and greedy line-breaking |
 | PDF ops | `merge_pdfs`, `split_pdf`, `rotate_pages`, `encrypt_pdf`, +11 more | 15 pikepdf wrappers for document manipulation |
 | Annotations | `get_annotations`, `add_annotation`, `update_annotation_uri`, `delete_annotation`, `move_annotation` | Read, create, modify, remove annotations |
 
-All edit functions support `dry_run=True` to preview changes without writing.
+The text-replace functions (`replace`, `replace_all`, `batch_replace`) support `dry_run=True` to preview changes without writing.
 
 ## Usage examples
 
@@ -125,7 +126,7 @@ For structural editing, annotations, reflow, and all 15 PDF operations, see the 
 1. **Index** — `find()` interprets content stream operators (BT/ET blocks), tracking graphics state through each page
 2. **Match** — Characters assembled into a string; position-aware matching locates the target across split operators
 3. **Encode** — Replacement text encoded using the font's CID mapping (Identity-H) or byte encoding (WinAnsi), with micro-kerning distributed across glyphs to match original text width
-4. **Extend** — If new text needs glyphs not in the font's CMap, the subset is extended: CMap-only when glyphs exist in the font binary, full re-embed (with `--retain-gids`) when they don't
+4. **Extend** — If new text needs glyphs not in the font's CMap, the subset is extended: CMap-only when glyphs exist in the font binary, Tier 1.5 in-place glyph injection (the existing `/FontFile2` is loaded with fontTools, the missing glyph outline is appended, and the font is re-serialized) when they don't. Tier 1.5 preserves every pre-existing CID → glyph mapping
 5. **Reflow** — If replacement is wider than the original, the containing paragraph is reflowed with greedy line breaking
 6. **Serialize** — Modified operators re-serialized via `pikepdf.unparse_content_stream()` and saved
 
@@ -154,7 +155,7 @@ For structural editing, annotations, reflow, and all 15 PDF operations, see the 
 
 **surgeon** — Content stream modification with Identity-H CID encoding and kerning-aware replacement.
 
-**fonts** — Font analysis and subset extension. Two-tier: CMap-only fast path when glyphs exist in embedded font, full re-embed when they don't.
+**fonts** — Font analysis and subset extension. Two-tier: CMap-only fast path when glyphs exist in embedded font; Tier 1.5 in-place glyph injection (preserves pre-existing CIDs) when they don't.
 
 **reflow** — Paragraph reflow using fonttools for glyph metrics and greedy line breaking.
 
@@ -201,6 +202,20 @@ CI runs on Python 3.12 and 3.13. The test suite validates against PDFs from mult
 | Google Docs | Identity-H | 100% |
 | reportlab (4 variants) | WinAnsi | 100% |
 | pikepdf (synthetic) | WinAnsi | 100% |
+
+## Audit suite
+
+Beyond ~660 conventional unit tests, the engine ships **81 invariant probes** under
+`tests/invariants/` covering 14 layers (encoding, content stream, font, locator,
+surgeon, structural, reflow, wrapper, annotations, fidelity contract, public API,
+error hierarchy, security, differential vs pdfminer.six). Each probe quotes the
+invariant claim verbatim in its docstring and runs as part of `make test`. The
+probes were generated by the v0.1.2 release-gate audits — see
+`docs/audit-findings-v0.1.2.md`, `docs/security-review-v0.1.2.md`, and
+`docs/comprehensive-audit-2026-05-02.md`. 15 violations surfaced across the
+audits (9 in the invariant pass, 6 in the post-audit hardening review), all
+root-fixed structurally rather than patched per call site. The probes are now
+permanent regression guards.
 
 ## Error handling
 

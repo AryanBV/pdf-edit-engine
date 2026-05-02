@@ -6,24 +6,14 @@ from pathlib import Path
 
 import pikepdf
 
-from pdf_edit_engine._pathutil import validate_output_dir, validate_output_path
+from pdf_edit_engine._pathutil import (
+    open_pdf as _open_pdf,
+)
+from pdf_edit_engine._pathutil import (
+    validate_output_dir,
+    validate_output_path,
+)
 from pdf_edit_engine.errors import PDFEditError
-
-
-def _open_pdf(path: str, **kwargs: object) -> pikepdf.Pdf:
-    """Open a PDF file, translating pikepdf errors to PDFEditError."""
-    try:
-        return pikepdf.Pdf.open(path, **kwargs)  # type: ignore[arg-type]
-    except pikepdf.PasswordError:
-        raise PDFEditError("PDF is password-protected") from None
-    except pikepdf.PdfError as exc:
-        raise PDFEditError(f"Cannot open PDF: {exc}") from None
-    except FileNotFoundError:
-        raise PDFEditError(f"PDF file not found: {Path(path).name}") from None
-    except IsADirectoryError:
-        raise PDFEditError("Expected a file path, got a directory") from None
-    except PermissionError:
-        raise PDFEditError(f"Permission denied: {Path(path).name}") from None
 
 
 def _validate_page_indices(pages: list[int], total: int, operation: str) -> None:
@@ -51,8 +41,7 @@ def merge_pdfs(pdf_paths: list[str], output_path: str) -> str:
     if not pdf_paths:
         msg = "No PDF paths provided"
         raise PDFEditError(msg)
-    pdf = _open_pdf(pdf_paths[0])
-    try:
+    with _open_pdf(pdf_paths[0]) as pdf:
         others: list[pikepdf.Pdf] = []
         try:
             for path in pdf_paths[1:]:
@@ -63,8 +52,6 @@ def merge_pdfs(pdf_paths: list[str], output_path: str) -> str:
         finally:
             for other in others:
                 other.close()
-    finally:
-        pdf.close()
     return output_path
 
 
@@ -81,8 +68,7 @@ def split_pdf(pdf_path: str, output_dir: str) -> list[str]:
     validate_output_dir(output_dir)
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    pdf = _open_pdf(pdf_path)
-    try:
+    with _open_pdf(pdf_path) as pdf:
         outputs: list[str] = []
         for i, page in enumerate(pdf.pages):
             new_pdf = pikepdf.Pdf.new()
@@ -90,8 +76,6 @@ def split_pdf(pdf_path: str, output_dir: str) -> list[str]:
             out = str(out_dir / f"page_{i}.pdf")
             new_pdf.save(out)
             outputs.append(out)
-    finally:
-        pdf.close()
     return outputs
 
 
@@ -107,15 +91,12 @@ def reorder_pages(pdf_path: str, page_order: list[int], output_path: str) -> str
         Path to the output file.
     """
     validate_output_path(output_path)
-    pdf = _open_pdf(pdf_path)
-    try:
+    with _open_pdf(pdf_path) as pdf:
         _validate_page_indices(page_order, len(pdf.pages), "reorder_pages")
         new_pdf = pikepdf.Pdf.new()
         for i in page_order:
             new_pdf.pages.append(pdf.pages[i])
         new_pdf.save(output_path)
-    finally:
-        pdf.close()
     return output_path
 
 
@@ -135,8 +116,7 @@ def rotate_pages(pdf_path: str, pages: list[int], angle: int, output_path: str) 
     if angle not in (90, 180, 270):
         msg = f"Angle must be 90, 180, or 270, got {angle}"
         raise PDFEditError(msg)
-    pdf = _open_pdf(pdf_path)
-    try:
+    with _open_pdf(pdf_path) as pdf:
         _validate_page_indices(pages, len(pdf.pages), "rotate_pages")
         for i in pages:
             page = pdf.pages[i]
@@ -144,8 +124,6 @@ def rotate_pages(pdf_path: str, pages: list[int], angle: int, output_path: str) 
             existing = int(rotate_val) if rotate_val is not None else 0
             page["/Rotate"] = (existing + angle) % 360
         pdf.save(output_path)
-    finally:
-        pdf.close()
     return output_path
 
 
@@ -161,14 +139,11 @@ def delete_pages(pdf_path: str, pages: list[int], output_path: str) -> str:
         Path to the output file.
     """
     validate_output_path(output_path)
-    pdf = _open_pdf(pdf_path)
-    try:
+    with _open_pdf(pdf_path) as pdf:
         _validate_page_indices(pages, len(pdf.pages), "delete_pages")
         for i in sorted(pages, reverse=True):
             del pdf.pages[i]
         pdf.save(output_path)
-    finally:
-        pdf.close()
     return output_path
 
 
@@ -188,15 +163,12 @@ def crop_pages(
         Path to the output file.
     """
     validate_output_path(output_path)
-    pdf = _open_pdf(pdf_path)
-    try:
+    with _open_pdf(pdf_path) as pdf:
         for page in pdf.pages:
             page["/CropBox"] = pikepdf.Array(
                 [pikepdf.Object.parse(str(v).encode()) for v in box],
             )
         pdf.save(output_path)
-    finally:
-        pdf.close()
     return output_path
 
 
@@ -223,15 +195,12 @@ def edit_metadata(pdf_path: str, metadata: dict[str, str], output_path: str) -> 
         "subject": "dc:description",
         "creator": "xmp:CreatorTool",
     }
-    pdf = _open_pdf(pdf_path)
-    try:
+    with _open_pdf(pdf_path) as pdf:
         with pdf.open_metadata() as meta:
             for key, value in metadata.items():
                 xmp_key = _simple_to_xmp.get(key, key)
                 meta[xmp_key] = value
         pdf.save(output_path)
-    finally:
-        pdf.close()
     return output_path
 
 
@@ -248,13 +217,10 @@ def add_bookmark(pdf_path: str, title: str, page: int, output_path: str) -> str:
         Path to the output file.
     """
     validate_output_path(output_path)
-    pdf = _open_pdf(pdf_path)
-    try:
+    with _open_pdf(pdf_path) as pdf:
         with pdf.open_outline() as outline:
             outline.root.append(pikepdf.OutlineItem(title, page))
         pdf.save(output_path)
-    finally:
-        pdf.close()
     return output_path
 
 
@@ -276,14 +242,11 @@ def encrypt_pdf(
         Path to the output file.
     """
     validate_output_path(output_path)
-    pdf = _open_pdf(pdf_path)
-    try:
+    with _open_pdf(pdf_path) as pdf:
         pdf.save(
             output_path,
             encryption=pikepdf.Encryption(owner=owner_pass, user=user_pass),
         )
-    finally:
-        pdf.close()
     return output_path
 
 
@@ -299,11 +262,8 @@ def decrypt_pdf(pdf_path: str, password: str, output_path: str) -> str:
         Path to the output file.
     """
     validate_output_path(output_path)
-    pdf = _open_pdf(pdf_path, password=password)
-    try:
+    with _open_pdf(pdf_path, password=password) as pdf:
         pdf.save(output_path)
-    finally:
-        pdf.close()
     return output_path
 
 
@@ -330,8 +290,7 @@ def add_hyperlink(
         Path to the output file.
     """
     validate_output_path(output_path)
-    pdf = _open_pdf(pdf_path)
-    try:
+    with _open_pdf(pdf_path) as pdf:
         target_page = pdf.pages[page]
         annot = pdf.make_indirect(
             pikepdf.Dictionary(
@@ -356,8 +315,6 @@ def add_hyperlink(
             target_page["/Annots"] = pikepdf.Array()
         target_page["/Annots"].append(annot)
         pdf.save(output_path)
-    finally:
-        pdf.close()
     return output_path
 
 
@@ -380,8 +337,7 @@ def add_highlight(
         Path to the output file.
     """
     validate_output_path(output_path)
-    pdf = _open_pdf(pdf_path)
-    try:
+    with _open_pdf(pdf_path) as pdf:
         target_page = pdf.pages[page]
         # Derive bounding rect from quad points
         xs = quad_points[0::2]
@@ -406,8 +362,6 @@ def add_highlight(
             target_page["/Annots"] = pikepdf.Array()
         target_page["/Annots"].append(annot)
         pdf.save(output_path)
-    finally:
-        pdf.close()
     return output_path
 
 
@@ -427,15 +381,12 @@ def flatten_annotations(pdf_path: str, output_path: str) -> str:
         Path to the output file.
     """
     validate_output_path(output_path)
-    pdf = _open_pdf(pdf_path)
-    try:
+    with _open_pdf(pdf_path) as pdf:
         for page in pdf.pages:
             page_obj = page.obj
             if "/Annots" in page_obj:
                 del page_obj["/Annots"]
         pdf.save(output_path)
-    finally:
-        pdf.close()
     return output_path
 
 
@@ -458,8 +409,7 @@ def fill_form(pdf_path: str, field_values: dict[str, str], output_path: str) -> 
         Path to the output file.
     """
     validate_output_path(output_path)
-    pdf = _open_pdf(pdf_path)
-    try:
+    with _open_pdf(pdf_path) as pdf:
         if "/AcroForm" not in pdf.Root:
             msg = "PDF has no AcroForm"
             raise PDFEditError(msg)
@@ -477,8 +427,6 @@ def fill_form(pdf_path: str, field_values: dict[str, str], output_path: str) -> 
             _fill_fields(acroform["/Fields"])
         acroform["/NeedAppearances"] = True
         pdf.save(output_path)
-    finally:
-        pdf.close()
     return output_path
 
 
@@ -497,8 +445,7 @@ def add_watermark(pdf_path: str, watermark_path: str, output_path: str) -> str:
         Path to the output file.
     """
     validate_output_path(output_path)
-    pdf = _open_pdf(pdf_path)
-    try:
+    with _open_pdf(pdf_path) as pdf:
         watermark = _open_pdf(watermark_path)
         try:
             watermark_page = watermark.pages[0]
@@ -507,6 +454,4 @@ def add_watermark(pdf_path: str, watermark_path: str, output_path: str) -> str:
             pdf.save(output_path)
         finally:
             watermark.close()
-    finally:
-        pdf.close()
     return output_path

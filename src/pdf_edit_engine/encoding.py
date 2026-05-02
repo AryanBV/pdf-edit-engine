@@ -339,18 +339,8 @@ def _glyph_name_to_unicode(name: str) -> str | None:
         except ValueError:
             pass
 
-    # Try pdfminer's glyph name database
-    try:
-        from pdfminer.glyphlist import glyphname2unicode
+    # pdfminer.six is a hard dependency in pyproject.toml, so the import
+    # never fails at runtime — no fallback dict is needed.
+    from pdfminer.glyphlist import glyphname2unicode
 
-        return glyphname2unicode.get(name)
-    except ImportError:
-        _COMMON: dict[str, str] = {
-            "space": " ",
-            "period": ".",
-            "comma": ",",
-            "hyphen": "-",
-            "colon": ":",
-            "semicolon": ";",
-        }
-        return _COMMON.get(name)
+    return glyphname2unicode.get(name)

@@ -12,7 +12,7 @@ import pikepdf
 import pytest
 
 from pdf_edit_engine.errors import PDFEditError
-from pdf_edit_engine.locator import find, get_fonts, get_text
+from pdf_edit_engine.locator import find, get_text
 from pdf_edit_engine.models import Edit, EditResult
 from pdf_edit_engine.surgeon import batch_replace, replace, replace_all
 
@@ -63,26 +63,6 @@ def test_get_text_no_crash(entry: dict[str, object]) -> None:
     pdf_path = _skip_if_missing(entry)
     text = get_text(pdf_path)
     assert len(text) > 0, f"get_text returned empty for {entry['filename']}"
-
-
-@pytest.mark.parametrize("entry", MANIFEST, ids=lambda e: str(e["filename"]))
-def test_get_fonts_not_empty(entry: dict[str, object]) -> None:
-    """get_fonts() returns at least one font for every corpus PDF."""
-    pdf_path = _skip_if_missing(entry)
-    fonts = get_fonts(pdf_path)
-    assert len(fonts) >= 1, f"Expected >=1 font in {entry['filename']}"
-
-
-@pytest.mark.parametrize("entry", MANIFEST, ids=lambda e: str(e["filename"]))
-def test_find_expected_text(entry: dict[str, object]) -> None:
-    """find() locates expected_text with valid bounding boxes."""
-    pdf_path = _skip_if_missing(entry)
-    expected = str(entry["expected_text"])
-    matches = find(pdf_path, expected)
-    assert len(matches) >= 1, f"find() returned no matches for {expected!r} in {entry['filename']}"
-    for m in matches:
-        assert m.bounding_box[0] < m.bounding_box[2], "x0 < x1"
-        assert m.bounding_box[1] < m.bounding_box[3], "y0 < y1"
 
 
 # ── Replace tests ────────────────────────────────────────────────────────

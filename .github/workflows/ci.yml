@@ -6,19 +6,32 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        # macOS coverage matters: system_fonts.py walks /Library/Fonts/
+        # and /System/Library/Fonts/, neither of which is exercised on
+        # ubuntu/windows runners. Tier 1.5 metric-equivalent fallbacks
+        # (Helvetica → Liberation Sans on Linux, Helvetica is native
+        # on macOS) take a different code path here.
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install system fonts
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install system fonts (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get install -y fonts-liberation fonts-dejavu-core
       - name: Install dependencies
         run: pip install -e ".[dev]"
@@ -26,5 +39,27 @@ jobs:
         run: ruff check src/ tests/
       - name: Typecheck
         run: python -m mypy
+      - name: Docs vs code drift check
+        run: python scripts/check_docs_vs_code.py
       - name: Test
         run: python -m pytest -v --cov=pdf_edit_engine
+      - name: Slow tests (clean-install gate)
+        # Only run on one matrix cell to avoid 4× redundant wheel-build
+        # timing. The slow probes verify package installation, not
+        # platform-specific behavior.
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: python -m pytest -v -m slow tests/test_stress.py
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install with dev extras
+        run: pip install -e ".[dev]"
+      - name: Run pip-audit on the resolved dependency closure
+        run: python -m pip_audit --skip-editable --strict

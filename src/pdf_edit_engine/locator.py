@@ -10,6 +10,7 @@ from typing import Literal
 
 import pikepdf
 
+from pdf_edit_engine._pathutil import open_pdf
 from pdf_edit_engine.encoding import FontResolver, FontResolverCache
 from pdf_edit_engine.errors import OperatorError
 from pdf_edit_engine.fragments import TJReconstructor
@@ -615,18 +616,28 @@ def _group_into_lines(elements: list[ContentElement]) -> list[str]:
     lines: list[list[ContentElement]] = []
     current_line: list[ContentElement] = [elements[0]]
     current_y = elements[0].bbox[3]  # y1 (top of bbox)
+    prev_line_height = elements[0].bbox[3] - elements[0].bbox[1]
 
     for elem in elements[1:]:
         elem_y = elem.bbox[3]
-        # Estimate line height from bbox
-        line_height = elem.bbox[3] - elem.bbox[1]
-        threshold = max(line_height * 0.5, 2.0)
+        elem_line_height = elem.bbox[3] - elem.bbox[1]
+        # ARY-N1 fix: take the MIN of adjacent line-heights as the
+        # threshold base. Using the current element's line_height alone
+        # caused vertically-adjacent text in very different font sizes
+        # (e.g. a 36pt heading immediately above a 110pt badge run) to
+        # be grouped as a single line. The bigger element's bbox height
+        # produced a threshold (55pt) wide enough to absorb the smaller
+        # element's distinct line above. min() makes the threshold
+        # symmetric: two lines are merged only if their gap is small
+        # relative to BOTH font sizes.
+        threshold = max(min(prev_line_height, elem_line_height) * 0.5, 2.0)
         if abs(current_y - elem_y) <= threshold:
             current_line.append(elem)
         else:
             lines.append(current_line)
             current_line = [elem]
             current_y = elem_y
+        prev_line_height = elem_line_height
 
     lines.append(current_line)
 
@@ -636,7 +647,6 @@ def _group_into_lines(elements: list[ContentElement]) -> list[str]:
         line_elems.sort(key=lambda e: e.bbox[0])
         line_parts: list[str] = []
         prev_end_x: float | None = None
-        prev_chars: list[TextCharacter] | None = None
         prev_font_size: float = 12.0
         for elem in line_elems:
             if not elem.text_content:
@@ -644,19 +654,23 @@ def _group_into_lines(elements: list[ContentElement]) -> list[str]:
             chars = elem.characters
             if prev_end_x is not None and chars:
                 gap = chars[0].page_x - prev_end_x
-                if prev_chars:
-                    total_w = sum(c.width for c in prev_chars)
-                    avg_w = (total_w / len(prev_chars)) * 0.5
-                else:
-                    avg_w = prev_font_size * 0.25
-                if gap > avg_w:
+                # ARY-N1 fix: use font_size * 0.25 (≈ space-glyph width for
+                # typical Latin fonts) as the gap threshold. The previous
+                # heuristic (avg-char-width * 0.5 of the immediately
+                # preceding fragment) misbehaved when the PDF emits one
+                # glyph per text-showing operator (Chrome, some Word
+                # exports). A single wide glyph ('m', 'w') produced a
+                # threshold of ~8pt at 24pt Helvetica, large enough to
+                # absorb genuine inter-word gaps and merge consecutive
+                # words into single tokens.
+                threshold_x = max(prev_font_size * 0.25, 2.0)
+                if gap > threshold_x:
                     line_parts.append(" ")
             line_parts.append(elem.text_content)
             if chars:
                 last_c = chars[-1]
                 prev_end_x = last_c.page_x + last_c.width
                 prev_font_size = chars[0].font_size
-                prev_chars = chars
         result.append("".join(line_parts))
     return result
 
@@ -820,7 +834,6 @@ def _build_flat_string(
     prev_y: float | None = None
     prev_end_x: float = 0.0
     prev_font_size: float = 12.0
-    prev_chars: list[TextCharacter] | None = None
 
     for elem in text_elements:
         chars = elem.characters
@@ -830,18 +843,20 @@ def _build_flat_string(
         elem_y = elem.bbox[3]  # top of bbox
         elem_x = chars[0].page_x
         font_size = chars[0].font_size
-        threshold = max(font_size * 0.5, 2.0)
+        # See _group_into_lines for the symmetric-min rationale.
+        threshold = max(min(prev_font_size, font_size) * 0.5, 2.0)
 
         if prev_y is not None:
             if abs(prev_y - elem_y) <= threshold:
-                # Same line — insert space if there is a horizontal gap
+                # Same line — insert space if there is a horizontal gap.
+                # See _group_into_lines for rationale on the threshold:
+                # using the previous fragment's avg char-width breaks
+                # for one-glyph-per-operator PDFs (Chrome, some Word).
+                # font_size * 0.25 is the space-glyph proxy that holds
+                # regardless of fragment granularity.
                 gap = elem_x - prev_end_x
-                if prev_chars:
-                    total_w = sum(c.width for c in prev_chars)
-                    avg_w = (total_w / len(prev_chars)) * 0.5
-                else:
-                    avg_w = prev_font_size * 0.25
-                if gap > avg_w:
+                threshold_x = max(prev_font_size * 0.25, 2.0)
+                if gap > threshold_x:
                     parts.append(" ")
                     char_map.append(None)
             else:
@@ -857,7 +872,6 @@ def _build_flat_string(
         prev_end_x = last_char.page_x + last_char.width
         prev_y = elem_y
         prev_font_size = font_size
-        prev_chars = chars
 
     return "".join(parts), char_map
 
@@ -903,7 +917,7 @@ def find(
     resolved = str(path.resolve())
     matches: list[TextMatch] = []
 
-    with pikepdf.open(path) as pdf:
+    with open_pdf(path) as pdf:
         pages = _resolve_pages(pdf, page)
 
         for page_num, page_obj in pages:
@@ -981,7 +995,7 @@ def get_text(pdf_path: str, *, page: int | None = None) -> str:
     """
     path = Path(pdf_path)
     resolved = str(path.resolve())
-    with pikepdf.open(path) as pdf:
+    with open_pdf(path) as pdf:
         pages = _resolve_pages(pdf, page)
         all_text: list[str] = []
         for page_num, page_obj in pages:
@@ -1005,7 +1019,7 @@ def get_fonts(pdf_path: str, *, page: int | None = None) -> list[FontInfo]:
         List of FontInfo objects describing each font.
     """
     path = Path(pdf_path)
-    with pikepdf.open(path) as pdf:
+    with open_pdf(path) as pdf:
         pages = _resolve_pages(pdf, page)
         fonts: list[FontInfo] = []
         seen: set[str] = set()
@@ -1040,7 +1054,7 @@ def get_text_layout(pdf_path: str, page: int | None = None) -> list[TextBlock]:
     """
     path = str(Path(pdf_path).resolve())
     blocks: list[TextBlock] = []
-    with pikepdf.open(path) as pdf:
+    with open_pdf(path) as pdf:
         pages = _resolve_pages(pdf, page)
         for page_num, page_obj in pages:
             elements = _build_index(page_obj, page_num, pdf_path=path)
@@ -1094,7 +1108,7 @@ def extract_bbox_text(
     """
     x0, y0, x1, y1 = bbox
     path = str(Path(pdf_path).resolve())
-    with pikepdf.open(path) as pdf:
+    with open_pdf(path) as pdf:
         pages = _resolve_pages(pdf, page)
         if not pages:
             return ""

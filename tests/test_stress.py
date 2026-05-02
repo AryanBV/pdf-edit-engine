@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -367,8 +368,11 @@ class TestCleanInstall:
         assert "ALL IMPORTS OK" in result.stdout
 
     def test_installed_version_matches(self, tmp_path: Path) -> None:
-        """Installed version should be 0.1.0."""
+        """Installed ``__version__`` must match the version embedded in the wheel filename."""
         wheel = self._find_wheel()
+        m = re.match(r"pdf_edit_engine-(\d+\.\d+\.\d+)-", wheel.name)
+        assert m is not None, f"Could not parse version from wheel: {wheel.name}"
+        expected_version = m.group(1)
         venv_dir = tmp_path / "test_venv"
 
         subprocess.run(
@@ -397,4 +401,6 @@ class TestCleanInstall:
             text=True,
             timeout=10,
         )
-        assert "0.1.0" in result.stdout, f"Version mismatch: {result.stdout}"
+        assert expected_version in result.stdout, (
+            f"Version mismatch: expected {expected_version}, got {result.stdout!r}"
+        )

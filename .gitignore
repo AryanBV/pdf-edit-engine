@@ -3,6 +3,12 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Scratch directories for one-shot investigation / repro scripts
+tmp/
+
+# Stray literal "~/" directory left over from earlier test runs
+~/
+
 # C extensions
 *.so
 
@@ -210,6 +216,9 @@ __marimo__/
 # Claude Code
 .claude/
 
+# Claude Code session memory + scratch logs (this repo's local instance)
+.remember/
+
 # Demo output (for manual inspection, not committed)
 demo_output/
 validate_output/
@@ -223,3 +232,6 @@ tests/corpus/*.pdf
 
 # Stress test output
 tests/stress_output/
+
+# Ad-hoc analysis scratch from audit/cleanup runs
+.audit/

@@ -85,6 +85,17 @@ class EditResult:
         )
     )
 
+    def __post_init__(self) -> None:
+        # INV-J-3 contract enforcement: overflow_detected=True must imply
+        # at least one warning whose text references "overflow", so callers
+        # iterating warnings can surface the condition without inspecting
+        # the FidelityReport flags. Every internal site that flips
+        # overflow_detected gets this guarantee for free.
+        if self.fidelity_report.overflow_detected and not any(
+            "overflow" in w.lower() for w in self.warnings
+        ):
+            self.warnings.append("Overflow detected: replacement extends past available space.")
+
 
 @dataclass
 class Edit:
@@ -96,11 +107,15 @@ class Edit:
 
 @dataclass
 class GraphicsStateSnapshot:
-    """Snapshot of the PDF graphics state at a point in the content stream."""
+    """Snapshot of the PDF graphics state at a point in the content stream.
+
+    Stroke color and text rise are intentionally absent: every consumer
+    in the engine reads ``fill_color`` only, never stroke. Tracking
+    stroke state was dead code from v0.1.0 to v0.1.1; removed in v0.1.2.
+    """
 
     ctm: tuple[float, float, float, float, float, float]
     fill_color: tuple[float, ...] | None
-    stroke_color: tuple[float, ...] | None
     font_name: str | None
     font_size: float | None
     text_matrix: tuple[float, float, float, float, float, float] | None

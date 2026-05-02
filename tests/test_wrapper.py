@@ -43,9 +43,9 @@ class TestMerge:
             # simple=1 page + multi=2 pages = 3
             assert len(pdf.pages) == 3
 
-    def test_merge_empty_raises(self, tmp_path: Path) -> None:
-        with pytest.raises(PDFEditError):
-            merge_pdfs([], str(tmp_path / "out.pdf"))
+    # test_merge_empty_raises removed — strict subset of
+    # tests/invariants/test_h_1_merge_empty.py
+    # (also covered by tests/test_error_messages.py).
 
 
 class TestSplit:

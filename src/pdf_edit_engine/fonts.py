@@ -10,8 +10,10 @@ import pikepdf
 from fontTools.ttLib import TTFont  # type: ignore[import-untyped]
 from pdfminer.cmapdb import CMapParser, FileUnicodeMap
 
+from pdf_edit_engine._pathutil import open_pdf
 from pdf_edit_engine.errors import FontNotFoundError
 from pdf_edit_engine.models import FontInfo
+from pdf_edit_engine.system_fonts import _strip_subset_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -169,44 +171,6 @@ def _append_to_unicode_cmap(
     font_dict["/ToUnicode"] = pdf.make_stream(new_cmap.encode("latin-1"))
 
 
-def _rebuild_to_unicode_cmap(all_mappings: dict[int, str]) -> bytes:
-    """Build a complete ToUnicode CMap from scratch.
-
-    Args:
-        all_mappings: Full dict of {CID: unicode_string} for every mapped CID.
-
-    Returns:
-        CMap stream bytes (latin-1 encoded).
-    """
-    header = (
-        "/CIDInit /ProcSet findresource begin\n"
-        "12 dict begin\n"
-        "begincmap\n"
-        "/CIDSystemInfo\n"
-        "<< /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
-        "/CMapName /Adobe-Identity-UCS def\n"
-        "/CMapType 2 def\n"
-        "1 begincodespacerange\n"
-        "<0000> <FFFF>\n"
-        "endcodespacerange\n"
-    )
-    footer = "endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n"
-    entries = sorted(all_mappings.items())
-    blocks: list[str] = []
-    for chunk_start in range(0, len(entries), 100):
-        chunk = entries[chunk_start : chunk_start + 100]
-        lines = [f"{len(chunk)} beginbfchar"]
-        for cid, ustr in chunk:
-            cid_hex = f"<{cid:04X}>"
-            uni_hex = "<" + "".join(f"{ord(ch):04X}" for ch in ustr) + ">"
-            lines.append(f"{cid_hex} {uni_hex}")
-        lines.append("endbfchar")
-        blocks.append("\n".join(lines))
-
-    body = "\n".join(blocks) + "\n"
-    return (header + body + footer).encode("latin-1")
-
-
 def _append_w_entries(
     cid_font: pikepdf.Object,
     new_widths: dict[int, float],
@@ -240,22 +204,6 @@ def _append_w_entries(
         existing.append(pikepdf.Array([width]))
 
     cid_font["/W"] = pikepdf.Array(existing)
-
-
-def _rebuild_w_array(all_widths: dict[int, float]) -> pikepdf.Array:
-    """Build a complete /W array from scratch.
-
-    Args:
-        all_widths: Full dict of {CID: width_in_font_units}.
-
-    Returns:
-        pikepdf.Array in [CID [width]] format.
-    """
-    items: list[object] = []
-    for cid, width in sorted(all_widths.items()):
-        items.append(cid)
-        items.append(pikepdf.Array([width]))
-    return pikepdf.Array(items)
 
 
 def _update_cid_to_gid_map(
@@ -516,15 +464,6 @@ def _detect_postscript_name(fd: pikepdf.Object) -> str:
     return name
 
 
-def _strip_subset_prefix(ps_name: str) -> str:
-    """Remove 6-letter subset prefix (e.g. 'ABCDEF+Calibri-Bold' → 'Calibri-Bold')."""
-    if len(ps_name) > 7 and ps_name[6] == "+":
-        prefix = ps_name[:6]
-        if prefix.isalpha() and prefix.isupper():
-            return ps_name[7:]
-    return ps_name
-
-
 # ── Public API ───────────────────────────────────────────────────────────
 
 
@@ -542,7 +481,7 @@ def analyze_subset(pdf_path: str | Path, font_name: str) -> FontInfo:
     Raises:
         FontNotFoundError: If the font or its embedded data is not found.
     """
-    pdf = pikepdf.Pdf.open(str(pdf_path))
+    pdf = open_pdf(str(pdf_path))
     try:
         return _analyze_from_page(pdf.pages[0], font_name, pdf_path=pdf_path)
     finally:
@@ -645,6 +584,8 @@ def extend_subset(
     font_name: str,
     additional_chars: str,
     full_font_path: str | Path | None = None,
+    *,
+    substitution_log: list[str] | None = None,
 ) -> str:
     """Extend a font's character coverage in the open PDF object.
 
@@ -661,6 +602,13 @@ def extend_subset(
         font_name: Font resource name (e.g. 'F1').
         additional_chars: String of characters to add to the subset.
         full_font_path: Optional explicit path to the full font file (Tier 2).
+        substitution_log: Optional list to capture metric-equivalent
+            substitution events. INV-C-4 plumbing — when Tier 1.5 falls
+            back to a metric-equivalent system font (e.g. Carlito for
+            Calibri), the equivalent's PostScript name is appended so
+            the caller can populate ``FidelityReport.font_substituted``.
+            Pass ``None`` (default) when the caller doesn't need
+            substitution visibility.
 
     Returns:
         Extension tier used: ``'cmap_only'`` or ``'full_extension'``.
@@ -736,6 +684,7 @@ def extend_subset(
         fd,
         "".join(tier15_chars),
         full_font_path,
+        substitution_log,
     )
 
 
@@ -790,6 +739,7 @@ def _extend_tier2(
     fd: pikepdf.Object,
     additional_chars: str,
     full_font_path: str | Path | None,
+    substitution_log: list[str] | None = None,
 ) -> str:
     """Tier 1.5 in-place glyph injection (root fix for ARY-276 Mode 2).
 
@@ -831,15 +781,27 @@ def _extend_tier2(
             character is absent from the system font, or a composite
             component is missing from both fonts.
     """
-    from pdf_edit_engine.system_fonts import find_font
+    from pdf_edit_engine.system_fonts import _find_font_with_origin
 
     raw_ps_name = _detect_postscript_name(fd)
     ps_name = _strip_subset_prefix(raw_ps_name)
 
-    system_path = str(full_font_path) if full_font_path is not None else find_font(ps_name)
+    if full_font_path is not None:
+        system_path: str | None = str(full_font_path)
+        substituted_name: str | None = None
+    else:
+        found = _find_font_with_origin(ps_name)
+        if found is None:
+            system_path = None
+            substituted_name = None
+        else:
+            system_path, substituted_name = found
     if system_path is None or not Path(system_path).is_file():
         msg = f"System font not found for '{ps_name}'. Install the font or provide full_font_path."
         raise FontNotFoundError(msg)
+    # INV-C-4: surface metric-equivalent substitution to caller.
+    if substituted_name is not None and substitution_log is not None:
+        substitution_log.append(substituted_name)
 
     # Load the embedded font (so we can extend it in place)
     embedded_bytes = bytes(fd["/FontFile2"].read_bytes())

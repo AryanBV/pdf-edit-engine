@@ -8,24 +8,9 @@ from typing import Any
 
 import pikepdf
 
+from pdf_edit_engine._pathutil import open_pdf as _open_pdf
 from pdf_edit_engine._pathutil import validate_output_path
 from pdf_edit_engine.errors import PDFEditError
-
-
-def _open_pdf(path: str, **kwargs: object) -> pikepdf.Pdf:
-    """Open a PDF file, translating pikepdf errors to PDFEditError."""
-    try:
-        return pikepdf.Pdf.open(path, **kwargs)  # type: ignore[arg-type]
-    except pikepdf.PasswordError:
-        raise PDFEditError("PDF is password-protected") from None
-    except pikepdf.PdfError as exc:
-        raise PDFEditError(f"Cannot open PDF: {exc}") from None
-    except FileNotFoundError:
-        raise PDFEditError(f"PDF file not found: {Path(path).name}") from None
-    except IsADirectoryError:
-        raise PDFEditError("Expected a file path, got a directory") from None
-    except PermissionError:
-        raise PDFEditError(f"Permission denied: {Path(path).name}") from None
 
 
 @dataclass(frozen=True)

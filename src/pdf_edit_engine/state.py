@@ -56,10 +56,13 @@ class GraphicsStateTracker:
     """
 
     def __init__(self) -> None:
-        # Graphics state (saved/restored by q/Q)
+        # Graphics state (saved/restored by q/Q). Only fill_color is
+        # tracked: every consumer in the engine (locator, reflow,
+        # surgeon, structural) reads .fill_color but never .stroke_color.
+        # The stroke-state and text_rise tracking from prior versions
+        # was never read in production; removed in v0.1.2 cleanup.
         self._ctm: tuple[float, float, float, float, float, float] = _IDENTITY
         self._fill_color: tuple[float, ...] | None = None
-        self._stroke_color: tuple[float, ...] | None = None
         self._font_name: str | None = None
         self._font_size: float = 0.0
         self._char_spacing: float = 0.0  # Tc
@@ -67,7 +70,6 @@ class GraphicsStateTracker:
         self._horiz_scaling: float = 1.0  # Th (Tz/100)
         self._leading: float = 0.0  # TL
         self._text_render_mode: int = 0  # Tr
-        self._text_rise: float = 0.0  # Ts
 
         # Graphics state stack for q/Q
         self._state_stack: list[dict[str, object]] = []
@@ -76,13 +78,15 @@ class GraphicsStateTracker:
         self._text_matrix: tuple[float, float, float, float, float, float] = _IDENTITY
         self._text_line_matrix: tuple[float, float, float, float, float, float] = _IDENTITY
 
-        # Operator dispatch table
+        # Operator dispatch table. Stroke-state operators (G, RG, K,
+        # SC, SCN) are intentionally absent — the engine does not
+        # consume stroke color anywhere. cs/CS color-space-name
+        # operators are also absent (no color-space resolution today).
         self._handlers: dict[str, Callable[[list[object]], None]] = {
             "q": lambda ops: self.save(),
             "Q": lambda ops: self.restore(),
             "cm": self._handle_cm,
             "BT": self._handle_bt,
-            "ET": self._handle_et,
             "Tm": self._handle_tm,
             "Td": self._handle_td,
             "TD": self._handle_td_upper,
@@ -93,19 +97,11 @@ class GraphicsStateTracker:
             "Tz": self._handle_tz,
             "TL": self._handle_tl,
             "Tr": self._handle_tr,
-            "Ts": self._handle_ts,
             "g": self._handle_g,
-            "G": self._handle_g_upper,
             "rg": self._handle_rg,
-            "RG": self._handle_rg_upper,
             "k": self._handle_k,
-            "K": self._handle_k_upper,
-            "cs": self._handle_cs,
-            "CS": self._handle_cs_upper,
             "sc": self._handle_sc,
-            "SC": self._handle_sc_upper,
             "scn": self._handle_sc,
-            "SCN": self._handle_sc_upper,
         }
 
     # ── Public API ──────────────────────────────────────────────────────
@@ -127,7 +123,6 @@ class GraphicsStateTracker:
             {
                 "ctm": self._ctm,
                 "fill_color": self._fill_color,
-                "stroke_color": self._stroke_color,
                 "font_name": self._font_name,
                 "font_size": self._font_size,
                 "char_spacing": self._char_spacing,
@@ -135,7 +130,6 @@ class GraphicsStateTracker:
                 "horiz_scaling": self._horiz_scaling,
                 "leading": self._leading,
                 "text_render_mode": self._text_render_mode,
-                "text_rise": self._text_rise,
             }
         )
 
@@ -147,7 +141,6 @@ class GraphicsStateTracker:
         state = self._state_stack.pop()
         self._ctm = state["ctm"]  # type: ignore[assignment]
         self._fill_color = state["fill_color"]  # type: ignore[assignment]
-        self._stroke_color = state["stroke_color"]  # type: ignore[assignment]
         self._font_name = state["font_name"]  # type: ignore[assignment]
         self._font_size = state["font_size"]  # type: ignore[assignment]
         self._char_spacing = state["char_spacing"]  # type: ignore[assignment]
@@ -155,7 +148,6 @@ class GraphicsStateTracker:
         self._horiz_scaling = state["horiz_scaling"]  # type: ignore[assignment]
         self._leading = state["leading"]  # type: ignore[assignment]
         self._text_render_mode = state["text_render_mode"]  # type: ignore[assignment]
-        self._text_rise = state["text_rise"]  # type: ignore[assignment]
 
     def get_text_position(self) -> tuple[float, float]:
         """Get the current text position in user space.
@@ -211,7 +203,6 @@ class GraphicsStateTracker:
         return GraphicsStateSnapshot(
             ctm=self._ctm,
             fill_color=self._fill_color,
-            stroke_color=self._stroke_color,
             font_name=self._font_name,
             font_size=self._font_size if self._font_name is not None else None,
             text_matrix=self._text_matrix,
@@ -240,11 +231,6 @@ class GraphicsStateTracker:
         return self._fill_color
 
     @property
-    def stroke_color(self) -> tuple[float, ...] | None:
-        """Current stroke color, or None if not set."""
-        return self._stroke_color
-
-    @property
     def text_rendering_mode(self) -> int:
         """Current text rendering mode (0-7)."""
         return self._text_render_mode
@@ -265,9 +251,6 @@ class GraphicsStateTracker:
     def _handle_bt(self, operands: list[object]) -> None:
         self._text_matrix = _IDENTITY
         self._text_line_matrix = _IDENTITY
-
-    def _handle_et(self, operands: list[object]) -> None:
-        pass
 
     def _handle_tm(self, operands: list[object]) -> None:
         m = (
@@ -324,20 +307,11 @@ class GraphicsStateTracker:
     def _handle_tr(self, operands: list[object]) -> None:
         self._text_render_mode = int(_f(operands[0]))
 
-    def _handle_ts(self, operands: list[object]) -> None:
-        self._text_rise = _f(operands[0])
-
     def _handle_g(self, operands: list[object]) -> None:
         self._fill_color = (_f(operands[0]),)
 
-    def _handle_g_upper(self, operands: list[object]) -> None:
-        self._stroke_color = (_f(operands[0]),)
-
     def _handle_rg(self, operands: list[object]) -> None:
         self._fill_color = (_f(operands[0]), _f(operands[1]), _f(operands[2]))
-
-    def _handle_rg_upper(self, operands: list[object]) -> None:
-        self._stroke_color = (_f(operands[0]), _f(operands[1]), _f(operands[2]))
 
     def _handle_k(self, operands: list[object]) -> None:
         self._fill_color = (
@@ -347,30 +321,10 @@ class GraphicsStateTracker:
             _f(operands[3]),
         )
 
-    def _handle_k_upper(self, operands: list[object]) -> None:
-        self._stroke_color = (
-            _f(operands[0]),
-            _f(operands[1]),
-            _f(operands[2]),
-            _f(operands[3]),
-        )
-
-    def _handle_cs(self, operands: list[object]) -> None:
-        # cs/CS set color space name — defer resolution to v2
-        pass
-
-    def _handle_cs_upper(self, operands: list[object]) -> None:
-        pass
-
     def _handle_sc(self, operands: list[object]) -> None:
         values = self._safe_floats(operands)
         if values:
             self._fill_color = values
-
-    def _handle_sc_upper(self, operands: list[object]) -> None:
-        values = self._safe_floats(operands)
-        if values:
-            self._stroke_color = values
 
     @staticmethod
     def _safe_floats(operands: list[object]) -> tuple[float, ...]:

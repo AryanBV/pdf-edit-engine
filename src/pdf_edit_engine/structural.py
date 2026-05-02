@@ -15,12 +15,13 @@ from typing import Any
 
 import pikepdf
 
-from pdf_edit_engine._pathutil import validate_output_path
+from pdf_edit_engine._pathutil import open_pdf, validate_output_path
 from pdf_edit_engine.encoding import FontResolverCache
 from pdf_edit_engine.errors import OperatorError
 from pdf_edit_engine.locator import _build_index, _resolve_pages
 from pdf_edit_engine.models import ContentElement, EditResult, FidelityReport
 from pdf_edit_engine.reflow import (
+    _FONT_EXTEND_FAIL_EXCS,
     _build_replacement_ops,
     _expand_to_bt_et,
     _find_bt_et_blocks,
@@ -31,11 +32,9 @@ logger = logging.getLogger(__name__)
 
 _Ops = list[Any]
 
-_resolver_cache = FontResolverCache()
-
-# Path construction operators whose y-coordinates need shifting
-_PATH_Y_OPS = frozenset({"m", "l", "c", "v", "y", "re"})
-
+# Cache ownership (ARY-283): each public entrypoint constructs its own
+# FontResolverCache at entry and threads it through helpers. No module-
+# level cache here — surgeon.py follows the same policy.
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -86,13 +85,12 @@ def _get_operands(inst: Any) -> list[Any]:
     return list(inst[0])
 
 
-def _invalidate_caches() -> None:
-    """Clear locator and local caches after structural edits."""
+def _invalidate_locator_cache() -> None:
+    """Clear the locator's content-element cache after a content-stream edit."""
     from pdf_edit_engine import locator
 
     locator._cached_path = None  # noqa: SLF001
     locator._cached_elements = {}  # noqa: SLF001
-    _resolver_cache.clear()
 
 
 def _detect_line_height(
@@ -293,6 +291,7 @@ def _detect_font_from_elements(
 def _find_cid_font_in_elements(
     elements: list[ContentElement],
     page_obj: pikepdf.Page,
+    resolver_cache: FontResolverCache,
 ) -> tuple[str, float] | None:
     """Find the first CID/Identity-H font among text elements in a region.
 
@@ -302,6 +301,7 @@ def _find_cid_font_in_elements(
     Args:
         elements: Content elements to scan.
         page_obj: Page for font resolution.
+        resolver_cache: Caller-owned font resolver cache.
 
     Returns:
         Tuple of (font_name, font_size) for the first CID font, or None.
@@ -313,47 +313,77 @@ def _find_cid_font_in_elements(
             if name in seen:
                 continue
             seen.add(name)
-            resolver = _resolver_cache.get_resolver(page_obj, name.lstrip("/"))
+            resolver = resolver_cache.get_resolver(page_obj, name.lstrip("/"))
             if resolver.is_cid_font:
                 return (name, elem.graphics_state.font_size or 12.0)
     return None
 
 
-def _check_page_overflow(
-    elements: list[ContentElement],
-    page_obj: pikepdf.Page,
-    delta_y: float,
-    y_threshold: float,
-) -> list[str]:
-    """Check if shifted elements exceed page boundaries.
-
-    Args:
-        elements: All content elements on the page.
-        page_obj: The pikepdf page object.
-        delta_y: Shift amount (positive = down in visual terms).
-        y_threshold: Only elements below this were shifted.
-
-    Returns:
-        List of warning strings.
-    """
-    warnings: list[str] = []
-    mediabox = page_obj.get("/MediaBox")
-    if mediabox is None:
-        return warnings
-    page_bottom = float(mediabox[1])
-
-    for elem in elements:
-        elem_bottom = elem.bbox[1]
-        if elem_bottom < y_threshold:
-            new_bottom = elem_bottom - delta_y
-            if new_bottom < page_bottom:
-                overshoot = page_bottom - new_bottom
-                warnings.append(f"Content shifted below page boundary by {overshoot:.1f}pt")
-                break
-    return warnings
-
-
 # ── Core: annotation sync ───────────────────────────────────────────────
+
+
+def _is_annotation_orphaned(annot: pikepdf.Object, new_lower: str) -> bool:
+    """Decide whether an annotation's URI is orphaned by the new text.
+
+    An orphan is a hyperlink whose URI references keywords (the last
+    path segment, split on '-'/'_') of which **none** appear in the
+    new text. A blank ``new_text`` keeps the annotation by convention
+    (the caller may be deleting content; orphan-detection then has no
+    text to compare against).
+    """
+    if not new_lower:
+        return False
+    a_dict = annot.get("/A")
+    uri = str(a_dict.get("/URI", "")) if a_dict else ""  # type: ignore[call-overload]
+    if not uri:
+        return False
+    path = uri.rstrip("/").rsplit("/", 1)[-1]
+    keywords = [
+        kw for kw in path.replace("-", " ").replace("_", " ").lower().split() if len(kw) > 2
+    ]
+    return bool(keywords) and not any(kw in new_lower for kw in keywords)
+
+
+def _remove_orphaned_annotations(
+    page_obj: pikepdf.Page,
+    bbox: tuple[float, float, float, float],
+    new_text: str,
+) -> None:
+    """Remove hyperlink annotations whose URI keywords don't match *new_text*.
+
+    INV-W0-7 contract: orphan detection MUST run on every replace_block /
+    delete_block / batch_replace_block call regardless of whether the
+    replacement triggers a vertical shift. Splitting this from the shift
+    pass guarantees the two concerns can never silently couple again.
+
+    Writes back via ``page_obj["/Annots"]`` because deleting from a
+    locally-bound ``list(annots_obj)`` only mutates the Python list, not
+    the PDF's ``/Annots`` array — a latent bug in the prior monolithic
+    ``_sync_annotations_in_bbox`` that hid the orphan removal entirely.
+    """
+    annots_obj = page_obj.get("/Annots")
+    if not annots_obj:
+        return
+    annots: list[pikepdf.Object] = list(annots_obj)  # type: ignore[call-overload]
+    new_lower = new_text.lower()
+    kept: list[pikepdf.Object] = []
+    removed = False
+    for annot in annots:
+        try:
+            rect = [float(r) for r in annot["/Rect"]]  # type: ignore[attr-defined]
+        except (KeyError, TypeError):
+            kept.append(annot)
+            continue
+        # Vertical overlap with bbox
+        if not (rect[1] < bbox[3] and rect[3] > bbox[1]):
+            kept.append(annot)
+            continue
+        if _is_annotation_orphaned(annot, new_lower):
+            removed = True
+            continue
+        kept.append(annot)
+    if removed:
+        page_obj["/Annots"] = pikepdf.Array(kept)
 
 
 def _sync_annotations_in_bbox(
@@ -362,53 +392,33 @@ def _sync_annotations_in_bbox(
     delta_y: float,
     new_text: str = "",
 ) -> None:
-    """Sync annotations within *bbox* after content replacement.
+    """Shift relevant annotations in *bbox* by *delta_y* and remove orphans.
 
-    For each annotation overlapping the bbox:
-    - **Relevant** (URI keywords found in *new_text*): shift by *delta_y*
-      and restore underlines if the content-stream decoration was removed.
-    - **Orphaned** (URI keywords NOT in *new_text*): remove entirely,
-      because the linked content no longer exists at this position.
-
-    This is universal: when content is replaced, annotations that match
-    the new content are repositioned; annotations that don't are cleaned up.
+    Relevant annotations (URI keywords appear in *new_text*) get their
+    /Rect shifted and any zeroed /BS underline restored. Orphan removal
+    is delegated to :func:`_remove_orphaned_annotations` so callers that
+    don't shift can still drop dangling links.
 
     Args:
         page_obj: The page whose annotations to adjust.
         bbox: The replaced region (x0, y0, x1, y1).
         delta_y: Vertical shift to apply (positive = up in PDF coords).
-        new_text: The replacement text (used to detect orphaned annotations).
+        new_text: The replacement text (used to detect orphans).
     """
+    # First pass: drop orphans. After this, the only annotations left
+    # overlapping bbox are relevant ones that should follow the shift.
+    _remove_orphaned_annotations(page_obj, bbox, new_text)
+
     annots_obj = page_obj.get("/Annots")
     if not annots_obj:
         return
-    annots: list[pikepdf.Object] = list(annots_obj)  # type: ignore[call-overload]
-    new_lower = new_text.lower()
-    to_remove: list[int] = []
-    for idx, annot in enumerate(annots):
+    for annot in list(annots_obj):  # type: ignore[call-overload]
         try:
-            rect = [float(r) for r in annot["/Rect"]]  # type: ignore[attr-defined]
+            rect = [float(r) for r in annot["/Rect"]]
         except (KeyError, TypeError):
             continue
-        # Check vertical overlap with bbox
         if not (rect[1] < bbox[3] and rect[3] > bbox[1]):
             continue
-
-        # Determine if annotation is orphaned: extract keywords from URI
-        # and check if any appear in the replacement text.
-        a_dict = annot.get("/A")
-        uri = str(a_dict.get("/URI", "")) if a_dict else ""  # type: ignore[call-overload]
-        if uri and new_lower:
-            # Extract meaningful keywords from last URI path segment
-            path = uri.rstrip("/").rsplit("/", 1)[-1]
-            keywords = [
-                kw for kw in path.replace("-", " ").replace("_", " ").lower().split() if len(kw) > 2
-            ]
-            if keywords and not any(kw in new_lower for kw in keywords):
-                to_remove.append(idx)
-                continue
-
-        # Relevant annotation — shift and restore underline
         annot["/Rect"] = pikepdf.Array(
             [
                 rect[0],
@@ -418,17 +428,13 @@ def _sync_annotations_in_bbox(
             ]
         )
         bs = annot.get("/BS")
-        if bs is not None and float(bs.get("/W", 1)) == 0:  # type: ignore[call-overload]
+        if bs is not None and float(bs.get("/W", 1)) == 0:
             annot["/BS"] = pikepdf.Dictionary(
                 {
                     "/W": 0.5,
                     "/S": pikepdf.Name("/U"),
                 }
             )
-
-    # Remove orphaned annotations (reverse order to preserve indices)
-    for idx in reversed(to_remove):
-        del annots[idx]
 
 
 # ── Core: shift content below ────────────────────────────────────────────
@@ -656,7 +662,7 @@ def shift_content_below(
         EditResult with fidelity information.
     """
     validate_output_path(output_path)
-    pdf = pikepdf.Pdf.open(pdf_path)
+    pdf = open_pdf(pdf_path)
     try:
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
@@ -671,7 +677,7 @@ def shift_content_below(
 
         overflow = any("below page boundary" in w for w in warnings)
         pdf.save(output_path)
-        _invalidate_caches()
+        _invalidate_locator_cache()
 
         return EditResult(
             success=True,
@@ -741,6 +747,7 @@ def _auto_compute_layout(
     page_obj: pikepdf.Page,
     page_number: int,
     replacements: list[tuple[tuple[float, float, float, float], str]],
+    resolver_cache: FontResolverCache,
 ) -> tuple[float, float]:
     """Auto-detect layout params from original content and replacement text.
 
@@ -776,7 +783,7 @@ def _auto_compute_layout(
 
     # Count lines for each replacement text at the detected font/width
     try:
-        resolver = _resolver_cache.get_resolver(page_obj, clean)
+        resolver = resolver_cache.get_resolver(page_obj, clean)
         font_ref = page_obj["/Resources"]["/Font"]["/" + clean]
     except (KeyError, TypeError):
         return (font_size * 1.2, original_gap)
@@ -830,24 +837,39 @@ def _extend_font(
     page_obj: pikepdf.Page,
     font_name: str,
     text: str,
+    resolver_cache: FontResolverCache,
+    *,
+    substitution_log: list[str] | None = None,
 ) -> bool:
-    """Extend a font's subset to encode *text*.  Returns True on success."""
+    """Extend a font's subset to encode *text*.  Returns True on success.
+
+    The optional *substitution_log* (kw-only) captures metric-equivalent
+    substitution events from ``extend_subset`` so the calling
+    ``_replace_block_on_page`` / ``insert_text_block`` can surface them
+    through ``FidelityReport.font_substituted`` (INV-C-4).
+    """
     from pdf_edit_engine.fonts import extend_subset
 
     clean = font_name.lstrip("/")
-    r = _resolver_cache.get_resolver(page_obj, clean)
+    r = resolver_cache.get_resolver(page_obj, clean)
     can, missing = r.can_encode(text)
     if can:
         return True
     if not r.is_cid_font:
         return False  # can't extend non-CID fonts
     try:
-        extend_subset(pdf, page_obj, clean, "".join(missing))
-        _resolver_cache.evict(page_obj, clean)
-        r2 = _resolver_cache.get_resolver(page_obj, clean)
+        extend_subset(
+            pdf,
+            page_obj,
+            clean,
+            "".join(missing),
+            substitution_log=substitution_log,
+        )
+        resolver_cache.evict(page_obj, clean)
+        r2 = resolver_cache.get_resolver(page_obj, clean)
         ok, _ = r2.can_encode(text)
         return ok
-    except Exception:
+    except _FONT_EXTEND_FAIL_EXCS:
         logger.warning("Font extension failed for %s", font_name, exc_info=True)
         return False
 
@@ -858,6 +880,7 @@ def _replace_block_on_page(
     page_number: int,
     bbox: tuple[float, float, float, float],
     new_text: str,
+    resolver_cache: FontResolverCache,
     font_name: str | None = None,
     font_size: float | None = None,
     line_height: float | None = None,
@@ -885,6 +908,12 @@ def _replace_block_on_page(
         extends below the bbox, negative when it is shorter (underflow).
     """
     from pdf_edit_engine.encoding import FontResolver
+
+    # INV-C-4 wiring: capture metric-equivalent substitutions
+    # (e.g. Carlito for Calibri) from extend_subset so the
+    # FidelityReport can surface them. Empty list → no substitution
+    # observed; first entry → name of the substitute font.
+    substitution_log: list[str] = []
 
     # ── Phase 1: Analyze ──────────────────────────────────────────────
     elements = _build_index(page_obj, page_number)
@@ -933,7 +962,7 @@ def _replace_block_on_page(
     except (KeyError, TypeError) as exc:
         raise OperatorError(f"Font {font_name} not found in page resources") from exc
 
-    resolver = _resolver_cache.get_resolver(page_obj, clean_name)
+    resolver = resolver_cache.get_resolver(page_obj, clean_name)
     encodable_text = "".join(ch for ch in new_text if ch >= " ")
     font_action_str = "kept"
     font_switched = False
@@ -941,14 +970,14 @@ def _replace_block_on_page(
     # CID font fallback for non-CID body font
     can_enc, missing = resolver.can_encode(encodable_text)
     if not can_enc and not resolver.is_cid_font:
-        cid_alt = _find_cid_font_in_elements(matched_elems, page_obj)
+        cid_alt = _find_cid_font_in_elements(matched_elems, page_obj, resolver_cache)
         if cid_alt is not None:
             alt_name, alt_size = cid_alt
             font_name = alt_name
             clean_name = font_name.lstrip("/")
             font_key = font_name if font_name.startswith("/") else f"/{font_name}"
             font_ref = page_obj["/Resources"]["/Font"][font_key]
-            resolver = _resolver_cache.get_resolver(page_obj, clean_name)
+            resolver = resolver_cache.get_resolver(page_obj, clean_name)
             if font_size_was_auto:
                 font_size = alt_size
             can_enc, missing = resolver.can_encode(encodable_text)
@@ -971,19 +1000,28 @@ def _replace_block_on_page(
                 0.0,
                 bbox[3],
             )
-        if not _extend_font(pdf, page_obj, clean_name, encodable_text):
+        if not _extend_font(
+            pdf,
+            page_obj,
+            clean_name,
+            encodable_text,
+            resolver_cache,
+            substitution_log=substitution_log,
+        ):
             return (
                 EditResult(
                     success=False,
                     original_text=original_text,
                     new_text=new_text,
                     font_action="failed",
-                    warnings=["Font extension failed for body font"],
+                    warnings=[
+                        f"Font extension failed for body font '{clean_name}' (missing: {missing!r})"
+                    ],
                 ),
                 0.0,
                 bbox[3],
             )
-        resolver = _resolver_cache.get_resolver(page_obj, clean_name)
+        resolver = resolver_cache.get_resolver(page_obj, clean_name)
         font_ref = page_obj["/Resources"]["/Font"][font_key]
         font_action_str = "extended"
 
@@ -991,7 +1029,14 @@ def _replace_block_on_page(
     first_line = new_text.split("\n", 1)[0] if new_text else ""
     first_line_clean = "".join(ch for ch in first_line if ch >= " ")
     if palette.heading_font and palette.heading_font != clean_name:
-        if _extend_font(pdf, page_obj, palette.heading_font, first_line_clean):
+        if _extend_font(
+            pdf,
+            page_obj,
+            palette.heading_font,
+            first_line_clean,
+            resolver_cache,
+            substitution_log=substitution_log,
+        ):
             if font_action_str == "kept":
                 font_action_str = "extended"
         else:
@@ -1007,7 +1052,14 @@ def _replace_block_on_page(
 
     # Extend marker fonts
     for char, mfont in list(palette.marker_fonts.items()):
-        if mfont != clean_name and not _extend_font(pdf, page_obj, mfont, char):
+        if mfont != clean_name and not _extend_font(
+            pdf,
+            page_obj,
+            mfont,
+            char,
+            resolver_cache,
+            substitution_log=substitution_log,
+        ):
             del palette.marker_fonts[char]  # degrade: drop this marker
 
     # Build resolvers for ALL palette fonts
@@ -1017,7 +1069,7 @@ def _replace_block_on_page(
         if fn is None:
             continue  # narrow for mypy; set difference should have removed None
         with contextlib.suppress(KeyError, TypeError):
-            extra_resolvers[fn] = _resolver_cache.get_resolver(
+            extra_resolvers[fn] = resolver_cache.get_resolver(
                 page_obj,
                 fn.lstrip("/"),
             )
@@ -1164,7 +1216,11 @@ def _replace_block_on_page(
     new_stream = pikepdf.unparse_content_stream(new_ops)
     page_obj.Contents = pdf.make_stream(new_stream)
 
-    # Sync annotations: shift link rects to match new text position
+    # Sync annotations: shift link rects to match new text position.
+    # Orphan-removal also runs at the public-API entry points
+    # (replace_block / batch_replace_block / delete_block) so even the
+    # early-return branches in _replace_block_on_page (e.g. empty bbox)
+    # still clean up dangling links.
     delta_y = actual_first_y - (bbox[3] - font_size)
     if abs(delta_y) > 0.5:
         _sync_annotations_in_bbox(page_obj, bbox, delta_y, new_text)
@@ -1186,6 +1242,16 @@ def _replace_block_on_page(
     last_line_y = actual_first_y - max(0, len(lines) - 1) * line_height
     effective_delta = 0.0 if skip_vertical_shift else overflow_delta
 
+    # INV-C-4: prefer the metric-equivalent substitution name (e.g.
+    # "Carlito-Regular" when the system lacks Calibri) over the
+    # CID-fallback alternative. Both are real substitutions, but the
+    # metric-equivalent one signals a *fidelity* concern (different
+    # outlines from the original); CID fallback merely picks a font
+    # already shown on the page.
+    substituted_name = (
+        substitution_log[0] if substitution_log else (clean_name if font_switched else None)
+    )
+
     result = EditResult(
         success=True,
         original_text=original_text,
@@ -1193,8 +1259,10 @@ def _replace_block_on_page(
         font_action=font_action_str,  # type: ignore[arg-type]
         warnings=shift_warnings,
         fidelity_report=FidelityReport(
-            font_preserved=font_action_str == "kept" and not font_switched,
-            font_substituted=clean_name if font_switched else None,
+            font_preserved=(
+                font_action_str == "kept" and not font_switched and not substitution_log
+            ),
+            font_substituted=substituted_name,
             overflow_detected=original_overflow > 0,
             reflow_applied=True,
             glyphs_missing=[],
@@ -1233,7 +1301,11 @@ def replace_block(
         EditResult with fidelity information.
     """
     validate_output_path(output_path)
-    pdf = pikepdf.Pdf.open(pdf_path)
+
+    # Per-call cache (ARY-283)
+    resolver_cache = FontResolverCache()
+
+    pdf = open_pdf(pdf_path)
     try:
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
@@ -1243,12 +1315,19 @@ def replace_block(
             page_number,
             bbox,
             new_text,
+            resolver_cache,
             font_name,
             font_size,
             line_height=line_height,
         )
+        # INV-W0-7: orphan-annotation cleanup must run regardless of
+        # whether _replace_block_on_page found text to surgery. A bbox
+        # may contain only annotations (no content stream text), and
+        # those still go orphan when the user asks us to replace the
+        # region with unrelated text.
+        _remove_orphaned_annotations(page_obj, bbox, new_text)
         pdf.save(output_path)
-        _invalidate_caches()
+        _invalidate_locator_cache()
         return result
     finally:
         pdf.close()
@@ -1296,7 +1375,10 @@ def batch_replace_block(
     if not replacements:
         return []
 
-    pdf = pikepdf.Pdf.open(pdf_path)
+    # Per-call cache (ARY-283)
+    resolver_cache = FontResolverCache()
+
+    pdf = open_pdf(pdf_path)
     try:
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
@@ -1310,6 +1392,7 @@ def batch_replace_block(
                 page_obj,
                 page_number,
                 replacements,
+                resolver_cache,
             )
 
         # Sort by y1 descending (topmost first) while preserving input order
@@ -1334,13 +1417,21 @@ def batch_replace_block(
                     page_number,
                     bbox,
                     new_text,
+                    resolver_cache,
                     line_height=line_height,
                     first_line_y_override=ffly,
                     skip_vertical_shift=True,
                 )
-                _invalidate_caches()
-                prev_last_line_y = last_y
+                _invalidate_locator_cache()
+                # Only update the running cursor on success — the failure
+                # branches return last_y=bbox[3] (top of the failed region)
+                # as a placeholder, which would mis-position subsequent
+                # sections in sequential mode if propagated.
+                if result.success:
+                    prev_last_line_y = last_y
                 results.append((orig_idx, result))
+                # INV-W0-7: orphan-annotation cleanup per bbox.
+                _remove_orphaned_annotations(page_obj, bbox, new_text)
 
             # Net shift: adjust content below the region.
             # Measure the ACTUAL gap from the last rendered line to the
@@ -1360,7 +1451,7 @@ def batch_replace_block(
                     )
                 else:
                     # Measure actual gap to first content below region
-                    _invalidate_caches()
+                    _invalidate_locator_cache()
                     below_elems = [
                         e
                         for e in _build_index(page_obj, page_number)
@@ -1395,14 +1486,18 @@ def batch_replace_block(
                     page_number,
                     adjusted_bbox,
                     new_text,
+                    resolver_cache,
                     line_height=line_height,
                 )
-                _invalidate_caches()
+                _invalidate_locator_cache()
                 cumulative_shift += overflow
                 results.append((orig_idx, result))
+                # INV-W0-7: clean up orphan annotations regardless of
+                # whether the per-bbox surgery hit content.
+                _remove_orphaned_annotations(page_obj, adjusted_bbox, new_text)
 
         pdf.save(output_path)
-        _invalidate_caches()
+        _invalidate_locator_cache()
 
         # Return results in original input order
         results.sort(key=lambda t: t[0])
@@ -1445,7 +1540,11 @@ def insert_text_block(
         EditResult with fidelity information.
     """
     validate_output_path(output_path)
-    pdf = pikepdf.Pdf.open(pdf_path)
+
+    # Per-call cache (ARY-283)
+    resolver_cache = FontResolverCache()
+
+    pdf = open_pdf(pdf_path)
     try:
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
@@ -1478,7 +1577,7 @@ def insert_text_block(
         except (KeyError, TypeError) as exc:
             raise OperatorError(f"Font {font_name} not found in page resources") from exc
 
-        resolver = _resolver_cache.get_resolver(page_obj, clean_name)
+        resolver = resolver_cache.get_resolver(page_obj, clean_name)
 
         # Check encodability — extend font if needed
         can_enc, missing = resolver.can_encode(text)
@@ -1487,16 +1586,18 @@ def insert_text_block(
                 from pdf_edit_engine.fonts import extend_subset
 
                 extend_subset(pdf, page_obj, clean_name, "".join(missing))
-                _resolver_cache.evict(page_obj, clean_name)
-                resolver = _resolver_cache.get_resolver(page_obj, clean_name)
-            except Exception:
+                resolver_cache.evict(page_obj, clean_name)
+                resolver = resolver_cache.get_resolver(page_obj, clean_name)
+            except _FONT_EXTEND_FAIL_EXCS as exc:
                 logger.warning("Font extension failed for insert", exc_info=True)
                 return EditResult(
                     success=False,
                     original_text="",
                     new_text=text,
                     font_action="failed",
-                    warnings=["Font extension failed"],
+                    warnings=[
+                        f"Font extension failed for '{clean_name}' (missing: {missing!r}): {exc}"
+                    ],
                 )
 
         # Determine max width
@@ -1546,7 +1647,7 @@ def insert_text_block(
         new_stream = pikepdf.unparse_content_stream(ops)
         page_obj.Contents = pdf.make_stream(new_stream)
         pdf.save(output_path)
-        _invalidate_caches()
+        _invalidate_locator_cache()
 
         overflow = any("below page boundary" in w for w in shift_warnings)
         return EditResult(
@@ -1591,7 +1692,7 @@ def delete_block(
         EditResult with fidelity information.
     """
     validate_output_path(output_path)
-    pdf = pikepdf.Pdf.open(pdf_path)
+    pdf = open_pdf(pdf_path)
     try:
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
@@ -1671,7 +1772,7 @@ def delete_block(
             )
 
         pdf.save(output_path)
-        _invalidate_caches()
+        _invalidate_locator_cache()
 
         overflow = any("below page boundary" in w for w in warnings)
         return EditResult(
