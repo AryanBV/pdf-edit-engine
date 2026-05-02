@@ -32,7 +32,12 @@ jobs:
           cache-dependency-path: pyproject.toml
       - name: Install system fonts (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y fonts-liberation fonts-dejavu-core
+        # Carlito is the open-source metric equivalent of Calibri; its
+        # presence lets the metric-equivalent fallback path inside
+        # fonts.extend_subset / system_fonts execute on CI, which
+        # accounts for ~3-4pp of line coverage on Linux. Liberation +
+        # DejaVu cover the Helvetica / Times / Courier substitutes.
+        run: sudo apt-get install -y fonts-liberation fonts-dejavu-core fonts-crosextra-carlito
       - name: Install dependencies
         run: pip install -e ".[dev]"
       - name: Lint
@@ -62,4 +67,10 @@ jobs:
       - name: Install with dev extras
         run: pip install -e ".[dev]"
       - name: Run pip-audit on the resolved dependency closure
-        run: python -m pip_audit --skip-editable --strict
+        # `--skip-editable` skips pdf-edit-engine itself (installed via
+        # `pip install -e .` above). `--strict` is intentionally NOT
+        # passed: it promotes the editable-skip warning into an error,
+        # which contradicts `--skip-editable`'s purpose. The audit
+        # still fails on real CVE findings — the only thing dropped
+        # is the warning-as-error escalation.
+        run: python -m pip_audit --skip-editable

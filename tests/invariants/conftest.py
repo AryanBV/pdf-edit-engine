@@ -27,19 +27,32 @@ def cidfont_synthetic(corpus: Path) -> Path:
     return corpus / "cidfont_synthetic.pdf"
 
 
+# Real-world PDF fixtures (Chrome, Word/Google-Docs export, personal
+# resume) cannot be auto-generated like the synthetic corpus — they're
+# captured artifacts. On CI these files are absent (the .gitignore
+# excludes tests/corpus/*.pdf), so each fixture skips its dependent
+# tests cleanly when the file isn't present. Locally, the developer
+# has all three and the tests run normally. ARY-280 tracks adding a
+# reproducible Chrome-fixture generator for v0.1.3.
+def _skip_if_missing(path: Path) -> Path:
+    if not path.exists():
+        pytest.skip(f"corpus fixture missing: {path.name}")
+    return path
+
+
 @pytest.fixture
 def chrome_webpage(corpus: Path) -> Path:
     """Chrome-printed PDF (per-glyph Tm+Tj title pattern)."""
-    return corpus / "chrome_webpage.pdf"
+    return _skip_if_missing(corpus / "chrome_webpage.pdf")
 
 
 @pytest.fixture
 def resume_pdf(corpus: Path) -> Path:
     """Aryan's resume — multi-font Identity-H test artifact."""
-    return corpus / "Aryan_BV_Resume_2026.pdf"
+    return _skip_if_missing(corpus / "Aryan_BV_Resume_2026.pdf")
 
 
 @pytest.fixture
 def gdocs_document(corpus: Path) -> Path:
     """Google Docs export — multi-font Identity-H."""
-    return corpus / "gdocs_document.pdf"
+    return _skip_if_missing(corpus / "gdocs_document.pdf")
