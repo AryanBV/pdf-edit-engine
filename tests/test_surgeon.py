@@ -265,9 +265,14 @@ class TestReplaceAll:
         text = get_text(out)
         assert "Content" not in text
 
-    def test_not_found_returns_empty(self) -> None:
+    def test_not_found_returns_empty(self, tmp_path: Path) -> None:
         """Searching for nonexistent text returns empty list."""
-        results = replace_all(SIMPLE_PDF, "ZZZZZZZ", "YYYYYYY", "/tmp/nope.pdf")
+        # Use the tmp_path fixture (not "/tmp/...") so the test works on
+        # Windows runners where "/tmp/nope.pdf" resolves against the
+        # current drive — e.g. "D:\tmp\nope.pdf" — and validate_output_path
+        # refuses paths whose parent does not exist on the GH Actions image.
+        out = str(tmp_path / "nope.pdf")
+        results = replace_all(SIMPLE_PDF, "ZZZZZZZ", "YYYYYYY", out)
         assert results == []
 
     def test_single_occurrence(self, tmp_path: Path) -> None:
