@@ -956,7 +956,6 @@ def reflow_paragraph(
                     new_text=new_text,
                     font_action="failed",
                     fidelity_report=FidelityReport(
-                        font_preserved=True,
                         font_substituted=None,
                         overflow_detected=False,
                         reflow_applied=True,
@@ -976,7 +975,6 @@ def reflow_paragraph(
                 new_text=new_text,
                 font_action="failed",
                 fidelity_report=FidelityReport(
-                    font_preserved=True,
                     font_substituted=None,
                     overflow_detected=False,
                     reflow_applied=True,
@@ -1110,7 +1108,6 @@ def reflow_paragraph(
         font_action=font_action,
         warnings=warnings,
         fidelity_report=FidelityReport(
-            font_preserved=True,
             # INV-C-4: surface metric-equivalent if any was used.
             font_substituted=substitution_log[0] if substitution_log else None,
             overflow_detected=overflow,

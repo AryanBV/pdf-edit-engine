@@ -55,15 +55,84 @@ class TextMatch:
     operator_refs: list[int]
 
 
+DegradationKind = Literal[
+    "font_extension_failed",
+    "kerning_compressed",
+    "kerning_widened",
+    "heading_font_dropped",
+    "marker_font_dropped",
+    "paragraph_detection_low_confidence",
+    "overflow_shift_clamped",
+    "overflow_shift_suppressed",
+    "line_height_compressed",
+    "reflow_aborted_to_simple",
+    "font_coverage_extended",
+    "font_coverage_substituted",
+]
+
+
+FONT_AFFECTING_KINDS: frozenset[str] = frozenset(
+    {
+        "heading_font_dropped",
+        "marker_font_dropped",
+        "font_extension_failed",
+    }
+)
+
+
+@dataclass(frozen=True)
+class Degradation:
+    """A single typed degradation event surfaced by an edit operation.
+
+    Frozen so that structural equality holds (used by the dry_run parity
+    contract: the degradations list produced by ``dry_run=True`` must equal
+    the list produced by ``dry_run=False`` for the same input).
+
+    ``kind`` is one of twelve canonical values (see ``DegradationKind``).
+    ``detail`` carries site-specific context (e.g. ``"Tz 88%"`` or
+    ``"tier=1.5,chars=ø,ü,source=Carlito-Regular"``). ``severity`` is one
+    of ``"info"``, ``"warning"``, or ``"error"``.
+    """
+
+    kind: DegradationKind
+    detail: str = ""
+    severity: Literal["info", "warning", "error"] = "info"
+
+
 @dataclass
 class FidelityReport:
-    """Report on the fidelity of an edit operation."""
+    """Report on the fidelity of an edit operation.
 
-    font_preserved: bool
+    ``font_preserved`` is a computed property derived from ``degradations``
+    and ``font_substituted`` (INV-J-8); the constructor does not accept it.
+
+    ``glyphs_missing`` reflects the **pre-extension state**: chars that
+    were missing from the font at the time ``can_encode`` was called.
+    After successful extension the chars ARE in the font, but
+    ``glyphs_missing`` still lists them as a record of what triggered the
+    extension. This is information-preserving for callers who want to see
+    what extension covered.
+    """
+
     font_substituted: str | None
     overflow_detected: bool
     reflow_applied: bool
     glyphs_missing: list[str]
+    degradations: list[Degradation] = field(default_factory=list)
+
+    @property
+    def font_preserved(self) -> bool:
+        """True iff the original font's identity was preserved.
+
+        Returns False when ``font_substituted`` is non-None (a metric-equivalent
+        was used) OR when any degradation kind in ``FONT_AFFECTING_KINDS``
+        was emitted. Extension (``font_coverage_extended`` / ``...substituted``)
+        does NOT clear this flag — those record what extension covered, not
+        an identity break.
+        """
+        return self.font_substituted is None and not any(
+            d.kind in FONT_AFFECTING_KINDS for d in self.degradations
+        )
 
 
 @dataclass
@@ -77,7 +146,6 @@ class EditResult:
     warnings: list[str] = field(default_factory=list)
     fidelity_report: FidelityReport = field(
         default_factory=lambda: FidelityReport(
-            font_preserved=True,
             font_substituted=None,
             overflow_detected=False,
             reflow_applied=False,

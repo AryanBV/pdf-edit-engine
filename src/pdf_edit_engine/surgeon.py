@@ -573,7 +573,6 @@ def _apply_single_replacement(
                     new_text=new_text,
                     font_action="failed",
                     fidelity_report=FidelityReport(
-                        font_preserved=True,
                         font_substituted=None,
                         overflow_detected=False,
                         reflow_applied=False,
@@ -593,7 +592,6 @@ def _apply_single_replacement(
                 new_text=new_text,
                 font_action="failed",
                 fidelity_report=FidelityReport(
-                    font_preserved=True,
                     font_substituted=None,
                     overflow_detected=False,
                     reflow_applied=False,
@@ -807,7 +805,6 @@ def _apply_single_replacement(
         new_text=new_text,
         font_action=font_action,
         fidelity_report=FidelityReport(
-            font_preserved=True,
             # INV-C-4: surface the metric-equivalent name (if any).
             font_substituted=substitution_log[0] if substitution_log else None,
             overflow_detected=overflow,

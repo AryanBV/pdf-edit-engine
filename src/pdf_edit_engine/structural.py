@@ -686,7 +686,6 @@ def shift_content_below(
             font_action="kept",
             warnings=warnings,
             fidelity_report=FidelityReport(
-                font_preserved=True,
                 font_substituted=None,
                 overflow_detected=overflow,
                 reflow_applied=False,
@@ -1259,9 +1258,14 @@ def _replace_block_on_page(
         font_action=font_action_str,  # type: ignore[arg-type]
         warnings=shift_warnings,
         fidelity_report=FidelityReport(
-            font_preserved=(
-                font_action_str == "kept" and not font_switched and not substitution_log
-            ),
+            # font_preserved is now a computed @property on FidelityReport
+            # (INV-J-8). It returns True iff font_substituted is None AND no
+            # FONT_AFFECTING_KINDS Degradation was emitted. The pre-v0.1.3
+            # expression here lied about font_action_str=="extended" success
+            # (returned False even though extension preserves font identity);
+            # the computed property fixes that. font_switched populates
+            # substituted_name above (line 1252 fallback), so the new property
+            # still detects body-font swaps via font_substituted is not None.
             font_substituted=substituted_name,
             overflow_detected=original_overflow > 0,
             reflow_applied=True,
@@ -1657,7 +1661,6 @@ def insert_text_block(
             font_action="kept",
             warnings=shift_warnings,
             fidelity_report=FidelityReport(
-                font_preserved=True,
                 font_substituted=None,
                 overflow_detected=overflow,
                 reflow_applied=True,
@@ -1782,7 +1785,6 @@ def delete_block(
             font_action="kept",
             warnings=warnings,
             fidelity_report=FidelityReport(
-                font_preserved=True,
                 font_substituted=None,
                 overflow_detected=overflow,
                 reflow_applied=False,
