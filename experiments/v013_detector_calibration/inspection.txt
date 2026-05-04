@@ -1,0 +1,119 @@
+﻿
+=== SOW (Word, WinAnsi): input.pdf ===
+  MediaBox: 595 x 842
+  ops: total=2437
+    drawing: re=308 f=0 S=0 s=0 B=0
+    text: BT=150 ET=150
+    text-show: Tj=0 TJ=150 Tf=150 Tm=150 Td=0
+    marked: BMC=25 BDC=60
+    BMC/BDC tags (first 50): {'/Span': 30, '/Artifact': 16, '/P': 4}
+  paragraphs detected: 67
+    [ 0] x= 43.0 y= 779.5 w=176.4 lines=1 font=F1                   text='MERIDIAN LOGISTICS'
+    [ 1] x=220.0 y= 779.5 w= 21.3 lines=2 font=F2                   text='   '
+    [ 2] x= 43.0 y= 764.0 w=195.7 lines=1 font=F2                   text='Cold-chain pharmaceutical logistics  ·  Amsterdam, NL'
+    [ 3] x= 43.0 y= 734.7 w=231.2 lines=1 font=F1                   text='Statement of Work #SOW-2026-0247'
+    [ 4] x=274.0 y= 734.7 w=  2.9 lines=1 font=F2                   text=' '
+    [ 5] x=107.0 y= 717.0 w=201.1 lines=1 font=F2                   text='   '
+    [ 6] x= 43.0 y= 717.0 w=262.8 lines=1 font=F1                   text='SERVICE PROVIDER CLIENT'
+    [ 7] x= 43.0 y= 702.2 w= 82.8 lines=1 font=F1                   text='Meridian Logistics'
+    [ 8] x=126.0 y= 702.2 w=  2.3 lines=1 font=F2                   text=' '
+    [ 9] x=283.0 y= 702.2 w=100.4 lines=1 font=F1                   text='Apex Pharmaceuticals'
+    [10] x=383.0 y= 702.2 w=  2.9 lines=1 font=F2                   text=' '
+    [11] x=144.0 y= 689.0 w=217.1 lines=1 font=F2                   text='   '
+    [12] x= 43.0 y= 689.0 w=315.4 lines=1 font=F2                   text='Schiphol Logistics Centre Frankfurt am Main'
+    [13] x=146.0 y= 676.7 w=176.4 lines=1 font=F2                   text='   '
+    [14] x= 43.0 y= 676.7 w=276.9 lines=1 font=F2                   text='Amsterdam, Netherlands Germany'
+    [15] x=351.0 y= 656.5 w=  2.4 lines=1 font=F2                   text=' '
+    [16] x= 43.0 y= 656.5 w= 40.5 lines=1 font=F2                   text='Effective: '
+    [17] x= 84.0 y= 656.5 w= 48.3 lines=1 font=F1                   text='1 June 2026'
+    [18] x=132.0 y= 656.5 w= 42.6 lines=1 font=F2                   text='       Term: '
+    [19] x=175.0 y= 656.5 w=175.5 lines=1 font=F1                   text='Twelve (12) months, expiring 31 May 2027'
+    [20] x= 43.0 y= 633.2 w= 95.2 lines=1 font=F1                   text='1.  Scope of Work'
+    [21] x=138.0 y= 633.2 w=  2.5 lines=1 font=F2                   text=' '
+    [22] x= 43.0 y= 611.7 w=507.9 lines=6 font=F2                   text='Meridian Logistics shall provide end-to-end cold-chain distribution services for'
+    [23] x= 43.0 y= 520.9 w= 83.1 lines=1 font=F1                   text='2.  Deliverables'
+    [24] x=126.0 y= 520.9 w=  2.5 lines=1 font=F2                   text=' '
+    [25] x= 50.0 y= 495.9 w= 45.7 lines=1 font=F1                   text='Milestone'
+    [26] x= 96.0 y= 495.9 w=  2.0 lines=1 font=F2                   text=' '
+    [27] x=358.0 y= 495.9 w= 52.9 lines=1 font=F1                   text='Target date'
+    [28] x=411.0 y= 495.9 w=  2.2 lines=1 font=F2                   text=' '
+    [29] x= 50.0 y= 475.9 w=389.7 lines=4 font=F2                   text='Carrier capacity allocation  15 June 2026  Customs documentation set  1 July 202'
+
+=== reportlab_table.pdf: reportlab_table.pdf ===
+  MediaBox: 612 x 792
+  ops: total=156
+    drawing: re=1 f=0 S=9 s=0 B=0
+    text: BT=17 ET=17
+    text-show: Tj=14 TJ=0 Tf=5 Tm=14 Td=2
+    marked: BMC=0 BDC=0
+  paragraphs detected: 4
+    [ 0] x=234.0 y= 696.0 w=173.3 lines=1 font=F2                   text='Quarterly Report'
+    [ 1] x= 96.0 y= 659.0 w=336.0 lines=1 font=F2                   text='Quarter Revenue Expenses'
+    [ 2] x= 96.0 y= 641.0 w=430.0 lines=3 font=F1                   text='Q1 2026 $1,200,000 $980,000 Q2 2026 $1,350,000 $1,020,000 Q3 2026 $1,500,000 $1,'
+    [ 3] x= 78.0 y= 570.0 w=216.0 lines=1 font=F1                   text='Total revenue exceeded expectations.'
+
+=== chrome_webpage.pdf: chrome_webpage.pdf ===
+  MediaBox: 595 x 842
+  ops: total=2983
+    drawing: re=84 f=44 S=7 s=0 B=0
+    text: BT=97 ET=97
+    text-show: Tj=514 TJ=0 Tf=97 Tm=97 Td=417
+    marked: BMC=0 BDC=44
+    BMC/BDC tags (first 50): {'/NonStruct': 33, '/Figure': 5, '/H1': 1, '/H2': 2, '/Code': 1, '/Form': 2}
+  paragraphs detected: 16
+    [ 0] x= 50.0 y= 781.9 w=211.1 lines=1 font=F39                  text='Pro Teams Pricing Documentation'
+    [ 1] x= 81.0 y= 679.9 w= 96.6 lines=1 font=F6                   text='Search packages'
+    [ 2] x=493.0 y= 679.9 w= 40.0 lines=1 font=F43                  text='Search'
+    [ 3] x= 43.0 y= 613.2 w=266.1 lines=1 font=F4                   text='@aryanbv/pdf-toolkit-mcp'
+    [ 4] x= 43.0 y= 589.9 w=235.7 lines=1 font=F6                   text='0.2.4\xa0•\xa0Public\xa0•\xa0Published 2 days ago'
+    [ 5] x=283.0 y= 558.4 w= 46.6 lines=2 font=F4                   text=' Readme Code '
+    [ 6] x=316.0 y= 527.7 w= 18.9 lines=1 font=F4                   text='Beta'
+    [ 7] x=263.0 y= 492.4 w= 88.9 lines=4 font=F4                   text='11 Dependencies 0 Dependents 6 Versions  Settings'
+    [ 8] x= 43.0 y= 346.9 w=274.4 lines=1 font=F4                   text='PDF Toolkit MCP Server'
+    [ 9] x= 48.0 y= 253.2 w=285.9 lines=1 font=F17                  text='nnppmmvv00..22..44lliicceennsseeMMIITTnnooddee>>==1188ttoooollss1166'
+    [10] x= 43.0 y= 304.9 w=467.6 lines=2 font=F10                  text='MCP server for PDF manipulation — create from Markdown, fill forms, merge, split'
+    [11] x=103.0 y= 248.7 w=126.7 lines=1 font=F10                  text='     '
+    [12] x= 43.0 y= 208.2 w= 60.8 lines=1 font=F4                   text='Install'
+    [13] x= 52.0 y= 159.4 w=226.1 lines=1 font=F6                   text='npx -y @aryanbv/pdf-toolkit-mcp'
+    [14] x= 43.0 y= 109.9 w=300.1 lines=1 font=F10                  text='No config files, no API keys, no Docker. Works offline.'
+    [15] x= 43.0 y=  69.4 w=272.2 lines=1 font=F4                   text='Create PDFs from Markdown'
+
+=== Aryan_BV_Resume_2026.pdf: Aryan_BV_Resume_2026.pdf ===
+  MediaBox: 595 x 842
+  ops: total=2730
+    drawing: re=234 f=0 S=0 s=0 B=0
+    text: BT=228 ET=228
+    text-show: Tj=0 TJ=228 Tf=228 Tm=228 Td=0
+    marked: BMC=6 BDC=71
+    BMC/BDC tags (first 50): {'/P': 5, '/Span': 40, '/Artifact': 5}
+  paragraphs detected: 119
+    [ 0] x= 14.0 y= 818.2 w= 64.9 lines=1 font=F1                   text='Aryan B V'
+    [ 1] x= 79.0 y= 818.2 w=  3.9 lines=1 font=F2                   text=' '
+    [ 2] x= 14.0 y= 802.2 w=193.7 lines=1 font=F3                   text='Full-Stack Software Developer | AI/ML Engineer'
+    [ 3] x=208.0 y= 802.2 w=  2.1 lines=1 font=F4                   text=' '
+    [ 4] x= 14.0 y= 788.7 w=369.5 lines=1 font=F3                   text='Email: aryansalian5678@gmail.com | Phone: +91-6361801455 | Location: Bangalore, '
+    [ 5] x=384.0 y= 788.7 w=  2.2 lines=1 font=F4                   text=' '
+    [ 6] x= 14.0 y= 775.0 w=113.6 lines=1 font=F3                   text='LinkedIn | GitHub| Portfolio'
+    [ 7] x=128.0 y= 775.0 w=  2.1 lines=1 font=F4                   text=' '
+    [ 8] x= 14.0 y= 763.0 w=  2.2 lines=1 font=F4                   text=' '
+    [ 9] x= 14.0 y= 748.7 w=121.9 lines=1 font=F1                   text='PROFESSIONAL SUMMARY'
+    [10] x=136.0 y= 748.7 w=  2.3 lines=1 font=F2                   text=' '
+    [11] x= 14.0 y= 736.2 w=  2.2 lines=1 font=F4                   text=' '
+    [12] x= 14.0 y= 724.2 w=563.0 lines=4 font=F3                   text='Full-stack developer and AI/ML engineer who ships production-grade systems end-t'
+    [13] x=176.0 y= 687.7 w=  2.6 lines=1 font=F4                   text=' '
+    [14] x= 14.0 y= 675.2 w=  2.5 lines=1 font=F4                   text=' '
+    [15] x= 14.0 y= 662.0 w= 54.4 lines=1 font=F1                   text='EDUCATION'
+    [16] x= 69.0 y= 662.0 w=  2.0 lines=1 font=F2                   text=' '
+    [17] x= 14.0 y= 649.5 w=  2.2 lines=1 font=F4                   text=' '
+    [18] x= 14.0 y= 637.5 w=217.8 lines=1 font=F1                   text='B.Tech in Artificial Intelligence and Machine Learning'
+    [19] x=232.0 y= 637.5 w=  2.6 lines=1 font=F2                   text=' '
+    [20] x= 14.0 y= 623.7 w=338.7 lines=1 font=F3                   text='M S Ramaiah University of Applied Sciences, Bangalore | 2021 – 2025 | GPA: 8.0/1'
+    [21] x=353.0 y= 623.7 w=  2.2 lines=1 font=F4                   text=' '
+    [22] x= 14.0 y= 610.2 w=  2.5 lines=1 font=F4                   text=' '
+    [23] x= 14.0 y= 595.4 w= 82.1 lines=1 font=F1                   text='TECHNICAL SKILLS'
+    [24] x= 96.0 y= 595.4 w=  2.5 lines=1 font=F2                   text=' '
+    [25] x= 14.0 y= 582.9 w=  2.2 lines=1 font=F2                   text=' '
+    [26] x= 14.0 y= 570.9 w= 46.2 lines=1 font=F1                   text='Languages:'
+    [27] x= 60.0 y= 570.9 w=165.2 lines=1 font=F3                   text=' JavaScript, TypeScript, Python, Java, SQL'
+    [28] x=226.0 y= 570.9 w=  1.9 lines=1 font=F4                   text=' '
+    [29] x= 15.0 y= 557.4 w= 40.0 lines=1 font=F1                   text='Frontend:'

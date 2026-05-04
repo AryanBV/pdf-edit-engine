@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+# Intermediate artifacts (leading underscore convention)
+_*.pdf
+_*.png

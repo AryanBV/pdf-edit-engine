@@ -1,0 +1,16 @@
+fixture                                       rects   paragraphs x_cols 
+---------------------------------------------------------------------------
+Aryan_BV_Resume_2026.pdf                      234     119        40     
+Aryan_BV_Resume_2026_swapped.pdf              3       89         27     
+chrome_webpage.pdf                            789     16         9      
+cidfont_synthetic.pdf                         0       2          1      
+complex_contract.pdf                          12      11         6      
+complex_multifont.pdf                         0       8          4      
+complex_pymupdf_edited.pdf                    1       4          2      
+complex_transformed.pdf                       0       5          1      
+gdocs_document.pdf                            5       67         16     
+pikepdf_synthetic.pdf                         2       2          2      
+reportlab_forms.pdf                           0       3          1      
+reportlab_multipage.pdf                       0       2          1      
+reportlab_simple.pdf                          1       3          1      
+reportlab_table.pdf                           10      4          3      
