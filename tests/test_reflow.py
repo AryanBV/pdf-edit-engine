@@ -11,9 +11,14 @@ from pdf_edit_engine.encoding import FontResolverCache
 from pdf_edit_engine.locator import find, get_text
 from pdf_edit_engine.models import FontInfo, TextCharacter, TextMatch
 from pdf_edit_engine.reflow import (
+    S1_MIN,
+    S2_MAX,
+    S3_MIN,
+    _low_confidence_diagnostics,
     break_into_lines,
     detect_paragraphs,
     find_paragraph_for_match,
+    is_low_confidence_paragraph,
 )
 from pdf_edit_engine.surgeon import replace
 
@@ -534,3 +539,72 @@ class TestReflowOverflowShift:
             f"Shift-overflow regression: content below the reflowed paragraph "
             f"was overwritten. Extracted text: {text!r}"
         )
+
+
+# ── Phase 3 (v0.1.3): S5 low-confidence paragraph signal ────────────────
+
+
+class TestS5LowConfidenceSignal:
+    """Tests for is_low_confidence_paragraph (ARY-292 surfacing)."""
+
+    def test_thresholds_match_design_doc(self) -> None:
+        """Locked thresholds per fpr_table.md / design doc §2."""
+        assert S1_MIN == 0.50
+        assert S2_MAX == 0.55
+        assert S3_MIN == 2
+
+    def test_table_merge_paragraph_triggers(self) -> None:
+        """Reportlab table 'Q1 2026 $1,200,000 $980,000 ...' must trigger S5."""
+        path = str(CORPUS / "reportlab_table.pdf")
+        if not Path(path).exists():
+            pytest.skip("reportlab_table.pdf not in corpus")
+        paras = detect_paragraphs(path)
+        with pikepdf.open(path) as pdf:
+            page_w = float(pdf.pages[0].MediaBox[2])
+        # Find the table-data paragraph (multi-line financials).
+        table_para = None
+        for p in paras:
+            if "Q1 2026" in p.full_text and "Q2 2026" in p.full_text:
+                table_para = p
+                break
+        assert table_para is not None, "expected merged table paragraph"
+        assert is_low_confidence_paragraph(table_para, page_w), (
+            f"table-merge paragraph should trigger S5 — diagnostics="
+            f"{_low_confidence_diagnostics(table_para, page_w)}"
+        )
+
+    def test_natural_paragraph_does_not_trigger(self) -> None:
+        """A natural multi-line flowing paragraph in reportlab_simple stays under S5."""
+        paras = detect_paragraphs(SIMPLE_PDF)
+        with pikepdf.open(SIMPLE_PDF) as pdf:
+            page_w = float(pdf.pages[0].MediaBox[2])
+        body = [p for p in paras if p.line_count >= 2]
+        # At least one body paragraph; none should trigger S5 in this fixture.
+        assert body, "expected at least one body paragraph"
+        for p in body:
+            triggered = is_low_confidence_paragraph(p, page_w)
+            assert not triggered, (
+                f"natural paragraph triggered S5: {p.full_text[:60]!r} "
+                f"diagnostics={_low_confidence_diagnostics(p, page_w)}"
+            )
+
+    def test_diagnostics_returns_three_components(self) -> None:
+        """_low_confidence_diagnostics returns (s1, s2, s3) tuple."""
+        paras = detect_paragraphs(SIMPLE_PDF)
+        if not paras:
+            pytest.skip("no paragraphs in reportlab_simple")
+        with pikepdf.open(SIMPLE_PDF) as pdf:
+            page_w = float(pdf.pages[0].MediaBox[2])
+        s1, s2, s3 = _low_confidence_diagnostics(paras[0], page_w)
+        assert isinstance(s1, float)
+        assert isinstance(s2, float)
+        assert isinstance(s3, int)
+
+    def test_zero_page_width_returns_safe_diagnostics(self) -> None:
+        """Degenerate page_width=0 must not crash; returns (0, 1, 0) → no trigger."""
+        paras = detect_paragraphs(SIMPLE_PDF)
+        if not paras:
+            pytest.skip()
+        s1, s2, s3 = _low_confidence_diagnostics(paras[0], 0.0)
+        assert (s1, s2, s3) == (0.0, 1.0, 0)
+        assert not is_low_confidence_paragraph(paras[0], 0.0)

@@ -15,6 +15,7 @@ from pdf_edit_engine._pathutil import open_pdf
 from pdf_edit_engine.errors import EncodingError, FontNotFoundError, ReflowError
 from pdf_edit_engine.models import (
     ContentElement,
+    Degradation,
     EditResult,
     FidelityReport,
     Paragraph,
@@ -307,6 +308,66 @@ def _build_paragraph(
         line_count=len(lines),
         operator_indices=op_indices,
     )
+
+
+# ── v0.1.3 (Phase 3) S5 low-confidence paragraph signal (ARY-292 surfacing) ──
+# Locked thresholds per docs/v0.1.3-implementation-design.md §2 and
+# experiments/v013_detector_calibration/fpr_table.md "Locked decision: S5".
+# FPR=0%, recall=64% on the labeled corpus (TP=7, FN=4, FP=0).
+S1_MIN: float = 0.50  # paragraph_width / page_width threshold
+S2_MAX: float = 0.55  # avg row stub coverage (above = natural flow)
+S3_MIN: int = 2  # x-cluster count of element starts
+Y_BUCKET: float = 4.0  # pt — line clustering granularity
+X_TOL: float = 8.0  # pt — x-cluster tolerance
+
+
+def _low_confidence_diagnostics(
+    paragraph: Paragraph, page_width: float
+) -> tuple[float, float, int]:
+    """Compute S1, S2, S3 for the S5 low-confidence signal.
+
+    Pure function; no PDF state mutation. Returns the three signal
+    components so callers can populate Degradation.detail with the
+    actual measurements (e.g. "width=0.62,cov=0.41,cols=3").
+    """
+    if page_width <= 0 or paragraph.paragraph_width <= 0:
+        return 0.0, 1.0, 0
+
+    s1 = paragraph.paragraph_width / page_width
+
+    # S2: avg over y-buckets of (sum of element-line-widths / paragraph_width).
+    lines: dict[int, float] = {}
+    for e in paragraph.elements:
+        y_bucket = round(e.bbox[1] / Y_BUCKET) * int(Y_BUCKET)
+        line_w = e.bbox[2] - e.bbox[0]
+        lines[y_bucket] = lines.get(y_bucket, 0.0) + line_w
+    s2 = sum(w / paragraph.paragraph_width for w in lines.values()) / len(lines) if lines else 1.0
+
+    # S3: distinct x-clusters of element x-starts within tol.
+    xs = sorted(e.bbox[0] for e in paragraph.elements)
+    if not xs:
+        return s1, s2, 0
+    s3 = 1
+    last = xs[0]
+    for x in xs[1:]:
+        if x - last > X_TOL:
+            s3 += 1
+        last = x
+
+    return s1, s2, s3
+
+
+def is_low_confidence_paragraph(paragraph: Paragraph, page_width: float) -> bool:
+    """S5 low-confidence signal per design doc §2 (locked).
+
+    Returns True when the paragraph likely represents a misgrouped
+    table-cell cluster: wide enough to span columns (S1), with
+    significant white-space gaps per line (S2), AND multiple distinct
+    x-start clusters indicating column boundaries (S3). All three must
+    hold. False-positive rate on labeled corpus: 0% (FP=0/246).
+    """
+    s1, s2, s3 = _low_confidence_diagnostics(paragraph, page_width)
+    return s1 >= S1_MIN and s2 < S2_MAX and s3 >= S3_MIN
 
 
 def _detect_paragraphs_from_index(
@@ -1101,6 +1162,21 @@ def reflow_paragraph(
     if len(fonts_in_para) > 1:
         warnings.append("Mixed-font paragraph: reflowed using single font")
 
+    # v0.1.3 Phase 3: post-pass S5 low-confidence detector signal (ARY-292).
+    # The detector grouping is unchanged in v0.1.3 — we only surface what's
+    # misgrouped. Algorithm fix is v0.1.4 work.
+    page_width = float(page.MediaBox[2]) - float(page.MediaBox[0]) if page.MediaBox else 612.0
+    detector_degradations: list[Degradation] = []
+    if is_low_confidence_paragraph(paragraph, page_width):
+        s1, s2, s3 = _low_confidence_diagnostics(paragraph, page_width)
+        detector_degradations.append(
+            Degradation(
+                kind="paragraph_detection_low_confidence",
+                detail=f"width={s1:.2f},cov={s2:.2f},cols={s3}",
+                severity="info",
+            )
+        )
+
     return EditResult(
         success=True,
         original_text=match.matched_text,
@@ -1113,5 +1189,6 @@ def reflow_paragraph(
             overflow_detected=overflow,
             reflow_applied=True,
             glyphs_missing=[],
+            degradations=detector_degradations,
         ),
     )
