@@ -1,0 +1,69 @@
+Input PDF: C:\New Project\pdf-edit-engine\experiments\v013_kerning_compare\input.pdf  (exists=True, size=173604)
+Target:      'Sarah Chen'
+Replacement: 'Søren Müller'
+
+========================================================================
+1. All page-1 fonts in input.pdf
+========================================================================
+  /F1: BaseFont=/BCDEEE+Calibri-Bold  Subtype=/TrueType  Encoding=/WinAnsiEncoding
+  /F2: BaseFont=/BCDFEE+Calibri  Subtype=/TrueType  Encoding=/WinAnsiEncoding
+  /F3: BaseFont=/BCDGEE+Calibri-Italic  Subtype=/TrueType  Encoding=/WinAnsiEncoding
+
+========================================================================
+2. Locate the font that renders 'Sarah Chen'
+========================================================================
+  Target font resource = /F1
+  /BaseFont = /BCDEEE+Calibri-Bold
+  /Subtype  = /TrueType
+  /Encoding = /WinAnsiEncoding
+
+========================================================================
+3. Target font /Widths range and coverage of ø (0xF8) and ü (0xFC)
+========================================================================
+  /FirstChar=32  /LastChar=122  len(/Widths)=91
+    ø (0xF8): in /FirstChar..LastChar range = False, width entry present = False, width = None
+    ü (0xFC): in /FirstChar..LastChar range = False, width entry present = False, width = None
+
+========================================================================
+4. Target font /FontFile2 cmap coverage of U+00F8 and U+00FC
+========================================================================
+  /FontFile2 raw size = 141780 bytes
+  glyphOrder length = 6954 glyphs
+  cmap entries = 118
+    ø U+00F8: NOT in cmap (no glyph)
+    ü U+00FC: NOT in cmap (no glyph)
+
+========================================================================
+5. Direct call: FontResolver.can_encode(REPLACEMENT)
+========================================================================
+  encoding_type = WinAnsi
+  is_cid_font   = False
+  can_encode('Søren Müller') = (can_enc=True, missing=[])
+    char 'S' (U+0053): can_encode = True, missing = []
+    char 'ø' (U+00F8): can_encode = True, missing = []
+    char 'r' (U+0072): can_encode = True, missing = []
+    char 'e' (U+0065): can_encode = True, missing = []
+    char 'n' (U+006E): can_encode = True, missing = []
+    char ' ' (U+0020): can_encode = True, missing = []
+    char 'M' (U+004D): can_encode = True, missing = []
+    char 'ü' (U+00FC): can_encode = True, missing = []
+    char 'l' (U+006C): can_encode = True, missing = []
+    char 'l' (U+006C): can_encode = True, missing = []
+    char 'e' (U+0065): can_encode = True, missing = []
+    char 'r' (U+0072): can_encode = True, missing = []
+
+========================================================================
+6. Engine replace() — observe EditResult.font_action
+========================================================================
+  result.success            = True
+  result.font_action        = 'kept'
+  result.warnings           = []
+  fidelity.font_preserved   = True
+  fidelity.font_substituted = None
+  fidelity.glyphs_missing   = []
+  fidelity.overflow_detected= False
+
+========================================================================
+Diagnosis summary
+========================================================================
+  See font_extension_bug.md for the file:line citations and scope estimate.
