@@ -18,6 +18,87 @@ from pdf_edit_engine.system_fonts import _strip_subset_prefix
 logger = logging.getLogger(__name__)
 
 
+# ── Public coverage helper (used by encoding.FontResolver.can_encode) ────
+
+
+# Cache parsed TTFont per font dict's object generation pair to avoid
+# re-parsing the embedded /FontFile2 on every can_encode call. The cache
+# is process-local; pikepdf objects are not stable identifiers across
+# pdf.open boundaries so we don't try to share across PDFs.
+_FONTFILE2_CACHE: dict[tuple[int, int], frozenset[int]] = {}
+
+
+def _font_dict_key(font_dict: pikepdf.Object) -> tuple[int, int] | None:
+    """Object generation pair for cache keying. None if not an indirect ref."""
+    try:
+        return (int(font_dict.objgen[0]), int(font_dict.objgen[1]))
+    except (AttributeError, TypeError):
+        return None
+
+
+def font_has_codepoint(font_dict: pikepdf.Object, codepoint: int) -> bool:
+    """Return True iff the font's embedded /FontFile2 covers ``codepoint``.
+
+    Used by ``encoding.FontResolver.can_encode`` to verify glyph coverage
+    end-to-end (not just encoding-map membership). Encapsulates the
+    fontTools dependency in this module — encoding.py must not import
+    fontTools (CLAUDE.md dependency-boundary table).
+
+    Algorithm: load the /FontFile2 via fontTools, get its best cmap,
+    and check whether ``codepoint`` maps to a glyph name present in
+    ``getGlyphOrder()``. Returns True (best-effort) when /FontFile2 is
+    absent or unparseable so that can_encode does not regress on fonts
+    where coverage cannot be verified.
+
+    Args:
+        font_dict: The pikepdf font dictionary or descendant CIDFont dict.
+        codepoint: Unicode codepoint to check.
+
+    Returns:
+        True if the codepoint has a glyph in the embedded font binary,
+        OR if /FontFile2 cannot be loaded (best-effort fallback).
+    """
+    cache_key = _font_dict_key(font_dict)
+    if cache_key is not None and cache_key in _FONTFILE2_CACHE:
+        return codepoint in _FONTFILE2_CACHE[cache_key]
+
+    try:
+        # /FontDescriptor is on the font dict itself for simple fonts;
+        # for Type0/CID it lives on the descendant CIDFont. Caller passes
+        # whichever dict has /FontDescriptor.
+        font_descriptor = font_dict.get("/FontDescriptor")
+        if font_descriptor is None:
+            # Try descending into Type0's DescendantFonts[0] for CID case.
+            descendants = font_dict.get("/DescendantFonts")
+            if descendants is not None and len(descendants) > 0:
+                font_descriptor = descendants[0].get("/FontDescriptor")
+        if font_descriptor is None:
+            return True  # No descriptor → can't verify; best-effort True
+
+        font_file_obj = font_descriptor.get("/FontFile2")
+        if font_file_obj is None:
+            # /FontFile3 (CFF/OpenType) is not yet supported for coverage
+            # checks (ARY-279). Other slots: /FontFile (Type1) — also out
+            # of scope. Best-effort True.
+            return True
+
+        font_bytes = font_file_obj.read_bytes()
+        tt = TTFont(io.BytesIO(font_bytes))
+        try:
+            best_cmap = tt.getBestCmap() or {}
+            glyph_order = set(tt.getGlyphOrder())
+            covered: set[int] = {cp for cp, gname in best_cmap.items() if gname in glyph_order}
+        finally:
+            tt.close()
+    except Exception:  # noqa: BLE001 — best-effort, downstream still works
+        logger.debug("font_has_codepoint: TTFont parse failed", exc_info=True)
+        return True
+
+    if cache_key is not None:
+        _FONTFILE2_CACHE[cache_key] = frozenset(covered)
+    return codepoint in covered
+
+
 # ── Private helpers ──────────────────────────────────────────────────────
 
 

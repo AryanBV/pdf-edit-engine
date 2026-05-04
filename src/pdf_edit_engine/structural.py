@@ -19,7 +19,7 @@ from pdf_edit_engine._pathutil import open_pdf, validate_output_path
 from pdf_edit_engine.encoding import FontResolverCache
 from pdf_edit_engine.errors import OperatorError
 from pdf_edit_engine.locator import _build_index, _resolve_pages
-from pdf_edit_engine.models import ContentElement, EditResult, FidelityReport
+from pdf_edit_engine.models import ContentElement, Degradation, EditResult, FidelityReport
 from pdf_edit_engine.reflow import (
     _FONT_EXTEND_FAIL_EXCS,
     _build_replacement_ops,
@@ -839,6 +839,7 @@ def _extend_font(
     resolver_cache: FontResolverCache,
     *,
     substitution_log: list[str] | None = None,
+    coverage_tier_log: list[tuple[str, list[str]]] | None = None,
 ) -> bool:
     """Extend a font's subset to encode *text*.  Returns True on success.
 
@@ -846,6 +847,12 @@ def _extend_font(
     substitution events from ``extend_subset`` so the calling
     ``_replace_block_on_page`` / ``insert_text_block`` can surface them
     through ``FidelityReport.font_substituted`` (INV-C-4).
+
+    v0.1.3 (Phase 5): the optional *coverage_tier_log* captures
+    ``(tier, missing_chars)`` on successful extension so callers can emit
+    ``font_coverage_extended`` (Tier 1) or ``font_coverage_substituted``
+    (Tier 1.5) Degradations. Unlike substitution_log this carries the
+    tier even when no metric-equivalent fallback fires.
     """
     from pdf_edit_engine.fonts import extend_subset
 
@@ -857,7 +864,7 @@ def _extend_font(
     if not r.is_cid_font:
         return False  # can't extend non-CID fonts
     try:
-        extend_subset(
+        tier = extend_subset(
             pdf,
             page_obj,
             clean,
@@ -867,6 +874,8 @@ def _extend_font(
         resolver_cache.evict(page_obj, clean)
         r2 = resolver_cache.get_resolver(page_obj, clean)
         ok, _ = r2.can_encode(text)
+        if ok and coverage_tier_log is not None:
+            coverage_tier_log.append((tier, list(missing)))
         return ok
     except _FONT_EXTEND_FAIL_EXCS:
         logger.warning("Font extension failed for %s", font_name, exc_info=True)
@@ -913,6 +922,8 @@ def _replace_block_on_page(
     # FidelityReport can surface them. Empty list → no substitution
     # observed; first entry → name of the substitute font.
     substitution_log: list[str] = []
+    # v0.1.3 (Phase 5) coverage tier captures from extend_subset.
+    coverage_tier_log: list[tuple[str, list[str]]] = []
 
     # ── Phase 1: Analyze ──────────────────────────────────────────────
     elements = _build_index(page_obj, page_number)
@@ -1006,6 +1017,7 @@ def _replace_block_on_page(
             encodable_text,
             resolver_cache,
             substitution_log=substitution_log,
+            coverage_tier_log=coverage_tier_log,
         ):
             return (
                 EditResult(
@@ -1251,6 +1263,32 @@ def _replace_block_on_page(
         substitution_log[0] if substitution_log else (clean_name if font_switched else None)
     )
 
+    # v0.1.3 (Phase 5) emit coverage Degradations from any extend_subset
+    # events captured in coverage_tier_log. Pre-extension missing chars
+    # populate glyphs_missing (audit-bundle finding #3).
+    coverage_degradations: list[Degradation] = []
+    pre_extension_missing: list[str] = []
+    for tier, missing_chars in coverage_tier_log:
+        pre_extension_missing.extend(missing_chars)
+        chars_str = ",".join(missing_chars)
+        if tier == "cmap_only":
+            coverage_degradations.append(
+                Degradation(
+                    kind="font_coverage_extended",
+                    detail=f"tier=1,chars={chars_str}",
+                    severity="info",
+                )
+            )
+        elif tier == "full_extension":
+            source_suffix = f",source={substitution_log[0]}" if substitution_log else ""
+            coverage_degradations.append(
+                Degradation(
+                    kind="font_coverage_substituted",
+                    detail=f"tier=1.5,chars={chars_str}{source_suffix}",
+                    severity="warning",
+                )
+            )
+
     result = EditResult(
         success=True,
         original_text=original_text,
@@ -1269,7 +1307,8 @@ def _replace_block_on_page(
             font_substituted=substituted_name,
             overflow_detected=original_overflow > 0,
             reflow_applied=True,
-            glyphs_missing=[],
+            glyphs_missing=pre_extension_missing,
+            degradations=coverage_degradations,
         ),
     )
     return result, effective_delta, last_line_y

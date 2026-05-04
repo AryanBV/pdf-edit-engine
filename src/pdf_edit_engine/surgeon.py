@@ -577,6 +577,16 @@ def _apply_single_replacement(
     # extend_subset so the resulting EditResult can surface the
     # substitution via FidelityReport.font_substituted.
     substitution_log: list[str] = []
+    # v0.1.3 (Phase 5, audit-bundle scope): record extension events as
+    # typed Degradations on success — font_coverage_extended for Tier 1
+    # (cmap-only) or font_coverage_substituted for Tier 1.5 (in-place
+    # injection from a system font, possibly metric-equivalent).
+    coverage_degradations: list[Degradation] = []
+    # Pre-extension state of missing chars — captured BEFORE extend_subset
+    # mutates the font. Per locked semantic (design doc §5 + Phase 5
+    # docstring): glyphs_missing reflects what TRIGGERED the extension,
+    # even after extension succeeds. Information-preserving for callers.
+    pre_extension_missing: list[str] = []
 
     if not can_enc:
         # Attempt automatic font extension
@@ -625,6 +635,26 @@ def _apply_single_replacement(
                 tier,
                 len(missing),
             )
+            # v0.1.3 Phase 5: record what was extended.
+            pre_extension_missing = list(missing)
+            chars_str = ",".join(missing)
+            if tier == "cmap_only":
+                coverage_degradations.append(
+                    Degradation(
+                        kind="font_coverage_extended",
+                        detail=f"tier=1,chars={chars_str}",
+                        severity="info",
+                    )
+                )
+            elif tier == "full_extension":
+                source_suffix = f",source={substitution_log[0]}" if substitution_log else ""
+                coverage_degradations.append(
+                    Degradation(
+                        kind="font_coverage_substituted",
+                        detail=f"tier=1.5,chars={chars_str}{source_suffix}",
+                        severity="warning",
+                    )
+                )
         except (FontNotFoundError, PDFEditError) as exc:
             return EditResult(
                 success=False,
@@ -882,8 +912,11 @@ def _apply_single_replacement(
             font_substituted=substitution_log[0] if substitution_log else None,
             overflow_detected=overflow,
             reflow_applied=False,
-            glyphs_missing=[],
-            degradations=list(kerning_degradations),
+            # Audit-bundle finding #3: glyphs_missing reflects pre-extension
+            # state (what TRIGGERED the extension), even after extension
+            # successfully fills the gap. Empty when no extension ran.
+            glyphs_missing=pre_extension_missing,
+            degradations=[*coverage_degradations, *kerning_degradations],
         ),
     ), resolver
 

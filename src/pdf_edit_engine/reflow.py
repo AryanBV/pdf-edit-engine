@@ -991,19 +991,42 @@ def reflow_paragraph(
     can_enc, missing = font_resolver.can_encode(all_line_text)
     # INV-C-4 plumbing: capture metric-equivalent substitution events.
     substitution_log: list[str] = []
+    # v0.1.3 (Phase 5) coverage degradations + pre-extension glyphs_missing.
+    coverage_degradations: list[Degradation] = []
+    pre_extension_missing: list[str] = []
 
     if not can_enc:
         try:
             from pdf_edit_engine.fonts import extend_subset
 
             font_name = paragraph.font_name
-            extend_subset(
+            tier = extend_subset(
                 pdf,
                 page,
                 font_name,
                 "".join(missing),
                 substitution_log=substitution_log,
             )
+            # v0.1.3 Phase 5: record extension as a typed Degradation.
+            pre_extension_missing = list(missing)
+            chars_str = ",".join(missing)
+            if tier == "cmap_only":
+                coverage_degradations.append(
+                    Degradation(
+                        kind="font_coverage_extended",
+                        detail=f"tier=1,chars={chars_str}",
+                        severity="info",
+                    )
+                )
+            elif tier == "full_extension":
+                source_suffix = f",source={substitution_log[0]}" if substitution_log else ""
+                coverage_degradations.append(
+                    Degradation(
+                        kind="font_coverage_substituted",
+                        detail=f"tier=1.5,chars={chars_str}{source_suffix}",
+                        severity="warning",
+                    )
+                )
             # Refresh resolver through the caller's cache: evict the stale
             # entry so the next caller (and our re-fetch below) sees the
             # post-extension font state. See ARY-283.
@@ -1202,7 +1225,8 @@ def reflow_paragraph(
             font_substituted=substitution_log[0] if substitution_log else None,
             overflow_detected=overflow,
             reflow_applied=True,
-            glyphs_missing=[],
-            degradations=detector_degradations,
+            # Audit-bundle finding #3: pre-extension state.
+            glyphs_missing=pre_extension_missing,
+            degradations=[*coverage_degradations, *detector_degradations],
         ),
     )

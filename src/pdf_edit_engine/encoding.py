@@ -53,7 +53,53 @@ class FontResolver:
         # Max ligature length for greedy encoding
         self._max_ligature_len: int = 1
 
+        # v0.1.3 (Phase 5) can_encode strengthening — coverage check.
+        # /FirstChar..LastChar bounds and /Widths-key set let us verify
+        # the byte slot is actually populated in the embedded font. The
+        # font_dict reference enables a back-pointer to the binary for
+        # the fonts.font_has_codepoint cmap-coverage check (no fontTools
+        # import in this module — preserves dep-boundary table).
+        self._font_dict: pikepdf.Dictionary = font_dict
+        self._first_char: int | None = None
+        self._last_char: int | None = None
+        self._widths_keys: frozenset[int] = frozenset()
+
         self._detect_and_init(font_dict)
+        self._init_widths_bounds(font_dict)
+
+    def _init_widths_bounds(self, font_dict: pikepdf.Dictionary) -> None:
+        """Populate /FirstChar, /LastChar, /Widths-key set for simple fonts.
+
+        CID fonts use /W (range-based) instead — those are handled by
+        widths.parse_cid_widths and aren't checked here. The CID branch
+        of can_encode already performs coverage checks via the ToUnicode
+        CMap (audit-bundle finding #2: CID's _unicode_to_cid double-duties
+        as coverage).
+        """
+        if self._is_cid:
+            return
+        first = font_dict.get("/FirstChar")
+        last = font_dict.get("/LastChar")
+        widths = font_dict.get("/Widths")
+        try:
+            if first is not None and last is not None:
+                self._first_char = int(first)
+                self._last_char = int(last)
+            if widths is not None and self._first_char is not None and self._last_char is not None:
+                # /Widths is an array starting at /FirstChar. A byte b has
+                # an explicit width when first_char + i == b for some i in
+                # range(len(widths)) AND widths[i] is non-zero (zero typically
+                # means the slot is reserved but unmapped).
+                widths_list = list(widths)  # type: ignore[call-overload]
+                self._widths_keys = frozenset(
+                    self._first_char + i for i, w in enumerate(widths_list) if float(w) != 0.0
+                )
+        except (TypeError, ValueError):
+            # Malformed /Widths or /FirstChar — leave as None/empty;
+            # can_encode falls back to encoding-map membership only.
+            self._first_char = None
+            self._last_char = None
+            self._widths_keys = frozenset()
 
     def _detect_and_init(self, font_dict: pikepdf.Dictionary) -> None:
         """Detect encoding type and initialize lookup tables."""
@@ -211,6 +257,24 @@ class FontResolver:
     def can_encode(self, text: str) -> tuple[bool, list[str]]:
         """Check if all characters in the text can be encoded with this font.
 
+        v0.1.3 (Phase 5, audit-bundle scope): the non-CID branch was
+        strengthened from "encoding-map membership only" to a three-step
+        coverage check:
+
+        1. ``ch`` is in ``_unicode_to_byte`` (existing — encoding map).
+        2. The mapped byte falls in ``[/FirstChar, /LastChar]`` AND has a
+           non-zero entry in ``/Widths`` (verifies the slot is populated
+           in the PDF font dict, not just the abstract encoding table).
+        3. ``ord(ch)`` maps to a glyph in the embedded ``/FontFile2``
+           (delegated to ``fonts.font_has_codepoint`` to keep fontTools
+           out of this module). When ``/FontFile2`` cannot be parsed,
+           the helper returns True (best-effort) so we don't regress on
+           unverifiable fonts.
+
+        For Identity-H CID fonts the existing greedy ``_unicode_to_cid``
+        check already double-duties as coverage (per audit-bundle finding
+        #2), so the CID branch is unchanged.
+
         Args:
             text: Unicode text to check.
 
@@ -234,9 +298,42 @@ class FontResolver:
                     missing.append(text[i])
                     i += 1
         else:
+            # Lazy import to avoid circular: encoding ← fonts requires
+            # fontTools, but encoding itself must NOT import fontTools
+            # (CLAUDE.md dep-boundary table). The lazy import keeps the
+            # boundary intact at module-load time.
+            from pdf_edit_engine.fonts import font_has_codepoint
+
+            have_widths_metadata = (
+                self._first_char is not None
+                and self._last_char is not None
+                and bool(self._widths_keys)
+            )
             for ch in text:
+                # Check 1: encoding-map membership (existing).
                 if ch not in self._unicode_to_byte:
                     missing.append(ch)
+                    continue
+
+                byte_val = self._unicode_to_byte[ch]
+
+                # Check 2: byte in /FirstChar..LastChar AND /Widths entry.
+                # Skip when the font dict lacks these (some legacy fonts
+                # omit /FirstChar/LastChar — best-effort fall-through).
+                if have_widths_metadata:
+                    assert self._first_char is not None  # narrowed by guard
+                    assert self._last_char is not None
+                    if not (self._first_char <= byte_val <= self._last_char):
+                        missing.append(ch)
+                        continue
+                    if byte_val not in self._widths_keys:
+                        missing.append(ch)
+                        continue
+
+                # Check 3: codepoint covered by the embedded /FontFile2.
+                if not font_has_codepoint(self._font_dict, ord(ch)):
+                    missing.append(ch)
+                    continue
         return (len(missing) == 0, missing)
 
     # ── Properties ──────────────────────────────────────────────────────
