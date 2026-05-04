@@ -610,6 +610,13 @@ def _apply_single_replacement(
                         overflow_detected=False,
                         reflow_applied=False,
                         glyphs_missing=still_missing,
+                        degradations=[
+                            Degradation(
+                                kind="font_extension_failed",
+                                detail="partial_fail",
+                                severity="error",
+                            ),
+                        ],
                     ),
                 ), resolver
             font_action = "extended"
@@ -618,7 +625,7 @@ def _apply_single_replacement(
                 tier,
                 len(missing),
             )
-        except (FontNotFoundError, PDFEditError):
+        except (FontNotFoundError, PDFEditError) as exc:
             return EditResult(
                 success=False,
                 original_text=match.matched_text,
@@ -629,6 +636,13 @@ def _apply_single_replacement(
                     overflow_detected=False,
                     reflow_applied=False,
                     glyphs_missing=missing,
+                    degradations=[
+                        Degradation(
+                            kind="font_extension_failed",
+                            detail=type(exc).__name__,
+                            severity="error",
+                        ),
+                    ],
                 ),
             ), resolver
 

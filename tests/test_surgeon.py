@@ -191,7 +191,12 @@ class TestEncodingFailure:
     """Test behavior when replacement text cannot be encoded."""
 
     def test_unencodable_returns_failure(self, tmp_path: Path) -> None:
-        """Replacing with characters not in font returns success=False."""
+        """Replacing with characters not in font returns success=False.
+
+        v0.1.3 (Phase 4): also asserts the lying-success-path fix \u2014
+        font_preserved must be False (was buggy True pre-v0.1.3) and
+        degradations must contain a font_extension_failed entry.
+        """
         match = _first_match(SIMPLE_PDF, "Test")
         out = str(tmp_path / "output.pdf")
         result = replace(SIMPLE_PDF, match, "\u4f60\u597d", out)
@@ -199,6 +204,27 @@ class TestEncodingFailure:
         assert result.success is False
         assert result.font_action == "failed"
         assert len(result.fidelity_report.glyphs_missing) > 0
+
+        # v0.1.3 lying-success-path fix (design doc \u00a73 rows 2/3):
+        # font_preserved is now a computed @property \u2014 it must return
+        # False whenever a FONT_AFFECTING_KINDS Degradation was emitted.
+        # font_extension_failed is in FONT_AFFECTING_KINDS.
+        assert result.fidelity_report.font_preserved is False, (
+            "v0.1.3 INV-J-8 violated: font_preserved should be False on "
+            "force-failed extension; was True pre-v0.1.3 (architectural lie)."
+        )
+        kinds = [d.kind for d in result.fidelity_report.degradations]
+        assert "font_extension_failed" in kinds, (
+            f"v0.1.3 INV-J-5 violated: expected font_extension_failed "
+            f"degradation; got kinds={kinds}"
+        )
+        # Severity contract: error.
+        ext_degs = [
+            d for d in result.fidelity_report.degradations if d.kind == "font_extension_failed"
+        ]
+        assert all(d.severity == "error" for d in ext_degs), (
+            "font_extension_failed must have severity=error per design doc \u00a73"
+        )
 
     def test_unencodable_no_output_file(self, tmp_path: Path) -> None:
         """Failed encoding should not create an output PDF."""

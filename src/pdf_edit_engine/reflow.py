@@ -1021,6 +1021,13 @@ def reflow_paragraph(
                         overflow_detected=False,
                         reflow_applied=True,
                         glyphs_missing=still_missing,
+                        degradations=[
+                            Degradation(
+                                kind="font_extension_failed",
+                                detail="partial_fail",
+                                severity="error",
+                            ),
+                        ],
                     ),
                 )
             font_action = "extended"
@@ -1028,7 +1035,7 @@ def reflow_paragraph(
                 "Font extension succeeded for %d missing chars during reflow",
                 len(missing),
             )
-        except _FONT_EXTEND_FAIL_EXCS:
+        except _FONT_EXTEND_FAIL_EXCS as exc:
             logger.warning("Font extension failed during reflow", exc_info=True)
             return EditResult(
                 success=False,
@@ -1040,6 +1047,13 @@ def reflow_paragraph(
                     overflow_detected=False,
                     reflow_applied=True,
                     glyphs_missing=missing,
+                    degradations=[
+                        Degradation(
+                            kind="font_extension_failed",
+                            detail=type(exc).__name__,
+                            severity="error",
+                        ),
+                    ],
                 ),
             )
 
