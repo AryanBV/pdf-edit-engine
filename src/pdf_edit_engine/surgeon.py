@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import pikepdf
@@ -18,6 +19,7 @@ from pdf_edit_engine.errors import (
     ReflowError,
 )
 from pdf_edit_engine.models import (
+    Degradation,
     Edit,
     EditResult,
     FidelityReport,
@@ -211,6 +213,66 @@ def _splice_bytes(
     return bytes(buf)
 
 
+def _kerning_decision(factor: float) -> tuple[float | None, Degradation | None]:
+    """Map a kerning ``factor`` to a Tz-emit decision and an optional Degradation.
+
+    Pure function (no PDF state). Two independent axes:
+
+    - **Tz emission**: emit a Tz operator pair only when the factor differs
+      from 100 by more than ±0.05 (visually imperceptible deadzone keeps
+      the operator stack clean for unmodified-width replacements).
+    - **Degradation emission**: symmetric 95-105 deadzone per design doc §4a.
+      Below 95 → ``kerning_compressed`` (warning, glyphs visibly squished).
+      Above 105 → ``kerning_widened`` (info, glyphs spread; less visually
+      objectionable). Within [95, 105] → no degradation.
+
+    Returns ``(tz_factor, degradation)`` — ``tz_factor=None`` means do not
+    emit Tz operators; ``degradation=None`` means no surfacing required.
+    """
+    needs_scaling = abs(factor - 100.0) > 0.05
+
+    deg: Degradation | None = None
+    if factor < 95:
+        deg = Degradation(
+            kind="kerning_compressed",
+            detail=f"Tz {factor:.0f}%",
+            severity="warning",
+        )
+    elif factor > 105:
+        deg = Degradation(
+            kind="kerning_widened",
+            detail=f"Tz {factor:.0f}%",
+            severity="info",
+        )
+
+    return (factor if needs_scaling else None, deg)
+
+
+@dataclass(frozen=True)
+class KerningEncoding:
+    """Result of ``_encode_with_kerning``.
+
+    ``tj_items`` is the list of items to put into a TJ array (typically a
+    single ``pikepdf.String`` when ``tz_factor`` is set; per-glyph kerning
+    ints are no longer emitted as of v0.1.3 Algo A).
+
+    ``tz_factor`` is the horizontal-scaling percentage to apply via the
+    PDF ``Tz`` operator, computed as
+    ``100 * original_width / replacement_width``. ``None`` means no Tz
+    wrapping is needed (factor is within ±0.05 of 100, or the inputs were
+    degenerate).
+
+    ``degradation`` is a typed Degradation event for callers to surface
+    via ``FidelityReport.degradations``: ``kerning_compressed`` (warning)
+    when factor < 95 or ``kerning_widened`` (info) when factor > 105.
+    None within the symmetric 95-105 deadzone.
+    """
+
+    tj_items: list[object]
+    tz_factor: float | None
+    degradation: Degradation | None
+
+
 def _encode_with_kerning(
     text: str,
     original_width_page: float,
@@ -219,11 +281,15 @@ def _encode_with_kerning(
     width_cache: GlyphWidthCache,
     page: pikepdf.Page,
     font_name: str,
-) -> list[object]:
-    """Encode text into TJ items with kerning to match original width.
+) -> KerningEncoding:
+    """Encode text into TJ items with horizontal Tz scaling (Algo A, v0.1.3).
 
-    Produces a list of pikepdf.String and numeric kerning values that,
-    when rendered, occupy the same total width as the original match.
+    Replaces the v0.1.2 proportional TJ-gap kerning with a single ``Tz``
+    horizontal-scaling factor applied via the PDF graphics-state operator.
+    ``Tz`` preserves glyph identity regardless of factor — there is no
+    refusal threshold (per design doc §1). Symmetric 95-105 deadzone for
+    Degradation emission: factor < 95 emits ``kerning_compressed``
+    (warning); factor > 105 emits ``kerning_widened`` (info).
 
     Args:
         text: Replacement text to encode.
@@ -235,74 +301,41 @@ def _encode_with_kerning(
         font_name: Font resource name.
 
     Returns:
-        List of TJ array items (pikepdf.String and int kerning values).
+        KerningEncoding with tj_items (flat single-string list when
+        non-empty), tz_factor (None or the percentage to scale by), and
+        an optional Degradation event.
     """
     if not text:
-        return []
+        return KerningEncoding(tj_items=[], tz_factor=None, degradation=None)
 
     bw = resolver.byte_width
-    glyph_items: list[tuple[bytes, float]] = []  # (encoded_bytes, width_font_units)
+    glyph_widths_fu: list[float] = []
     full_encoded = resolver.encode(text)
     for i in range(0, len(full_encoded), bw):
         glyph_bytes = full_encoded[i : i + bw]
         char_code = (glyph_bytes[0] << 8) | glyph_bytes[1] if bw == 2 else glyph_bytes[0]
-        w = width_cache.get_width(page, font_name, char_code)
-        glyph_items.append((glyph_bytes, w))
+        glyph_widths_fu.append(width_cache.get_width(page, font_name, char_code))
 
-    if len(glyph_items) <= 1:
-        # Single glyph — no gaps to distribute kerning
-        return [pikepdf.String(glyph_items[0][0])] if glyph_items else []
+    # Tz scales horizontally — glyph identity preserved — so the TJ array
+    # collapses to a single flat string. No per-gap kerning ints needed.
+    tj_items: list[object] = [pikepdf.String(full_encoded)] if full_encoded else []
 
-    # Fallback: emit flat string when width info is unusable
-    if original_width_page <= 0 or font_size <= 0:
-        flat = b"".join(enc for enc, _ in glyph_items)
-        return [pikepdf.String(flat)]
+    if not glyph_widths_fu or original_width_page <= 0 or font_size <= 0:
+        return KerningEncoding(tj_items=tj_items, tz_factor=None, degradation=None)
 
-    # Compute everything in font units (/W scale) to avoid page-space round-trip
+    # Compute factor in font units (avoids page-space round-trip).
     original_fu = original_width_page * 1000.0 / font_size
-    replacement_fu = sum(w for _, w in glyph_items)
+    replacement_fu = sum(glyph_widths_fu)
+    if replacement_fu <= 0 or original_fu <= 0:
+        return KerningEncoding(tj_items=tj_items, tz_factor=None, degradation=None)
 
-    # TJ kerning: positive = move left (tighten), negative = move right (widen)
-    # When replacement is wider (repl > orig), total_kern > 0 → tighten to fit
-    # When replacement is narrower (repl < orig), total_kern < 0 → widen to fill
-    total_kern = replacement_fu - original_fu
-    num_gaps = len(glyph_items) - 1
-
-    if abs(total_kern) > 0.5 * original_fu and original_fu > 0:
-        # Width delta too large for kerning — return flat unkerned string
-        flat = b"".join(enc for enc, _ in glyph_items)
-        return [pikepdf.String(flat)]
-
-    # Distribute kerning PROPORTIONALLY to each glyph's width.
-    # Uniform distribution causes narrow chars (i, l, t) to overlap because
-    # they absorb the same tightening as wide chars (W, M).  Proportional
-    # distribution gives each glyph kerning proportional to its width, so
-    # the advance ratio (width - kern) / width is constant across all glyphs.
-    kern_values: list[int] = []
-    if replacement_fu > 0 and abs(total_kern) > 0.5:
-        accumulated = 0.0
-        for i in range(num_gaps):
-            w_i = glyph_items[i][1]
-            ideal = total_kern * (w_i / replacement_fu)
-            accumulated += ideal
-            kern_int = round(accumulated) - sum(kern_values)
-            kern_values.append(kern_int)
-    else:
-        kern_values = [0] * num_gaps
-
-    # If no kerning needed, emit flat string
-    if all(k == 0 for k in kern_values):
-        flat = b"".join(enc for enc, _ in glyph_items)
-        return [pikepdf.String(flat)]
-
-    # Build TJ items: [glyph0, kern0, glyph1, kern1, ..., glyphN-1]
-    result: list[object] = []
-    for i, (encoded, _) in enumerate(glyph_items):
-        result.append(pikepdf.String(encoded))
-        if i < num_gaps and kern_values[i] != 0:
-            result.append(kern_values[i])
-
-    return result
+    factor = 100.0 * original_fu / replacement_fu
+    tz_factor, degradation = _kerning_decision(factor)
+    return KerningEncoding(
+        tj_items=tj_items,
+        tz_factor=tz_factor,
+        degradation=degradation,
+    )
 
 
 def _rebuild_tj_array(
@@ -714,62 +747,88 @@ def _apply_single_replacement(
     # text fills exactly the visual space between operators.
     active_ops = sorted(op_idx for op_idx in chars_by_op if op_replacement_map.get(op_idx, ""))
 
-    if not dry_run:
-        for op_idx in sorted(chars_by_op.keys()):
-            inst = ops[op_idx]
-            op_str = str(inst.operator) if hasattr(inst, "operator") else str(inst[1])
-            op_chars = chars_by_op[op_idx]
-            replacement_text = op_replacement_map.get(op_idx, "")
-            # Per-operator same_length: merged operators have more chars than
-            # original, so they must use the rebuild path with kerning
-            op_same_length = same_length and len(replacement_text) == len(op_chars)
+    # v0.1.3 (Phase 2): collect (tz_factor, degradation) per op for the
+    # Tz post-pass below. The kerning loop runs in both dry_run and
+    # non-dry-run paths because design doc §4c locks degradations parity:
+    # dry_run=True must produce the same Degradation list as dry_run=False
+    # for the same input. Ops mutation is invisible in dry_run (the save
+    # is skipped further up the call chain).
+    op_tz_factors: dict[int, float] = {}
+    kerning_degradations: list[Degradation] = []
 
-            # Compute width_bonus: use Tm position gap for merged operators
-            wb = 0.0
-            if op_idx in merged_width_bonus and replacement_text:
-                # Find the next non-empty operator's first character position
-                active_pos = active_ops.index(op_idx) if op_idx in active_ops else -1
-                if active_pos >= 0 and active_pos + 1 < len(active_ops):
-                    next_op = active_ops[active_pos + 1]
-                    next_chars = chars_by_op[next_op]
-                    if next_chars and op_chars:
-                        first_x = op_chars[0].page_x
-                        next_x = next_chars[0].page_x
-                        glyph_width = sum(ch.width for ch in op_chars)
-                        wb = max(0.0, (next_x - first_x) - glyph_width)
-                if wb == 0.0:
-                    wb = merged_width_bonus[op_idx]
+    for op_idx in sorted(chars_by_op.keys()):
+        inst = ops[op_idx]
+        op_str = str(inst.operator) if hasattr(inst, "operator") else str(inst[1])
+        op_chars = chars_by_op[op_idx]
+        replacement_text = op_replacement_map.get(op_idx, "")
+        # Per-operator same_length: merged operators have more chars than
+        # original, so they must use the rebuild path with kerning
+        op_same_length = same_length and len(replacement_text) == len(op_chars)
 
-            if op_str in ("TJ",):
-                _modify_tj_operator(
-                    ops,
-                    op_idx,
-                    op_chars,
-                    replacement_text,
-                    resolver,
-                    byte_width,
-                    op_same_length,
-                    width_cache=width_cache,
-                    page=page,
-                    font_name=match.characters[0].font_name,
-                    font_size=match.characters[0].font_size,
-                    width_bonus=wb,
-                )
-            elif op_str in ("Tj", "'"):
-                _modify_tj_single_operator(
-                    ops,
-                    op_idx,
-                    op_chars,
-                    replacement_text,
-                    resolver,
-                    byte_width,
-                    op_same_length,
-                    width_cache=width_cache,
-                    page=page,
-                    font_name=match.characters[0].font_name,
-                    font_size=match.characters[0].font_size,
-                    width_bonus=wb,
-                )
+        # Compute width_bonus: use Tm position gap for merged operators
+        wb = 0.0
+        if op_idx in merged_width_bonus and replacement_text:
+            # Find the next non-empty operator's first character position
+            active_pos = active_ops.index(op_idx) if op_idx in active_ops else -1
+            if active_pos >= 0 and active_pos + 1 < len(active_ops):
+                next_op = active_ops[active_pos + 1]
+                next_chars = chars_by_op[next_op]
+                if next_chars and op_chars:
+                    first_x = op_chars[0].page_x
+                    next_x = next_chars[0].page_x
+                    glyph_width = sum(ch.width for ch in op_chars)
+                    wb = max(0.0, (next_x - first_x) - glyph_width)
+            if wb == 0.0:
+                wb = merged_width_bonus[op_idx]
+
+        op_tz: float | None = None
+        op_deg: Degradation | None = None
+        if op_str in ("TJ",):
+            op_tz, op_deg = _modify_tj_operator(
+                ops,
+                op_idx,
+                op_chars,
+                replacement_text,
+                resolver,
+                byte_width,
+                op_same_length,
+                width_cache=width_cache,
+                page=page,
+                font_name=match.characters[0].font_name,
+                font_size=match.characters[0].font_size,
+                width_bonus=wb,
+            )
+        elif op_str in ("Tj", "'"):
+            op_tz, op_deg = _modify_tj_single_operator(
+                ops,
+                op_idx,
+                op_chars,
+                replacement_text,
+                resolver,
+                byte_width,
+                op_same_length,
+                width_cache=width_cache,
+                page=page,
+                font_name=match.characters[0].font_name,
+                font_size=match.characters[0].font_size,
+                width_bonus=wb,
+            )
+
+        if op_tz is not None:
+            op_tz_factors[op_idx] = op_tz
+        if op_deg is not None:
+            kerning_degradations.append(op_deg)
+
+    # Tz post-pass: wrap each affected op_idx with `Tz <factor>` ... `Tz 100`.
+    # Iterate in REVERSE op_idx order so the .insert() calls don't shift
+    # indices we still have to process. Only mutate when not dry_run; the
+    # degradations themselves were already collected above.
+    if not dry_run and op_tz_factors:
+        tz_op = pikepdf.Operator("Tz")
+        for op_idx in sorted(op_tz_factors.keys(), reverse=True):
+            tz_factor = op_tz_factors[op_idx]
+            ops.insert(op_idx + 1, ([100], tz_op))
+            ops.insert(op_idx, ([round(tz_factor, 3)], tz_op))
 
     # Calculate widths
     old_width = sum(ch.width for ch in match.characters)
@@ -810,6 +869,7 @@ def _apply_single_replacement(
             overflow_detected=overflow,
             reflow_applied=False,
             glyphs_missing=[],
+            degradations=list(kerning_degradations),
         ),
     ), resolver
 
@@ -827,8 +887,15 @@ def _modify_tj_operator(
     font_name: str | None = None,
     font_size: float | None = None,
     width_bonus: float = 0.0,
-) -> None:
-    """Modify a TJ operator's array to apply replacement text."""
+) -> tuple[float | None, Degradation | None]:
+    """Modify a TJ operator's array to apply replacement text.
+
+    Returns ``(tz_factor, degradation)`` for the caller to wrap the
+    operator with PDF ``Tz`` operators (in a separate post-pass to keep
+    operator-index stability across multiple edits) and to plumb the
+    Degradation up through the FidelityReport. Both fields are ``None``
+    when no kerning/scaling was applied (e.g., same-length path).
+    """
     inst = ops[op_idx]
     operands = inst.operands if hasattr(inst, "operands") else inst[0]
     operator = inst.operator if hasattr(inst, "operator") else inst[1]
@@ -852,8 +919,12 @@ def _modify_tj_operator(
             tj_items[arr_idx] = pikepdf.String(new_raw)
 
         ops[op_idx] = ([pikepdf.Array(tj_items)], operator)
+        return None, None
     else:
-        # Different-length or empty: rebuild the TJ array with kerning
+        # Different-length or empty: rebuild the TJ array, applying Tz scaling
+        # if the replacement width differs materially from the original.
+        tz_factor: float | None = None
+        degradation: Degradation | None = None
         if (
             replacement_text
             and width_cache is not None
@@ -862,7 +933,7 @@ def _modify_tj_operator(
             and font_size
         ):
             op_original_width = sum(ch.width for ch in op_chars) + width_bonus
-            replacement_items = _encode_with_kerning(
+            enc = _encode_with_kerning(
                 replacement_text,
                 op_original_width,
                 font_size,
@@ -871,12 +942,16 @@ def _modify_tj_operator(
                 page,
                 font_name,
             )
+            replacement_items = enc.tj_items
+            tz_factor = enc.tz_factor
+            degradation = enc.degradation
         elif replacement_text:
             replacement_items = [pikepdf.String(resolver.encode(replacement_text))]
         else:
             replacement_items = []
         new_array = _rebuild_tj_array(tj_items, op_chars, replacement_items)
         ops[op_idx] = ([new_array], operator)
+        return tz_factor, degradation
 
 
 def _modify_tj_single_operator(
@@ -892,8 +967,11 @@ def _modify_tj_single_operator(
     font_name: str | None = None,
     font_size: float | None = None,
     width_bonus: float = 0.0,
-) -> None:
-    """Modify a Tj (or ') operator's string to apply replacement text."""
+) -> tuple[float | None, Degradation | None]:
+    """Modify a Tj (or ') operator's string to apply replacement text.
+
+    Returns ``(tz_factor, degradation)`` — see ``_modify_tj_operator``.
+    """
     inst = ops[op_idx]
     operands = inst.operands if hasattr(inst, "operands") else inst[0]
     operator = inst.operator if hasattr(inst, "operator") else inst[1]
@@ -907,15 +985,16 @@ def _modify_tj_single_operator(
             replacements.append((ch.byte_position, encoded_char))
         new_raw = _splice_bytes(raw, replacements, byte_width)
         ops[op_idx] = ([pikepdf.String(new_raw)], operator)
+        return None, None
     elif replacement_text:
-        # Different-length: use kerning if available, convert to TJ
+        # Different-length: use Tz scaling if available, convert to TJ
         if width_cache is not None and page is not None and font_name and font_size:
             min_pos = min(ch.byte_position for ch in op_chars)
             max_pos = max(ch.byte_position for ch in op_chars) + byte_width
             prefix_bytes = raw[:min_pos]
             suffix_bytes = raw[max_pos:]
             op_original_width = sum(ch.width for ch in op_chars) + width_bonus
-            kerned_items = _encode_with_kerning(
+            enc = _encode_with_kerning(
                 replacement_text,
                 op_original_width,
                 font_size,
@@ -927,22 +1006,25 @@ def _modify_tj_single_operator(
             tj_items: list[object] = []
             if prefix_bytes:
                 tj_items.append(pikepdf.String(prefix_bytes))
-            tj_items.extend(kerned_items)
+            tj_items.extend(enc.tj_items)
             if suffix_bytes:
                 tj_items.append(pikepdf.String(suffix_bytes))
             ops[op_idx] = ([pikepdf.Array(tj_items)], pikepdf.Operator("TJ"))
+            return enc.tz_factor, enc.degradation
         else:
             min_pos = min(ch.byte_position for ch in op_chars)
             max_pos = max(ch.byte_position for ch in op_chars) + byte_width
             encoded = resolver.encode(replacement_text)
             new_raw = raw[:min_pos] + encoded + raw[max_pos:]
             ops[op_idx] = ([pikepdf.String(new_raw)], operator)
+            return None, None
     else:
         # Empty replacement: remove matched bytes
         min_pos = min(ch.byte_position for ch in op_chars)
         max_pos = max(ch.byte_position for ch in op_chars) + byte_width
         new_raw = raw[:min_pos] + raw[max_pos:]
         ops[op_idx] = ([pikepdf.String(new_raw)], operator)
+        return None, None
 
 
 # ── Public API ──────────────────────────────────────────────────────────

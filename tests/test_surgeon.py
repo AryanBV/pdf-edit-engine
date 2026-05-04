@@ -10,7 +10,12 @@ import pytest
 from pdf_edit_engine.errors import OperatorError, PDFEditError
 from pdf_edit_engine.locator import find, get_fonts, get_text
 from pdf_edit_engine.models import Edit, TextMatch
-from pdf_edit_engine.surgeon import batch_replace, replace, replace_all
+from pdf_edit_engine.surgeon import (
+    _kerning_decision,
+    batch_replace,
+    replace,
+    replace_all,
+)
 
 CORPUS_DIR = Path(__file__).parent / "corpus"
 RESUME_PDF = str(CORPUS_DIR / "Aryan_BV_Resume_2026.pdf")
@@ -796,3 +801,79 @@ class TestModuleCacheOwnership:
         assert "Acme Co." in text, text
         assert "Nova Industries" not in text
         assert "Acme Corporation" not in text
+
+
+# ── Phase 2 (v0.1.3) kerning deadzone boundary tests ────────────────────
+
+
+class TestKerningDecisionDeadzone:
+    """Boundary tests for ``surgeon._kerning_decision`` (Algo A, design doc §1).
+
+    Symmetric 95-105 deadzone for Degradation emission. ±0.05 deadzone
+    around 100 for Tz operator emission. Both deadzones are deterministic
+    boundaries — these tests pin them exactly.
+    """
+
+    def test_factor_exactly_100_emits_no_tz_no_degradation(self) -> None:
+        """factor == 100.0 → no Tz operator, no Degradation."""
+        tz, deg = _kerning_decision(100.0)
+        assert tz is None
+        assert deg is None
+
+    def test_factor_exactly_95_no_degradation(self) -> None:
+        """Edge of compression deadzone: factor == 95.0 → Tz emitted, no Degradation."""
+        tz, deg = _kerning_decision(95.0)
+        assert tz == 95.0
+        assert deg is None
+
+    def test_factor_94_9_emits_kerning_compressed(self) -> None:
+        """Just below compression deadzone: factor == 94.9 → kerning_compressed warning."""
+        tz, deg = _kerning_decision(94.9)
+        assert tz == 94.9
+        assert deg is not None
+        assert deg.kind == "kerning_compressed"
+        assert deg.severity == "warning"
+        assert "95" in deg.detail or "Tz" in deg.detail
+
+    def test_factor_exactly_105_no_degradation(self) -> None:
+        """Edge of widening deadzone: factor == 105.0 → Tz emitted, no Degradation."""
+        tz, deg = _kerning_decision(105.0)
+        assert tz == 105.0
+        assert deg is None
+
+    def test_factor_105_1_emits_kerning_widened(self) -> None:
+        """Just above widening deadzone: factor == 105.1 → kerning_widened info."""
+        tz, deg = _kerning_decision(105.1)
+        assert tz == 105.1
+        assert deg is not None
+        assert deg.kind == "kerning_widened"
+        assert deg.severity == "info"
+
+    def test_factor_within_tz_deadzone_no_tz_emit(self) -> None:
+        """factor within ±0.05 of 100 → no Tz operator emitted (clean op stack)."""
+        for factor in (99.96, 100.0, 100.04):
+            tz, deg = _kerning_decision(factor)
+            assert tz is None, f"factor={factor} should be in Tz deadzone"
+            # All within [95, 105] → no degradation either
+            assert deg is None
+
+    def test_factor_just_outside_tz_deadzone_emits_tz(self) -> None:
+        """factor outside ±0.05 of 100 (but within 95-105) → Tz emitted, no Degradation."""
+        for factor in (99.94, 100.06, 99.0, 101.0):
+            tz, deg = _kerning_decision(factor)
+            assert tz == factor, f"factor={factor} should emit Tz"
+            assert deg is None, f"factor={factor} in 95-105 should not degrade"
+
+    def test_factor_extreme_compression_no_refusal(self) -> None:
+        """No refusal threshold (design doc §1) — extreme factors still produce Tz + Degradation."""
+        tz, deg = _kerning_decision(50.0)
+        assert tz == 50.0
+        assert deg is not None
+        assert deg.kind == "kerning_compressed"
+
+    def test_factor_extreme_widening_no_refusal(self) -> None:
+        """Symmetric to extreme compression — extreme widening also produces Tz."""
+        tz, deg = _kerning_decision(150.0)
+        assert tz == 150.0
+        assert deg is not None
+        assert deg.kind == "kerning_widened"
