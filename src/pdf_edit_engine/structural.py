@@ -1144,6 +1144,9 @@ def _replace_block_on_page(
     overflow_delta = text_height - bbox_height
 
     shift_warnings: list[str] = []
+    # v0.1.3 Phase 6: emit-at-source overflow_shift Degradations parallel
+    # to shift_warnings (INV-J-3 backward-compat preserved; v0.2 collapses).
+    shift_degradations: list[Degradation] = []
     original_overflow = overflow_delta
 
     # In sequential mode (skip_vertical_shift), the batch caller handles
@@ -1160,11 +1163,27 @@ def _replace_block_on_page(
                 lowest_y = min(below_ys)
                 max_safe_shift = lowest_y - page_bottom
                 if max_safe_shift <= 0:
+                    # No room below — shift fully suppressed (silent in
+                    # warnings list pre-v0.1.3; surfaced via Degradation).
+                    shift_degradations.append(
+                        Degradation(
+                            kind="overflow_shift_suppressed",
+                            detail=f"requested={original_overflow:.1f}pt,available=0pt",
+                            severity="warning",
+                        )
+                    )
                     overflow_delta = 0.0
                 elif overflow_delta > max_safe_shift:
                     shift_warnings.append(
                         f"Overflow shift clamped from {original_overflow:.1f}pt "
                         f"to {max_safe_shift:.1f}pt to keep content on-page",
+                    )
+                    shift_degradations.append(
+                        Degradation(
+                            kind="overflow_shift_clamped",
+                            detail=f"requested={original_overflow:.1f}pt,clamped_to={max_safe_shift:.1f}pt",
+                            severity="warning",
+                        )
                     )
                     overflow_delta = max_safe_shift
             else:
@@ -1308,7 +1327,7 @@ def _replace_block_on_page(
             overflow_detected=original_overflow > 0,
             reflow_applied=True,
             glyphs_missing=pre_extension_missing,
-            degradations=coverage_degradations,
+            degradations=[*coverage_degradations, *shift_degradations],
         ),
     )
     return result, effective_delta, last_line_y

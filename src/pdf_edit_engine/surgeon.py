@@ -1135,6 +1135,10 @@ def replace(
         ops = list(pikepdf.parse_content_stream(page))
         _assert_match_addressable(ops, match, resolver)
 
+        # v0.1.3 Phase 6: track if reflow was attempted but threw, so we can
+        # surface reflow_aborted_to_simple on the simple-replacement result.
+        reflow_abort_reason: str | None = None
+        reflow_abort_msg: str = ""
         # Check if reflow is needed: replacement wider than original
         if reflow:
             try:
@@ -1190,11 +1194,15 @@ def replace(
                             pdf.save(output_path)
                         _invalidate_locator_cache()
                         return result
-                except (ReflowError, OperatorError, EncodingError, KeyError, ValueError):
+                except (ReflowError, OperatorError, EncodingError, KeyError, ValueError) as exc:
                     logger.warning(
                         "Reflow failed, falling back to simple replacement",
                         exc_info=True,
                     )
+                    # v0.1.3 Phase 6: capture the abort reason; surface it on the
+                    # simple-replacement EditResult below as reflow_aborted_to_simple.
+                    reflow_abort_reason = type(exc).__name__
+                    reflow_abort_msg = str(exc)[:80] if str(exc) else ""
 
         # ops already parsed above for the addressability check; reuse it.
         result, _ = _apply_single_replacement(
@@ -1208,6 +1216,24 @@ def replace(
             resolver_cache,
             dry_run,
         )
+
+        # v0.1.3 Phase 6: surface reflow abort if reflow was attempted
+        # and threw, before the simple-replacement fallback ran. The
+        # Degradation is added to the simple-replacement result's
+        # FidelityReport so callers see why complex reflow was skipped.
+        if reflow_abort_reason is not None:
+            detail = (
+                f"{reflow_abort_reason}: {reflow_abort_msg}"
+                if reflow_abort_msg
+                else reflow_abort_reason
+            )
+            result.fidelity_report.degradations.append(
+                Degradation(
+                    kind="reflow_aborted_to_simple",
+                    detail=detail,
+                    severity="warning",
+                )
+            )
 
         if result.success and not dry_run:
             new_stream = pikepdf.unparse_content_stream(ops)

@@ -705,6 +705,7 @@ def _build_replacement_ops(
     *,
     style_palette: Any | None = None,
     extra_resolvers: dict[str, FontResolver] | None = None,
+    degradation_log: list[Degradation] | None = None,
 ) -> list[tuple[list[Any], Any]]:
     """Build replacement content stream operators for a reflowed paragraph.
 
@@ -798,7 +799,19 @@ def _build_replacement_ops(
     if use_heading:
         can_enc, _ = current_resolver.can_encode(lines[0])
         if not can_enc:
-            # Graceful degradation: render in body font instead
+            # Graceful degradation: render in body font instead.
+            # v0.1.3 Phase 6: emit-at-source heading_font_dropped Degradation.
+            # heading_font_dropped IS in FONT_AFFECTING_KINDS (font literally
+            # swapped) — caller's computed font_preserved property correctly
+            # returns False.
+            if degradation_log is not None and heading_font is not None:
+                degradation_log.append(
+                    Degradation(
+                        kind="heading_font_dropped",
+                        detail=f"original_font={heading_font},fallback={font_name}",
+                        severity="warning",
+                    )
+                )
             current_font = font_name
             current_resolver = resolver
             new_ops[-2] = ([body_font_ref, font_size], pikepdf.Operator("Tf"))
@@ -835,6 +848,23 @@ def _build_replacement_ops(
         marker_char = stripped[:1] if stripped else ""
         marker_font = marker_fonts.get(marker_char)
         marker_resolver = extra.get(marker_font) if marker_font else None
+
+        # v0.1.3 Phase 6: marker_font_dropped fires when style-palette has a
+        # marker font for this char but the marker resolver can't encode it
+        # (e.g., subset doesn't include the bullet glyph). The else branch
+        # below renders the marker in body font instead — kind is in
+        # FONT_AFFECTING_KINDS so font_preserved correctly flips False.
+        marker_drop = bool(
+            marker_font and marker_resolver and not marker_resolver.can_encode(marker_char)[0]
+        )
+        if marker_drop and degradation_log is not None:
+            degradation_log.append(
+                Degradation(
+                    kind="marker_font_dropped",
+                    detail=f"marker={marker_char!r},original_font={marker_font},fallback={font_name}",
+                    severity="warning",
+                )
+            )
 
         if marker_font and marker_resolver and marker_resolver.can_encode(marker_char)[0]:
             # ── Indented marker line ──────────────────────────────
@@ -1100,6 +1130,9 @@ def reflow_paragraph(
     extra_lines = len(lines) - paragraph.line_count
     overflow = extra_lines > 0
     shift_warnings: list[str] = []
+    # v0.1.3 Phase 6: emit-at-source Degradations for the same overflow events.
+    # Coexists with shift_warnings (INV-J-3 backward-compat); v0.2 will collapse.
+    shift_degradations: list[Degradation] = []
     if overflow:
         # Import locally to avoid cross-module boundary noise at import
         # time. structural owns the shift primitive; we borrow it.
@@ -1136,11 +1169,25 @@ def reflow_paragraph(
                         f"Overflow shift suppressed — no room below paragraph "
                         f"(wanted {requested_shift:.1f}pt, page has 0pt available)",
                     )
+                    shift_degradations.append(
+                        Degradation(
+                            kind="overflow_shift_suppressed",
+                            detail=f"requested={requested_shift:.1f}pt,available=0pt",
+                            severity="warning",
+                        )
+                    )
                     shift_amount = 0.0
                 elif requested_shift > max_safe_shift:
                     shift_warnings.append(
                         f"Overflow shift clamped from {requested_shift:.1f}pt "
                         f"to {max_safe_shift:.1f}pt to keep content on-page",
+                    )
+                    shift_degradations.append(
+                        Degradation(
+                            kind="overflow_shift_clamped",
+                            detail=f"requested={requested_shift:.1f}pt,clamped_to={max_safe_shift:.1f}pt",
+                            severity="warning",
+                        )
                     )
                     shift_amount = max_safe_shift
             else:
@@ -1163,7 +1210,9 @@ def reflow_paragraph(
             # the pre-shift build_index) stay valid.
             ops = list(pikepdf.parse_content_stream(page))
 
-    # 8. Build replacement operators
+    # 8. Build replacement operators (v0.1.3 Phase 6: capture per-line
+    # font-fallback Degradations via degradation_log out-param).
+    style_degradations: list[Degradation] = []
     replacement = _build_replacement_ops(
         lines=lines,
         font_name=paragraph.font_name,
@@ -1174,6 +1223,7 @@ def reflow_paragraph(
         line_height=paragraph.line_height,
         resolver=font_resolver,
         page=page,
+        degradation_log=style_degradations,
     )
 
     # 9. Splice: remove old operators, insert replacement
@@ -1227,6 +1277,11 @@ def reflow_paragraph(
             reflow_applied=True,
             # Audit-bundle finding #3: pre-extension state.
             glyphs_missing=pre_extension_missing,
-            degradations=[*coverage_degradations, *detector_degradations],
+            degradations=[
+                *coverage_degradations,
+                *detector_degradations,
+                *style_degradations,
+                *shift_degradations,
+            ],
         ),
     )
