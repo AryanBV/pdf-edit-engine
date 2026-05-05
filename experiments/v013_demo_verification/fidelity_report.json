@@ -1,0 +1,16 @@
+{
+  "font_substituted": null,
+  "overflow_detected": false,
+  "reflow_applied": false,
+  "glyphs_missing": [
+    "ø",
+    "ü"
+  ],
+  "degradations": [
+    {
+      "kind": "font_extension_failed",
+      "detail": "FontNotFoundError",
+      "severity": "error"
+    }
+  ]
+}
