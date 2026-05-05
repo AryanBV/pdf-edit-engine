@@ -21,11 +21,12 @@
 
 ## Font handling
 
-- Tier 1.5 font extension (in-place glyph injection) requires the matching system font (or a metric-equivalent fallback like Carlito for Calibri) to be installed; the resolved substitute name is surfaced through `FidelityReport.font_substituted`
-- CFF / OpenType (Type1C) embedded fonts are not yet supported for Tier 1.5 (`_inject_glyph_in_place` raises `FontNotFoundError`); tracked as ARY-279 for v0.1.3
+- Tier 1.5 font extension (in-place glyph injection) requires the matching system font (or a metric-equivalent fallback like Carlito for Calibri) to be installed; the resolved substitute name is surfaced through `FidelityReport.font_substituted` AND a `font_coverage_substituted` Degradation (v0.1.3)
+- CFF / OpenType (Type1C) embedded fonts are not yet supported for Tier 1.5 (`_inject_glyph_in_place` raises `FontNotFoundError`); tracked as ARY-279 for a future release
 - CJK fonts with 30,000+ glyphs have not been tested
 - Type 3 fonts (bitmap/procedural) are not supported for extension
-- Emoji and other multi-codepoint characters cannot be rendered if the font lacks those glyphs (reported via FidelityReport)
+- Emoji and other multi-codepoint characters cannot be rendered if the font lacks those glyphs (reported via `FidelityReport.degradations` as `font_extension_failed`)
+- Non-CID (simple WinAnsi/MacRoman) fonts cannot be extended via `extend_subset` — extension only works on Identity-H CID fonts. Replacements requiring missing glyphs in a simple font return `success=False` with `font_extension_failed` Degradation (v0.1.3 surfacing).
 
 ## Encoding
 

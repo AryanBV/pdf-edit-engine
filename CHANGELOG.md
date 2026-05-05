@@ -4,6 +4,83 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] — 2026-05-05
+
+### Added
+
+- **Typed `Degradation` field on `FidelityReport`.** Every degraded
+  result now appends a structured `Degradation` event (`kind`, `detail`,
+  `severity`) to `fidelity_report.degradations`. Twelve canonical kinds
+  cover kerning compression/widening, font extension success/failure,
+  paragraph-detection low-confidence, overflow shift clamping/suppression,
+  heading and marker font drops, line-height compression, reflow abort,
+  and font coverage extension via cmap-only or system-font substitution.
+  Permissive enum policy: clients should treat unknown kinds as opaque.
+- **`docs/v0.1.3-release-notes.md`** — implementation post-mortem with
+  per-phase summaries, deviation log, and v0.1.4 follow-ups.
+
+### Changed (algorithm fixes)
+
+- **Kerning Algo A — `Tz` horizontal scaling, no refusal threshold
+  (ARY-290).** The pre-v0.1.3 `>0.5×` flat-fallback in
+  `_encode_with_kerning` produced visibly squished/spread output and
+  silently refused large-delta kerning. Replaced with the PDF `Tz`
+  operator: glyph identity is preserved at any scale factor. Symmetric
+  95-105 deadzone for Degradation emission (`kerning_compressed`
+  warning <95, `kerning_widened` info >105). Pure decision lives in
+  `surgeon._kerning_decision`.
+- **`can_encode` strengthening (audit-bundle finding).** The non-CID
+  branch of `FontResolver.can_encode` was lying when the encoding map
+  had a codepoint but the embedded `/FontFile2` lacked the glyph or
+  `/Widths` lacked the entry. Strengthened to verify all three:
+  encoding-map ∧ `/FirstChar..LastChar` range ∧ `/Widths` entry ∧
+  `/FontFile2` cmap glyph presence. Cmap check delegates to
+  `fonts.font_has_codepoint` so `encoding.py` keeps no `fontTools`
+  import (preserves the `CLAUDE.md` dep-boundary table).
+- **Computed `font_preserved` (INV-J-8).** Converted from a stored
+  dataclass field to a `@property` derived from `degradations` (none
+  of kind in `FONT_AFFECTING_KINDS`) AND `font_substituted is None`.
+  The pre-v0.1.3 stored field let constructors override the truth
+  function — exactly the lying-success-path the audit flagged.
+- **Four lying-success-path fixes.** `surgeon.py:603/625` and
+  `reflow.py:1014/1037` returned `success=False` with `font_action="failed"`
+  but `font_preserved=True` (architectural lie). Each site now appends a
+  `font_extension_failed` Degradation (severity=error); the computed
+  `font_preserved` correctly derives False because the kind is in
+  `FONT_AFFECTING_KINDS`.
+- **`glyphs_missing` semantic locked.** Pre-extension state is now
+  recorded in `glyphs_missing` even after extension successfully fills
+  the gap (audit-bundle finding #3). Information-preserving for callers
+  who want to see what extension covered.
+- **Paragraph-detector S5 surfacing (ARY-292 partial).** When the
+  detector emits a paragraph that triggers the locked S5 signal
+  (`paragraph_width / page_width >= 0.5` ∧ `avg_row_stub_coverage <
+  0.55` ∧ `x_cluster_count >= 2`), a `paragraph_detection_low_confidence`
+  Degradation (info) is added to the result. The detector grouping
+  itself is unchanged in v0.1.3 — algorithm replacement is v0.1.4.
+
+### Contracts
+
+- **`dry_run` ↔ `degradations` parity.** The list returned by
+  `dry_run=True` is structurally equal to the list returned by
+  `dry_run=False` for the same input. Verified by
+  `tests/test_dry_run_parity.py` (design doc §4c).
+- **INV-J-3 coexistence.** The v0.1.0+ `EditResult.warnings` list and
+  the v0.1.3 `FidelityReport.degradations` list both populate for
+  overflow events. The two lists carry parallel information until v0.2
+  collapses the duplication. Verified by
+  `tests/invariants/test_j_3_overflow_coexistence.py`.
+- **INV-J-5 + INV-J-8 invariant probes** registered in
+  `docs/decisions.md` and `docs/ultimate-audit-charter.md` Layer J.
+
+### Fixed
+
+- **`_FONTFILE2_CACHE` cross-PDF collision.** The Phase 5 cache was
+  keyed on `(objgen[0], objgen[1])` which alias across `pikepdf.Pdf.open`
+  instances (two PDFs both having a font at object 7,0 collide). Now
+  keyed on `(id(font_dict.owner), objgen[0], objgen[1])` so each PDF
+  instance has its own cache namespace.
+
 ## [0.1.2] — 2026-04-25
 
 ### Fixed (post-audit hardening — 2026-05-02)

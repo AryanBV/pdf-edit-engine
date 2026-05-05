@@ -55,14 +55,58 @@ Every edit function returns a `FidelityReport` documenting exactly what changed:
 ```python
 @dataclass
 class FidelityReport:
-    font_preserved: bool        # Original font kept?
-    font_substituted: str | None  # Fallback font name (if any)
-    overflow_detected: bool     # Text wider than available space?
-    reflow_applied: bool        # Paragraph reflow triggered?
-    glyphs_missing: list[str]   # Characters that couldn't be rendered
+    font_substituted: str | None    # Fallback font name (if any)
+    overflow_detected: bool         # Text wider than available space?
+    reflow_applied: bool            # Paragraph reflow triggered?
+    glyphs_missing: list[str]       # Characters that triggered extension (pre-extension state)
+    degradations: list[Degradation] # v0.1.3: typed visual-fidelity events
+
+    @property
+    def font_preserved(self) -> bool:
+        """Computed (v0.1.3): True iff font_substituted is None and no
+        FONT_AFFECTING_KINDS Degradation was emitted."""
 ```
 
 Automated pipelines and AI agents inspect these fields to verify edit quality programmatically — no manual PDF review needed. The text-replace functions (`replace`, `replace_all`, `batch_replace`) support `dry_run=True` to preview the report without writing to disk.
+
+### Degradations (v0.1.3)
+
+When the engine produces output that may differ visually from the
+original, it appends a typed `Degradation` event to
+`fidelity_report.degradations`. Each event carries `kind`, `severity`,
+and a free-form `detail`:
+
+```python
+@dataclass(frozen=True)
+class Degradation:
+    kind: DegradationKind                      # one of 12 canonical values
+    detail: str = ""                           # site-specific context
+    severity: Literal["info", "warning", "error"] = "info"
+```
+
+The 12 canonical kinds (Permissive enum policy — clients should treat
+unknown kinds as opaque, not crash):
+
+| Kind | Severity | Meaning |
+|---|---|---|
+| `font_extension_failed` | error | Replacement needs glyphs the engine couldn't add to the font. |
+| `kerning_compressed` | warning | `Tz` factor < 95 — replacement is ≥5% wider than original. |
+| `kerning_widened` | info | `Tz` factor > 105 — replacement is ≥5% narrower than original. |
+| `heading_font_dropped` | warning | A heading font couldn't encode the text; fell back to body font. |
+| `marker_font_dropped` | warning | A list-marker font couldn't encode the bullet; fell back to body font. |
+| `paragraph_detection_low_confidence` | info | Detector flagged a possible table-cell merge (S5 signal). |
+| `overflow_shift_clamped` | warning | Vertical shift was bounded by page geometry. |
+| `overflow_shift_suppressed` | warning | Vertical shift was skipped entirely (no room below). |
+| `line_height_compressed` | info | Line height was reduced to fit content. |
+| `reflow_aborted_to_simple` | warning | Complex reflow failed; flat-replace fallback used. |
+| `font_coverage_extended` | info | Embedded font's cmap was extended (Tier 1, outlines present). |
+| `font_coverage_substituted` | warning | Glyph outlines were sourced from a system font (Tier 1.5). |
+
+**`degradations` is the visual-fidelity gate, not `font_preserved`.** For
+agentic consumers building gating logic, key off `degradations` first;
+`font_preserved` is for identity-only signal (it's True even when
+`kerning_compressed` or `font_coverage_extended` fired, because those
+preserve glyph identity).
 
 ## Comparison
 
