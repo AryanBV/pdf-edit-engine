@@ -143,7 +143,9 @@ def find_target_font(page: pikepdf.Page, pdf_path: Path) -> tuple[str, pikepdf.D
 
 
 def main() -> None:
-    print(f"Input PDF: {INPUT}  (exists={INPUT.exists()}, size={INPUT.stat().st_size if INPUT.exists() else 'n/a'})")
+    print(
+        f"Input PDF: {INPUT}  (exists={INPUT.exists()}, size={INPUT.stat().st_size if INPUT.exists() else 'n/a'})"
+    )
     print(f"Target:      {TARGET!r}")
     print(f"Replacement: {REPLACEMENT!r}")
 
