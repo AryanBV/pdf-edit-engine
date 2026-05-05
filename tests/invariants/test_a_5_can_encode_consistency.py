@@ -13,7 +13,17 @@ CORPUS_DIR = Path(__file__).parent.parent / "corpus"
 
 
 def _find_resolver(is_cid: bool):
-    """Find first resolver in corpus matching the CID-ness criterion."""
+    """Find first resolver in corpus that actually CAN encode 'Hello'.
+
+    v0.1.3: can_encode strengthened to verify glyph coverage, not just
+    encoding-map membership. This helper used to filter on encoding-map
+    presence ('H' in _unicode_to_byte) but post-Phase-5 strengthening,
+    that's no longer sufficient (e.g. F2 Calibri-Bold WinAnsi in resume
+    has 'H' in WinAnsi but /Widths only declares space). The probe now
+    asks the resolver itself whether it can encode "Hello"; we use the
+    first one that says yes — the consistency between can_encode True
+    and encode success is the actual invariant under test.
+    """
     cache = FontResolverCache()
     for path in sorted(CORPUS_DIR.glob("*.pdf")):
         try:
@@ -30,11 +40,10 @@ def _find_resolver(is_cid: bool):
                         r = cache.get_resolver(page, name)
                     except Exception:
                         continue
-                    if (
-                        r._is_cid == is_cid and "H" in r._unicode_to_cid
-                        if is_cid
-                        else "H" in r._unicode_to_byte
-                    ):
+                    if r._is_cid != is_cid:
+                        continue
+                    ok, _ = r.can_encode("Hello")
+                    if ok:
                         return r
     return None
 

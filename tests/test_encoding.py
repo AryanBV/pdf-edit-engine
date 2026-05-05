@@ -144,9 +144,22 @@ class TestCanEncode:
         assert len(missing) == 1
 
     def test_can_encode_winAnsi(self, f2_resolver: FontResolver) -> None:
-        ok, missing = f2_resolver.can_encode("ABC")
+        # v0.1.3 strengthens can_encode to verify glyph coverage, not just
+        # encoding-map membership. F2 in the resume is Calibri-Bold/WinAnsi
+        # with /FirstChar=/LastChar=32 — only space has a /Widths entry, so
+        # only space is encodable from this resolver. The test assertion
+        # was pinning the lax v0.1.2 behavior; v0.1.3 correctly reports
+        # ABC as missing because their bytes lack /Widths entries (the
+        # font dict is heavily subsetted to space). See INV-J-5 probe for
+        # the surface contract on the new behavior.
+        ok, missing = f2_resolver.can_encode(" ")
         assert ok is True
         assert missing == []
+        # And the strengthening contract: chars without /Widths entries
+        # report as missing, even though the encoding map has them.
+        ok2, missing2 = f2_resolver.can_encode("ABC")
+        assert ok2 is False
+        assert set(missing2) == {"A", "B", "C"}
 
     def test_can_encode_ligature_sequence(
         self,

@@ -21,17 +21,24 @@ logger = logging.getLogger(__name__)
 # ── Public coverage helper (used by encoding.FontResolver.can_encode) ────
 
 
-# Cache parsed TTFont per font dict's object generation pair to avoid
-# re-parsing the embedded /FontFile2 on every can_encode call. The cache
-# is process-local; pikepdf objects are not stable identifiers across
-# pdf.open boundaries so we don't try to share across PDFs.
-_FONTFILE2_CACHE: dict[tuple[int, int], frozenset[int]] = {}
+# Cache parsed TTFont per (PDF instance id, font dict objgen) tuple to
+# avoid re-parsing the embedded /FontFile2 on every can_encode call.
+#
+# Cache key includes id(font_dict.owner) because objgen alone collides
+# across PDFs — two different `pikepdf.Pdf.open` instances both having
+# a font at object 7,0 would alias each other. id() of the owning Pdf
+# is unique per live Python object; cache entries become unreachable
+# when their owning Pdf is garbage-collected.
+_FONTFILE2_CACHE: dict[tuple[int, int, int], frozenset[int]] = {}
 
 
-def _font_dict_key(font_dict: pikepdf.Object) -> tuple[int, int] | None:
-    """Object generation pair for cache keying. None if not an indirect ref."""
+def _font_dict_key(font_dict: pikepdf.Object) -> tuple[int, int, int] | None:
+    """Cache key tuple. None if the font_dict has no stable identity."""
     try:
-        return (int(font_dict.objgen[0]), int(font_dict.objgen[1]))
+        owner = font_dict.owner
+        if owner is None:
+            return None
+        return (id(owner), int(font_dict.objgen[0]), int(font_dict.objgen[1]))
     except (AttributeError, TypeError):
         return None
 
