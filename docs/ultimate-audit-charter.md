@@ -248,6 +248,22 @@ below is a floor, not a ceiling.
 - **INV-J-4** — `success == False` implies `font_action ==
   "failed"` OR `warnings` is non-empty. Never success=False
   without a reason. *Agent-safe.*
+- **INV-J-5** *(v0.1.3)* — Every code path that emits an
+  `EditResult` for a degraded result appends a typed
+  `Degradation` to `EditResult.fidelity_report.degradations`
+  before returning. Coexists with `EditResult.warnings`
+  (INV-J-3 backward compat) until v0.2 collapses the duplication.
+  Probe: `tests/invariants/test_j_5_degradation_surfacing.py`.
+  *Agent-safe.*
+- **INV-J-8** *(v0.1.3)* — `FidelityReport.font_preserved` is
+  a computed `@property` derived from `degradations` (none of
+  kind in `FONT_AFFECTING_KINDS`) AND `font_substituted is
+  None`; never hardcoded. Field-shape invariant: re-introducing
+  `font_preserved` as a stored dataclass field would let
+  constructors override the truth function — exactly the v0.1.2
+  lying-success-path that v0.1.3 fixes. Probe:
+  `tests/invariants/test_j_8_font_preserved_computed.py`.
+  *Agent-safe.*
 
 ### Layer K: Public API contract
 
