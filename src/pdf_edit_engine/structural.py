@@ -1890,6 +1890,27 @@ def delete_block(
         _invalidate_locator_cache()
 
         overflow = any("below page boundary" in w for w in warnings)
+        # IMP-2: emit a typed Degradation when overflow is detected.
+        # NOTE: this branch is currently unreachable from delete_block —
+        # _shift_content_below_inplace's "below page boundary" warning
+        # only fires for positive delta_y (content moving down), but
+        # delete_block always passes delta_y = -deleted_height
+        # (negative; content moving up to close the gap). The
+        # Degradation is wired defensively in case a future caller
+        # passes positive delta_y or the helper's overflow check is
+        # extended; the corresponding regression-guard test asserts the
+        # negative case (overflow=False ⇒ no overflow_shift_*
+        # Degradation) so a regression to false-positive emission is
+        # caught.
+        overflow_degradations: list[Degradation] = []
+        if overflow:
+            overflow_degradations.append(
+                Degradation(
+                    kind="overflow_shift_clamped",
+                    detail="vertical,defensive_unreachable_at_v0_1_3",
+                    severity="warning",
+                )
+            )
         return EditResult(
             success=True,
             original_text=original_text,
@@ -1901,6 +1922,7 @@ def delete_block(
                 overflow_detected=overflow,
                 reflow_applied=False,
                 glyphs_missing=[],
+                degradations=list(overflow_degradations),
             ),
         )
     finally:

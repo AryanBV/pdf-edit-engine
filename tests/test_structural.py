@@ -665,6 +665,24 @@ class TestDeleteBlock:
         assert result.original_text
         assert "simple test document" in result.original_text
 
+    def test_overflow_path_is_wired_no_false_positive(self, tmp_path: Path) -> None:
+        """IMP-2 regression guard: delete_block's overflow branch is
+        currently unreachable (the helper's "below page boundary"
+        warning fires only for positive delta_y, but delete_block
+        always passes delta_y = -deleted_height). A normal delete
+        must NOT spuriously emit overflow_shift_* Degradations or
+        flip overflow_detected. If a future change makes the path
+        reachable AND the typed Degradation wiring breaks, this
+        guard plus the surgeon test together pin the contract.
+        """
+        out = str(tmp_path / "out.pdf")
+        result = delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), out)
+        assert result.success is True
+        assert result.fidelity_report.overflow_detected is False
+        assert not any(
+            d.kind.startswith("overflow_shift_") for d in result.fidelity_report.degradations
+        )
+
 
 @_need_resume
 class TestDeleteBlockResume:

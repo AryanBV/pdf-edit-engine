@@ -157,6 +157,38 @@ class TestDifferentLengthReplace:
         assert result.success is True
         assert result.fidelity_report.overflow_detected is True
 
+    def test_overflow_emits_typed_degradation(self, tmp_path: Path) -> None:
+        """IMP-2: when overflow_detected flips True on the simple-
+        replacement path the surgeon emits a typed
+        ``overflow_shift_clamped`` Degradation (severity=warning)
+        alongside the warnings-list entry. Pre-fix the flag was set
+        but no typed Degradation was appended, so callers iterating
+        ``fidelity_report.degradations`` (the v0.1.3 surfacing layer)
+        could not distinguish "overflowed" from "clean replacement"
+        without falling back to the legacy warnings list.
+
+        Uses ``reflow=False`` to force the simple-replacement path.
+        With reflow enabled, a wider-than-original replacement routes
+        through ``reflow_paragraph`` which already emits its own typed
+        overflow Degradations (v0.1.3 Phase 6). The IMP-2 site is the
+        simple-replacement horizontal-overflow detection at the tail
+        of ``_apply_single_replacement``.
+        """
+        match = _first_match(SIMPLE_PDF, "Test")
+        out = str(tmp_path / "output.pdf")
+        result = replace(SIMPLE_PDF, match, "A" * 200, out, reflow=False)
+
+        assert result.success is True
+        assert result.fidelity_report.overflow_detected is True
+        assert any(
+            d.kind == "overflow_shift_clamped" and d.severity == "warning"
+            for d in result.fidelity_report.degradations
+        ), (
+            "IMP-2: overflow_detected=True must imply at least one "
+            "Degradation(kind='overflow_shift_clamped', severity='warning'); "
+            f"got {result.fidelity_report.degradations!r}"
+        )
+
 
 # ── Cross-element replacement ────────────────────────────────────────────
 

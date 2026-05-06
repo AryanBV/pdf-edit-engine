@@ -902,6 +902,27 @@ def _apply_single_replacement(
     page_width = float(page.MediaBox[2]) if page.MediaBox else 612.0
     overflow = (match.bounding_box[0] + new_width) > page_width
 
+    # IMP-2: emit a typed Degradation when horizontal overflow is
+    # detected. Tz post-pass (above) and _adjust_subsequent_positioning
+    # already attempted to compress the layout; reaching this branch
+    # means the page edge clamps the visible result. `overflow_shift_clamped`
+    # is the closest match in the locked 12-kind enumeration (no
+    # horizontal-overflow-specific kind exists; structural.replace_block
+    # uses the same kind for analogous "shift was applied but bounded"
+    # situations — see structural.py:1168-1186).
+    overflow_degradations: list[Degradation] = []
+    if overflow:
+        overflow_degradations.append(
+            Degradation(
+                kind="overflow_shift_clamped",
+                detail=(
+                    f"horizontal,page_width={page_width:.1f}pt,"
+                    f"replacement_right={(match.bounding_box[0] + new_width):.1f}pt"
+                ),
+                severity="warning",
+            )
+        )
+
     return EditResult(
         success=True,
         original_text=match.matched_text,
@@ -916,7 +937,11 @@ def _apply_single_replacement(
             # state (what TRIGGERED the extension), even after extension
             # successfully fills the gap. Empty when no extension ran.
             glyphs_missing=pre_extension_missing,
-            degradations=[*coverage_degradations, *kerning_degradations],
+            degradations=[
+                *coverage_degradations,
+                *kerning_degradations,
+                *overflow_degradations,
+            ],
         ),
     ), resolver
 
