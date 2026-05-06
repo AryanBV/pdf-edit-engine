@@ -500,6 +500,118 @@ class TestInsertTextBlock:
         assert "Section two" in text
 
 
+# ── TestInsertTextBlockHonesty (CRIT-1) ──────────────────────────────
+
+
+@_need_resume
+class TestInsertTextBlockHonesty:
+    """CRIT-1: insert_text_block must surface Tier 1.5 metric-equivalent
+    substitution in its FidelityReport (was previously hardcoding
+    font_substituted=None / degradations=[] / font_action="kept" even
+    when extension actually ran from a metric-equivalent system font).
+
+    Single-source-of-truth char selection (probed via analyze_subset on
+    tests/corpus/Aryan_BV_Resume_2026.pdf during plan development):
+    every embedded font on page 0 (F1/F2 Calibri-Bold 6954 glyphs,
+    F3/F4 Calibri 6954 glyphs, F6 ArialMT 4503 glyphs) lacks 0x00F8
+    (ø). ø is the shared test char used by both this test and
+    tests/test_fonts.py's IMP-1 cache test.
+    """
+
+    def test_metric_equivalent_surfaces_substitution(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Forces Tier 1.5 metric-equivalent path deterministically.
+
+        Without monkeypatch the test would silently no-op on any dev's
+        machine that has Calibri installed (Windows + Office is the
+        common case). The whole point of this fix is to catch silent
+        lying — a soft assertion gated on the dev's local font
+        landscape would defeat the test.
+
+        Tests the surfacing layer (the FidelityReport contract). Does
+        not assert visual fidelity of the injected glyphs; the source
+        path can be any locally-installed Calibri-Bold-or-equivalent.
+        """
+        from pdf_edit_engine import system_fonts
+
+        # Find any locally-installed Calibri-Bold-or-equivalent for use
+        # as the injection source (must be TrueType, upem=2048 to match
+        # the embedded font). The substituted_name we report is
+        # independent of which actual font we inject from — the test
+        # verifies surfacing, not visual output.
+        real = system_fonts._find_font_with_origin("Calibri-Bold")
+        if real is None:
+            pytest.skip(
+                "No Calibri-Bold or metric-equivalent installed; cannot exercise Tier 1.5 path"
+            )
+        real_path = real[0]
+
+        monkeypatch.setattr(
+            "pdf_edit_engine.system_fonts._find_font_with_origin",
+            lambda ps_name: (real_path, "Carlito-Regular"),
+        )
+
+        out = str(tmp_path / "out.pdf")
+        result = insert_text_block(
+            RESUME_PDF,
+            0,
+            x=72.0,
+            y=400.0,
+            text="ø-test",
+            output_path=out,
+            font_size=11.0,
+        )
+
+        assert result.success
+        assert result.font_action == "extended"
+        fr = result.fidelity_report
+        assert fr.font_substituted == "Carlito-Regular"
+        assert fr.font_preserved is False
+        assert any(d.kind == "font_coverage_substituted" for d in fr.degradations)
+        assert "ø" in fr.glyphs_missing
+
+        # Lock CRIT-2 contract simultaneously (font_preserved must
+        # surface via to_dict() too):
+        d = fr.to_dict()
+        assert d["font_preserved"] is False
+        assert d["font_substituted"] == "Carlito-Regular"
+        assert Path(out).exists()
+
+    def test_extension_failure_emits_typed_degradation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """CRIT-1 expansion: failure branch (was lacking fidelity_report
+        entirely; default-factory FidelityReport reported
+        font_preserved=True even on extension failure)."""
+        from pdf_edit_engine import fonts as fonts_mod
+        from pdf_edit_engine.errors import FontNotFoundError
+
+        def _explode(*args: object, **kwargs: object) -> None:
+            raise FontNotFoundError("simulated: no system font for fixture")
+
+        monkeypatch.setattr(fonts_mod, "extend_subset", _explode)
+
+        out = str(tmp_path / "out.pdf")
+        result = insert_text_block(
+            RESUME_PDF,
+            0,
+            x=72.0,
+            y=400.0,
+            text="ø-failure",
+            output_path=out,
+            font_size=11.0,
+        )
+
+        assert result.success is False
+        assert result.font_action == "failed"
+        fr = result.fidelity_report
+        assert fr.font_preserved is False
+        assert any(
+            d.kind == "font_extension_failed" and d.severity == "error" for d in fr.degradations
+        )
+
+
 # ── TestDeleteBlock ──────────────────────────────────────────────────
 
 

@@ -11,7 +11,7 @@ import contextlib
 import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import pikepdf
 
@@ -1606,6 +1606,15 @@ def insert_text_block(
     # Per-call cache (ARY-283)
     resolver_cache = FontResolverCache()
 
+    # CRIT-1: capture extension events for honest FidelityReport surfacing.
+    # Mirrors the canonical pattern in surgeon._apply_single_replacement
+    # (surgeon.py:579-657, 905-921) so insert_text_block produces the same
+    # shape FidelityReport when Tier 1.5 metric-equivalent substitution runs.
+    substitution_log: list[str] = []
+    coverage_degradations: list[Degradation] = []
+    pre_extension_missing: list[str] = []
+    font_action: Literal["kept", "extended", "substituted", "failed"] = "kept"
+
     pdf = open_pdf(pdf_path)
     try:
         pages = _resolve_pages(pdf, page_number)
@@ -1647,11 +1656,42 @@ def insert_text_block(
             try:
                 from pdf_edit_engine.fonts import extend_subset
 
-                extend_subset(pdf, page_obj, clean_name, "".join(missing))
+                tier = extend_subset(
+                    pdf,
+                    page_obj,
+                    clean_name,
+                    "".join(missing),
+                    substitution_log=substitution_log,
+                )
+                font_action = "extended"
+                pre_extension_missing = list(missing)
+                chars_str = ",".join(missing)
+                if tier == "cmap_only":
+                    coverage_degradations.append(
+                        Degradation(
+                            kind="font_coverage_extended",
+                            detail=f"tier=1,chars={chars_str}",
+                            severity="info",
+                        )
+                    )
+                elif tier == "full_extension":
+                    source_suffix = f",source={substitution_log[0]}" if substitution_log else ""
+                    coverage_degradations.append(
+                        Degradation(
+                            kind="font_coverage_substituted",
+                            detail=f"tier=1.5,chars={chars_str}{source_suffix}",
+                            severity="warning",
+                        )
+                    )
                 resolver_cache.evict(page_obj, clean_name)
                 resolver = resolver_cache.get_resolver(page_obj, clean_name)
             except _FONT_EXTEND_FAIL_EXCS as exc:
                 logger.warning("Font extension failed for insert", exc_info=True)
+                # CRIT-1 expansion: failure path also surfaces a typed
+                # Degradation. Pre-fix this branch returned an EditResult
+                # without fidelity_report, so the default-factory
+                # FidelityReport reported font_preserved=True even on
+                # extension failure (the same lying-success-path shape).
                 return EditResult(
                     success=False,
                     original_text="",
@@ -1660,6 +1700,19 @@ def insert_text_block(
                     warnings=[
                         f"Font extension failed for '{clean_name}' (missing: {missing!r}): {exc}"
                     ],
+                    fidelity_report=FidelityReport(
+                        font_substituted=None,
+                        overflow_detected=False,
+                        reflow_applied=False,
+                        glyphs_missing=list(missing),
+                        degradations=[
+                            Degradation(
+                                kind="font_extension_failed",
+                                detail=type(exc).__name__,
+                                severity="error",
+                            )
+                        ],
+                    ),
                 )
 
         # Determine max width
@@ -1716,13 +1769,14 @@ def insert_text_block(
             success=True,
             original_text="",
             new_text=text,
-            font_action="kept",
+            font_action=font_action,
             warnings=shift_warnings,
             fidelity_report=FidelityReport(
-                font_substituted=None,
+                font_substituted=substitution_log[0] if substitution_log else None,
                 overflow_detected=overflow,
                 reflow_applied=True,
-                glyphs_missing=[],
+                glyphs_missing=pre_extension_missing,
+                degradations=list(coverage_degradations),
             ),
         )
     finally:
