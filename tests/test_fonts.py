@@ -737,6 +737,100 @@ class TestTier1_5GlyphInjection:
                 f"on repeat call — duplicate bfchar lines appended"
             )
 
+
+# ── TestFontFile2CacheEviction (IMP-1) ───────────────────────────────
+
+
+@_need_resume
+class TestFontFile2CacheEviction:
+    """IMP-1: ``_FONTFILE2_CACHE`` is evicted after every ``/FontFile2``
+    write so subsequent ``font_has_codepoint`` queries observe the
+    just-injected glyphs.
+
+    The bug is latent at v0.1.3 — Agent H's compounding diagnostic
+    exercised double-extension on the same font dict without observable
+    corruption. Likely pikepdf updates ``objgen`` on stream rewrite, so
+    the cache key changes naturally and the stale entry is never
+    consulted. Per the prompt's IMP-1 directive: "ship the eviction
+    defensively". The test is a regression guard against future
+    regressions where:
+
+    1. pikepdf changes such that ``objgen`` is preserved across stream
+       rewrites (cache key would no longer change naturally), OR
+    2. a refactor introduces a code path that calls
+       ``font_has_codepoint`` for the just-injected codepoint in the
+       same pdf-object scope, making the cache key collision explicit.
+
+    Behavioral test (no white-box poking of ``_FONTFILE2_CACHE``).
+    Double-extension scenario per the prompt's spec: ø at step 1, then
+    ü on the same logical font dict at step 2. Step 2 must report ü as
+    a fresh extension with no stale ø entry leaking from step 1.
+
+    Single-source-of-truth char selection: ø and ü are both verified
+    missing from every embedded font on the resume corpus page 0 (F1
+    cmap has 94 ASCII-range entries; verified during plan dev). ø is
+    shared with ``tests/test_structural.py::TestInsertTextBlockHonesty``
+    so future maintainers don't re-derive the choice.
+    """
+
+    def test_double_extension_different_codepoints(self, tmp_path: Path) -> None:
+        if find_font("Calibri-Bold") is None:
+            pytest.skip("Calibri-Bold not installed; cannot exercise Tier 1.5 path")
+
+        step1 = str(tmp_path / "step1.pdf")
+        step2 = str(tmp_path / "step2.pdf")
+
+        # Step 1: replace "Aryan" with "Aryanø" — Calibri-Bold subset
+        # lacks ø, so extend_subset runs and Tier 1.5 injects ø into
+        # /FontFile2.
+        r1_list = replace_all(str(RESUME), "Aryan", "Aryanø", step1)
+        assert r1_list, "step 1: no matches (corpus invariant broken)"
+        r1 = r1_list[0]
+        assert r1.success is True
+        assert r1.font_action == "extended"
+        r1_cov = [
+            d
+            for d in r1.fidelity_report.degradations
+            if d.kind in ("font_coverage_extended", "font_coverage_substituted")
+        ]
+        assert any("ø" in d.detail for d in r1_cov)
+
+        # Step 2: replace "Aryanø" with "Aryanü" — ü is also missing
+        # from the Calibri-Bold subset, so Tier 1.5 must run again as
+        # a fresh extension for ü. With cache eviction (the fix), any
+        # font_has_codepoint queries during step 2 read the current
+        # /FontFile2 freshly. Without eviction, in scenarios where the
+        # cache key is preserved, a stale read could spuriously report
+        # ø as missing and append a duplicate ø entry to step 2's
+        # degradations.
+        r2_list = replace_all(step1, "Aryanø", "Aryanü", step2)
+        assert r2_list, "step 2: no matches"
+        r2 = r2_list[0]
+        assert r2.success is True
+        # Step 2 must report a fresh extension event for ü:
+        assert r2.font_action == "extended"
+        r2_cov = [
+            d
+            for d in r2.fidelity_report.degradations
+            if d.kind in ("font_coverage_extended", "font_coverage_substituted")
+        ]
+        assert any("ü" in d.detail for d in r2_cov), (
+            "step 2 did not surface ü as a fresh extension; "
+            f"r2 degradations: {r2.fidelity_report.degradations!r}"
+        )
+        # Step 2 must NOT have an entry whose chars-list is just ø
+        # (would indicate a stale-cache leak from step 1).
+        # Detail format: "tier=N,chars=<csv>[,source=<name>]".
+        for d in r2_cov:
+            chars_part = next(
+                (p[len("chars=") :] for p in d.detail.split(",") if p.startswith("chars=")),
+                "",
+            )
+            assert chars_part != "ø", (
+                "step 2 has a stale ø-only coverage Degradation "
+                f"({d!r}) — _FONTFILE2_CACHE may be leaking pre-step-1 state"
+            )
+
     def test_resolver_cache_shared_font_cross_page_evict(self, tmp_path: Path) -> None:
         """Pages sharing a font via indirect ref must share one cache entry.
 

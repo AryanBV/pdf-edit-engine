@@ -939,6 +939,19 @@ def _extend_tier2(
         embedded.save(buf)
         fd["/FontFile2"] = pdf.make_stream(buf.getvalue())
 
+        # IMP-1: evict the stale covered-codepoints cache for this font
+        # dict. Cache is keyed on font_dict.objgen; pikepdf MAY update
+        # objgen on stream rewrite (Agent H exercised this without
+        # observable corruption — mechanism unclear), but we evict
+        # defensively so font_has_codepoint observes the just-injected
+        # glyphs on the next query. Without eviction, a subsequent
+        # can_encode() against a codepoint that step 1 just added would
+        # observe the stale pre-injection covered set, return False, and
+        # trigger a redundant re-extension.
+        _evict_key = _font_dict_key(font_dict)
+        if _evict_key is not None:
+            _FONTFILE2_CACHE.pop(_evict_key, None)
+
         # Apply PDF-level metadata updates using Tier 1 helpers.
         _append_to_unicode_cmap(font_dict, new_cmap_entries, pdf)
         _append_w_entries(cid_font, new_w_entries)
