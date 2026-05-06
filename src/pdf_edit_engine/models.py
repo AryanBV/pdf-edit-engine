@@ -134,6 +134,27 @@ class FidelityReport:
             d.kind in FONT_AFFECTING_KINDS for d in self.degradations
         )
 
+    def to_dict(self) -> dict[str, object]:
+        """Serialize including @property fields (which dataclasses.asdict drops).
+
+        ``dataclasses.asdict`` enumerates only declared fields, so the
+        computed ``font_preserved`` property is silently lost when callers
+        use ``asdict`` for JSON serialization. This helper inserts
+        ``font_preserved`` after ``asdict`` runs.
+
+        ``asdict`` recurses into ``Degradation`` (a frozen dataclass with
+        no ``@property`` fields — verified above), so default recursion
+        is correct for the nested ``degradations`` list. If a future
+        ``@property`` is added to ``Degradation`` or any nested
+        dataclass type used here, this method must override the recursion
+        explicitly for that nesting.
+        """
+        import dataclasses
+
+        data: dict[str, object] = dict(dataclasses.asdict(self))
+        data["font_preserved"] = self.font_preserved
+        return data
+
 
 @dataclass
 class EditResult:
