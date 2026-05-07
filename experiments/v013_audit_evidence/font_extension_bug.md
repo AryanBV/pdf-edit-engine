@@ -1,5 +1,27 @@
 # Font-extension bug — M10 case
 
+> **[v0.1.3 Phase 13 correction (2026-05-07)]** This bundle was captured
+> on `design/v013-implementation` and originally framed the M10 fix path
+> as **Tier 1 (CMap-only extension)** on the assumption that the
+> `/FontFile2` binary's 6,954 `glyf` slots represented physically-present
+> outlines. Block 3 pre-flight (`experiments/v013_block_3_preflight/REPORT.md`
+> Section 4B) re-inspected F1 with a stricter probe and found that
+> **only 116 of those 6,954 slots have real named glyphs**; the
+> remaining **6,838 are anonymous `glyph0XXXX` placeholders** the
+> embedder retained for slot-index consistency. **Neither `oslash` nor
+> `udieresis` exists in F1's glyph table.** The correct fix path is
+> therefore **Tier 1.5 (system-font sourcing)**, not Tier 1 — and
+> Phase 13 implements that. Inline corrections below mark the specific
+> sentences that drift from this updated empirical truth; the original
+> analysis is preserved for the reasoning-trail audit.
+>
+> Reference numbers (locked from preflight 4B):
+> - `glyf_total_slots = 6954`
+> - `real_glyph_names = 116`
+> - `placeholder_glyph0XXXX = 6838`
+> - `cmap_size = 118`
+> - `unitsPerEm = 2048`
+
 > Evidence for the design doc Section 1 verification gate (a) claim:
 > `docs/v0.1.3-implementation-design.md` lines 72–82 state that for the M10
 > case, "the engine returns `font_action='kept'` (`extend_subset` not
@@ -139,6 +161,22 @@ before assuming extension is needed. Spike found Calibri 'subset' with
 in the language of `docs/font-pipeline.md`, *not* Tier 1.5 — the
 outlines are physically present.
 
+> **[v0.1.3 Phase 13 correction]** The paragraph above is wrong about
+> the outlines. Block 3 preflight 4B re-inspected with a stricter probe
+> (`non_cid_extension_scope.py`, in the demo-verification bundle) and
+> walked the `glyf` slots: only **116 of 6,954** carry real named
+> glyphs (alphabetical Latin + a small punctuation set). The other
+> **6,838 are anonymous `glyph0XXXX` placeholders** — empty/null entries
+> the embedder retained for slot-index consistency, with no outline
+> data and no cmap reachability. **`oslash` and `udieresis` are NOT
+> in the 116 real names.** The cmap-only Tier 1 fix path proposed
+> here cannot work because there is no outline to map *to*. The
+> correct fix is Tier 1.5 (source the outline from a system font and
+> inject it), which Phase 13's `_extend_simple_tier_15` implements.
+> The CLAUDE.md "subsetted fonts may be full" rule still applies in
+> general — it just doesn't describe this specific F1's slot
+> population.
+
 ## Scope estimate (for Aryan to decide)
 
 A real fix has two parts:
@@ -189,6 +227,15 @@ not large by the project's standards.
    pure Tier 1 (CMap-only extension), not Tier 1.5 — much cheaper than
    the design doc's framing implies. This may be relevant to scope/risk
    discussions about whether to bundle a fix in v0.1.3 or defer.
+
+   > **[v0.1.3 Phase 13 correction]** The "much cheaper than the design
+   > doc's framing implies" claim was based on the now-falsified
+   > assumption that 6,954 outlines are present. Block 3 preflight 4B
+   > showed only 116 are real; 6,838 are anonymous placeholders. The
+   > design doc's Tier 1.5 framing was correct (or at minimum was
+   > consistent with the actual code path needed); this audit-bundle
+   > finding underestimated the work. Phase 13's `_extend_simple_tier_15`
+   > does the actual Tier 1.5 work that this case requires.
 
 3. **`fidelity_report.glyphs_missing` is `[]` in this case**, not a
    populated list. The engine has zero observable signal that anything

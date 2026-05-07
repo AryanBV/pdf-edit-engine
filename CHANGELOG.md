@@ -58,6 +58,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   0.55` ∧ `x_cluster_count >= 2`), a `paragraph_detection_low_confidence`
   Degradation (info) is added to the result. The detector grouping
   itself is unchanged in v0.1.3 — algorithm replacement is v0.1.4.
+- **Non-CID Tier 1.5 extension (Phase 13).** Simple TrueType WinAnsi
+  fonts can now extend their glyph coverage via system-font sourcing,
+  not just Type0/Identity-H. Mirrors the existing CID Tier 1.5 path
+  (`_extend_tier2`) for font-binary surgery; updates `/Encoding`
+  `/Differences` + `/Widths` instead of `/ToUnicode` + `/W`. Free-byte
+  allocation is deterministic (consecutive low-end starting at
+  `/LastChar + 1`, skipping byte 127). Surfaces via the existing
+  `font_coverage_substituted` Degradation when a system font (or
+  metric-equivalent like Carlito for Calibri) sources the outline.
+  M.4/M.5 inline guards in `_glyph_width_from_hmtx` and
+  `_extend_simple_widths` re-raise `KeyError` / `ZeroDivisionError`
+  / `ValueError` as `FontNotFoundError` so the canonical
+  `_FONT_EXTEND_FAIL_EXCS` tuple catches them. M10 SOW launch gate
+  now passes end-to-end ("Sarah Chen → Søren Müller" with ø + ü
+  rendered cleanly).
 
 ### Contracts
 
@@ -80,6 +95,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   instances (two PDFs both having a font at object 7,0 collide). Now
   keyed on `(id(font_dict.owner), objgen[0], objgen[1])` so each PDF
   instance has its own cache namespace.
+
+### Removed
+
+- **`_FONTFILE2_CACHE` and `_font_dict_key` removed.** The
+  module-global cache in `fonts.py` was deleted as a root fix
+  during Phase 13.4. The cache had two architectural issues that
+  Phase 13.4 invariant probes surfaced (populate/evict key
+  mismatch from the `pikepdf.Dictionary(font_obj)` copy stripping
+  objgen; cross-Pdf `id(pdf)` recycling pollution) and had been
+  functionally a no-op since pikepdf 10.5.1 anyway. Removed
+  alongside its API surface: the `pdf` parameter on
+  `font_has_codepoint`, `FontResolver.__init__`, and
+  `FontResolverCache.__init__`. `font_has_codepoint` now re-parses
+  `/FontFile2` on every call. No public-API impact.
+- **`_FONT_EXTEND_FAIL_EXCS` moved from `reflow.py` to `fonts.py`**
+  (its semantic home). `reflow.py`, `structural.py`, and
+  `surgeon.py` all import from there. Fixes `surgeon.py`'s prior
+  asymmetric font-extension catch (missing `OSError` + `TTLibError`).
+  No public-API impact.
 
 ## [0.1.2] — 2026-04-25
 

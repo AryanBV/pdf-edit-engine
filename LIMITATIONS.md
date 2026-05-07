@@ -26,7 +26,7 @@
 - CJK fonts with 30,000+ glyphs have not been tested
 - Type 3 fonts (bitmap/procedural) are not supported for extension
 - Emoji and other multi-codepoint characters cannot be rendered if the font lacks those glyphs (reported via `FidelityReport.degradations` as `font_extension_failed`)
-- Non-CID (simple WinAnsi/MacRoman) fonts cannot be extended via `extend_subset` — extension only works on Identity-H CID fonts. Replacements requiring missing glyphs in a simple font return `success=False` with `font_extension_failed` Degradation (v0.1.3 surfacing).
+- Non-CID font extension is supported for **simple TrueType + WinAnsi + `/FontFile2`** fonts (Phase 13). Replacements requiring missing glyphs trigger `_extend_simple_tier_15`, which sources the outline from a system font (or metric-equivalent fallback like Carlito for Calibri) and surfaces via `FidelityReport.font_substituted` AND a `font_coverage_substituted` Degradation. Still NOT supported: `/FontFile3` (CFF/OpenType) outlines (tracked as ARY-279 for v0.1.4); `/Type1` fonts (would require Type1 charstring surgery — out of scope); MacRoman simple fonts (architecturally similar to WinAnsi but untested in v0.1.3); CJK fonts with 30,000+ glyphs (untested). The dispatcher in `extend_subset()` raises `FontNotFoundError` for all these cases, which surfaces as a `font_extension_failed` Degradation through the public API.
 
 ## Encoding
 

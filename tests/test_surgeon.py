@@ -228,6 +228,22 @@ class TestEncodingFailure:
         v0.1.3 (Phase 4): also asserts the lying-success-path fix \u2014
         font_preserved must be False (was buggy True pre-v0.1.3) and
         degradations must contain a font_extension_failed entry.
+
+        v0.1.3 Phase 13 note: this test exercises the **non-CID
+        extension's no-AGL-name failure path**. SIMPLE_PDF
+        (`reportlab_simple.pdf`) is a /TrueType + /WinAnsiEncoding font
+        which Phase 13's dispatcher routes to `_extend_simple_tier_15`
+        rather than rejecting at the `is_cid_font` gate (now dropped).
+        The replacement chars are CJK (U+4F60 \u4f60, U+597D \u597d),
+        which `_glyph_name_for_codepoint` resolves to `uni4F60` and
+        `uni597D` (no AGL entry exists for these codepoints). The
+        downstream `_inject_glyph_in_place` then fails to source these
+        glyphs from the system font (Carlito/Arial don't carry CJK
+        outlines), and the call surfaces as `font_extension_failed`
+        per `_FONT_EXTEND_FAIL_EXCS`. This is the v0.1.3 contract:
+        extension is *attempted* on simple TrueType fonts, but
+        legitimately fails when neither AGL nor system-font cmap covers
+        the codepoint.
         """
         match = _first_match(SIMPLE_PDF, "Test")
         out = str(tmp_path / "output.pdf")
