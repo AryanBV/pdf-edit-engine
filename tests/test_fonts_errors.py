@@ -100,20 +100,65 @@ def test_extend_subset_empty_chars_no_op() -> None:
         pdf.close()
 
 
-# ── extend_subset: subtype != Type0 ──────────────────────────────────────
+# ── extend_subset: /Type1 rejection ──────────────────────────────────────
 
 
-@_need_resume
-def test_extend_subset_non_type0_raises() -> None:
-    """``extend_subset`` rejects non-Type0/Identity-H fonts (lines 627-632)."""
-    pdf = pikepdf.Pdf.open(str(RESUME))
+def test_extend_subset_type1_raises(tmp_path: Path) -> None:
+    """``extend_subset`` rejects /Type1 fonts via the v0.1.3 dispatcher.
+
+    Phase 13.1.1 replaced the v0.1.2 ``subtype != "/Type0"`` gate with a
+    subtype-aware switch: /Type0 takes the existing CID path, /TrueType
+    is now ROUTED to ``_extend_simple_tier_15`` (the entire point of
+    Phase 13), and /Type1 is explicitly rejected because Adobe Type1
+    charstring surgery is out of scope for v0.1.3. This test pins the
+    /Type1-rejection branch; the /Type0 path keeps its own coverage at
+    ``test_extend_subset_empty_chars_no_op`` and the broader Tier 1.5
+    suite. /TrueType extension success is covered by Phase 13.4's
+    ``test_simple_tier_15_success_via_synthetic_fixture``.
+    """
+    # Synthetic in-memory PDF: blank page with a minimal /Type1 font
+    # resource carrying a /FontDescriptor (so `_get_font_objects` accepts
+    # it and the dispatcher's /Type1 branch is the next thing to fire).
+    # The 14 standard Type1 base fonts have no /FontDescriptor, so this
+    # synthetic shape is the simplest path to reach the dispatcher.
+    out = tmp_path / "type1_synthetic.pdf"
+    pdf = pikepdf.new()
     try:
+        pdf.add_blank_page(page_size=(612, 792))
         page = pdf.pages[0]
-        # F2 in the resume is a WinAnsi (non-Type0) font.
-        with pytest.raises(FontNotFoundError, match="Type0|Identity-H"):
-            extend_subset(pdf, page, "F2", "Z")
+        font_descriptor = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/FontDescriptor"),
+                "/FontName": pikepdf.Name("/Helvetica"),
+                "/Flags": 32,
+                "/FontBBox": pikepdf.Array([-166, -225, 1000, 931]),
+                "/ItalicAngle": 0,
+                "/Ascent": 718,
+                "/Descent": -207,
+                "/CapHeight": 718,
+                "/StemV": 88,
+            }
+        )
+        type1_font = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Font"),
+                "/Subtype": pikepdf.Name("/Type1"),
+                "/BaseFont": pikepdf.Name("/Helvetica"),
+                "/FontDescriptor": font_descriptor,
+            }
+        )
+        page["/Resources"] = pikepdf.Dictionary({"/Font": pikepdf.Dictionary({"/F1": type1_font})})
+        pdf.save(str(out))
     finally:
         pdf.close()
+
+    pdf2 = pikepdf.Pdf.open(str(out))
+    try:
+        page = pdf2.pages[0]
+        with pytest.raises(FontNotFoundError, match="Type1"):
+            extend_subset(pdf2, page, "F1", "Z")
+    finally:
+        pdf2.close()
 
 
 # ── extend_subset: no system font available ──────────────────────────────

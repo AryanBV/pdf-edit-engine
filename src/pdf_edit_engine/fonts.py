@@ -732,15 +732,40 @@ def extend_subset(
     subtype_obj = font_dict.get("/Subtype")
     subtype = str(subtype_obj) if subtype_obj is not None else ""
 
-    if subtype != "/Type0":
+    if subtype == "/Type0":
+        if cid_font is None:
+            msg = f"No CIDFont descendant for {font_name}"
+            raise FontNotFoundError(msg)
+        # CID Identity-H path follows below verbatim.
+    elif subtype == "/TrueType":
+        # Reject CFF/OpenType outlines and Type1 explicitly inside the
+        # simple-font path so the failure detail is clean.
+        if fd.get("/FontFile3") is not None or fd.get("/FontFile") is not None:
+            msg = (
+                f"simple-font extension requires /FontFile2 (TrueType outlines); "
+                f"got /FontFile3 (CFF/OpenType) or /FontFile (Type1) for {font_name}"
+            )
+            raise FontNotFoundError(msg)
+        return _extend_simple_tier_15(
+            pdf,
+            font_dict,
+            fd,
+            additional_chars=additional_chars,
+            full_font_path=full_font_path,
+            substitution_log=substitution_log,
+        )
+    elif subtype == "/Type1":
         msg = (
-            f"Font extension is only supported for Type0/Identity-H fonts, "
-            f"got {subtype} for {font_name}"
+            f"Type1 font extension is not supported (would require Adobe Type1 "
+            f"charstring surgery); got {subtype} for {font_name}. Caller should "
+            f"see this as font_extension_failed via Phase 4 lying-fix path."
         )
         raise FontNotFoundError(msg)
-
-    if cid_font is None:
-        msg = f"No CIDFont descendant for {font_name}"
+    else:
+        msg = (
+            f"Font extension is only supported for Type0/Identity-H or "
+            f"simple /TrueType fonts; got {subtype} for {font_name}"
+        )
         raise FontNotFoundError(msg)
 
     # Extract and load the embedded font
@@ -989,3 +1014,305 @@ def _extend_tier2(
     finally:
         embedded.close()
         system.close()
+
+
+# ── Simple-font (non-CID) Tier 1.5 path ──────────────────────────────────
+
+
+def _extend_simple_tier_15(
+    pdf: pikepdf.Pdf,
+    font_dict: pikepdf.Object,
+    fd: pikepdf.Object,
+    additional_chars: str,
+    full_font_path: str | Path | None = None,
+    substitution_log: list[str] | None = None,
+) -> str:
+    """Tier 1.5 in-place glyph injection for simple (non-CID) TrueType fonts.
+
+    Mirrors ``_extend_tier2`` for the font-binary surgery (system font
+    sourcing, composite resolution, hinting strip, glyf append) but
+    updates ``/Encoding /Differences``, ``/Widths``, and
+    ``/FirstChar..LastChar`` on the PDF side instead of ``/ToUnicode``,
+    ``/W``, and ``/CIDToGIDMap``.
+
+    Args:
+        pdf: The open ``pikepdf.Pdf`` (mutated in place). Threaded
+            through from the public-API entry point per INV-L-1; this
+            helper must NOT call ``pikepdf.Pdf.open`` itself.
+        font_dict: The simple-font dictionary (Subtype /TrueType).
+        fd: The /FontDescriptor dictionary owning /FontFile2.
+        additional_chars: Unicode characters to add.
+        full_font_path: Optional explicit override for the system font
+            path; bypasses ``_find_font_with_origin`` lookup.
+        substitution_log: Optional list to receive metric-equivalent
+            substitution names (INV-C-4).
+
+    Returns:
+        ``"full_extension"`` (mirrors CID Tier 1.5 contract).
+
+    Raises:
+        FontNotFoundError: /FontFile2 missing, system font unavailable,
+            embedded hmtx malformed, or no free byte slots remaining.
+    """
+    from pdf_edit_engine.system_fonts import _find_font_with_origin
+
+    if not additional_chars:
+        return "full_extension"
+
+    # 1. /FontFile2 must be present + parseable
+    ff2 = fd.get("/FontFile2")
+    if ff2 is None:
+        raise FontNotFoundError(
+            "simple-font Tier 1.5 requires /FontFile2; "
+            "/FontFile (Type1) and /FontFile3 (CFF) not supported"
+        )
+
+    # 2. Locate system font (mirrors _extend_tier2 sourcing)
+    base_font = str(font_dict.get("/BaseFont") or "").lstrip("/")
+    ps_name = _strip_subset_prefix(base_font)
+    found = _find_font_with_origin(ps_name)
+    if found is None:
+        if full_font_path is None:
+            raise FontNotFoundError(
+                f"system font for {ps_name!r} not found and no full_font_path provided"
+            )
+        system_path = str(full_font_path)
+        substituted_name = None
+    else:
+        system_path, substituted_name = found
+    if substituted_name is not None and substitution_log is not None:
+        substitution_log.append(substituted_name)
+
+    # 3. Open both fonts (close in finally per existing pattern)
+    embedded = TTFont(io.BytesIO(ff2.read_bytes()))
+    system = TTFont(system_path)
+    try:
+        # 4. Inject each missing glyph; collect (byte, glyph_name, width).
+        # Consecutive low-end allocation: bytes start at /LastChar + 1.
+        used_bytes = _used_bytes_in_encoding(font_dict)
+        last_char = int(font_dict.get("/LastChar") or 0)
+        free_bytes = _allocate_free_bytes(used_bytes, len(additional_chars), last_char=last_char)
+        new_assignments: list[tuple[int, str, float]] = []
+
+        for ch, byte_slot in zip(additional_chars, free_bytes, strict=True):
+            cp = ord(ch)
+            # Standard Adobe Glyph List name (e.g. ø → "oslash"); fall
+            # back to uniXXXX for codepoints AGL doesn't cover.
+            glyph_name = _glyph_name_for_codepoint(cp)
+            # Inject outline; reuses CID Tier 1.5 helper verbatim
+            _inject_glyph_in_place(embedded, system, ch)
+            # Width from hmtx (after injection, so entry exists). Helper
+            # raises FontNotFoundError on missing glyph_name (would
+            # indicate _inject_glyph_in_place partial-failed) or
+            # unitsPerEm == 0 (corrupt font metadata) — both surfaced as
+            # font_extension_failed via _FONT_EXTEND_FAIL_EXCS at the
+            # call site (M.4 hardening).
+            width = _glyph_width_from_hmtx(embedded, glyph_name)
+            new_assignments.append((byte_slot, glyph_name, width))
+
+        # 5. Re-serialize embedded font, replace /FontFile2 stream.
+        # Mirrors _extend_tier2's pattern (fonts.py:960):
+        #     fd["/FontFile2"] = pdf.make_stream(buf.getvalue())
+        buf = io.BytesIO()
+        embedded.save(buf)
+        fd["/FontFile2"] = pdf.make_stream(buf.getvalue())
+
+        # 5b. Invalidate /FontFile2 coverage cache for this font dict.
+        # _FONTFILE2_CACHE is keyed on (id(pdf), *objgen) post-13.2.3;
+        # underlying bytes have changed, so cached coverage is stale.
+        cache_key = _font_dict_key(pdf, font_dict)
+        _FONTFILE2_CACHE.pop(cache_key, None)
+
+        # 6. PDF-side updates: /Encoding /Differences, /Widths, bounds.
+        _extend_simple_encoding(pdf, font_dict, new_assignments)
+        _extend_simple_widths(font_dict, new_assignments)
+
+        logger.info(
+            "Tier 1.5 (simple-font) extension from %s: %d character(s) added",
+            system_path,
+            len(additional_chars),
+        )
+        return "full_extension"
+    finally:
+        embedded.close()
+        system.close()
+
+
+def _glyph_name_for_codepoint(cp: int) -> str:
+    """Reverse-lookup Adobe Glyph List name for a Unicode codepoint.
+
+    Returns the AGL name (e.g. ``"oslash"`` for U+00F8) when one exists;
+    otherwise falls back to the canonical ``uniXXXX`` form. Used by
+    ``_extend_simple_tier_15`` to populate /Encoding /Differences with
+    PDF-spec-conformant glyph names.
+    """
+    from fontTools.agl import UV2AGL  # type: ignore[import-untyped]
+
+    return UV2AGL.get(cp) or f"uni{cp:04X}"
+
+
+def _glyph_width_from_hmtx(font: TTFont, glyph_name: str) -> float:
+    """Read advance width from hmtx and normalize to PDF /Widths scale (1/1000-em).
+
+    Raises FontNotFoundError on missing ``glyph_name`` (indicates a
+    partial ``_inject_glyph_in_place`` failure) or ``unitsPerEm == 0``
+    (corrupt font metadata). Both are surfaced as
+    ``font_extension_failed`` via ``_FONT_EXTEND_FAIL_EXCS`` at the call
+    site, satisfying INV-J-5 (M.4 hardening).
+    """
+    metrics = font["hmtx"].metrics
+    if glyph_name not in metrics:
+        raise FontNotFoundError(f"glyph {glyph_name!r} missing from embedded hmtx after injection")
+    upem = font["head"].unitsPerEm
+    if upem == 0:
+        raise FontNotFoundError(f"unitsPerEm is 0 for glyph {glyph_name!r}; cannot normalize width")
+    raw = float(metrics[glyph_name][0])
+    result: float = raw * 1000.0 / upem
+    return result
+
+
+def _used_bytes_in_encoding(font_dict: pikepdf.Object) -> set[int]:
+    """Return all byte slots already in use by this font's encoding.
+
+    Combines (a) bytes in [/FirstChar, /LastChar] (the explicit /Widths
+    range) and (b) bytes explicitly mapped via /Encoding /Differences.
+    Bytes outside this union are free for allocation.
+    """
+    used: set[int] = set()
+    fc = font_dict.get("/FirstChar")
+    lc = font_dict.get("/LastChar")
+    if fc is not None and lc is not None:
+        used.update(range(int(fc), int(lc) + 1))
+    enc = font_dict.get("/Encoding")
+    if isinstance(enc, pikepdf.Dictionary) and "/Differences" in enc:
+        cur = 0
+        for item in list(enc["/Differences"]):  # type: ignore[call-overload]
+            s = str(item)
+            if not s.startswith("/"):
+                cur = int(item)
+            else:
+                used.add(cur)
+                cur += 1
+    return used
+
+
+def _allocate_free_bytes(used: set[int], n: int, *, last_char: int) -> list[int]:
+    """Allocate n free byte slots, consecutively from /LastChar + 1.
+
+    Low-end consecutive allocation: starts at ``last_char + 1``, walks
+    up, skipping 127 (DEL) and any byte already in ``used`` (which would
+    indicate a /Differences override on a high byte). Order is stable:
+    same ``(used, n, last_char)`` → same returned list, so multiple
+    extensions on the same font don't collide.
+
+    Raises:
+        FontNotFoundError: when no contiguous run of n free bytes
+            exists in [last_char+1, 255].
+    """
+    free: list[int] = []
+    for byte in range(last_char + 1, 256):
+        if byte == 127:
+            continue
+        if byte in used:
+            continue
+        free.append(byte)
+        if len(free) == n:
+            return free
+    raise FontNotFoundError(
+        f"no free byte slots above /LastChar={last_char}: need {n}, "
+        f"only {len(free)} free in {last_char + 1}..255"
+    )
+
+
+def _extend_simple_encoding(
+    pdf: pikepdf.Pdf,
+    font_dict: pikepdf.Object,
+    new_assignments: list[tuple[int, str, float]],
+) -> None:
+    """Append (byte, glyph_name) pairs to /Encoding /Differences.
+
+    If /Encoding is currently a NAME (e.g. /WinAnsiEncoding), promotes
+    it to a DICT first so /Differences can be added. If already a dict,
+    appends to existing /Differences.
+    """
+    del pdf  # parameter retained for API symmetry; pikepdf.Dictionary
+    # construction does not need the owning Pdf.
+
+    enc = font_dict.get("/Encoding")
+    if not isinstance(enc, pikepdf.Dictionary):
+        # Promote name → dict
+        base_name = str(enc) if enc is not None else "/WinAnsiEncoding"
+        font_dict["/Encoding"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Encoding"),
+                "/BaseEncoding": pikepdf.Name(base_name),
+                "/Differences": pikepdf.Array(),
+            }
+        )
+        enc = font_dict["/Encoding"]
+
+    diffs: list[object] = list(enc.get("/Differences") or [])  # type: ignore[arg-type]
+    # PDF /Differences format: [byte_start /name1 /name2 ... byte_start2 /name3 ...]
+    # Consecutive bytes can share a single byte_start prefix. We emit
+    # one prefix per assignment for simplicity (no correctness risk;
+    # mild verbosity).
+    for byte_slot, glyph_name, _width in sorted(new_assignments):
+        diffs.append(byte_slot)
+        diffs.append(pikepdf.Name(f"/{glyph_name}"))
+    enc["/Differences"] = pikepdf.Array(diffs)
+
+
+def _extend_simple_widths(
+    font_dict: pikepdf.Object,
+    new_assignments: list[tuple[int, str, float]],
+) -> None:
+    """Append /Widths entries for newly-allocated bytes; bump /LastChar.
+
+    With consecutive low-end allocation in ``_allocate_free_bytes``, the
+    new bytes are guaranteed contiguous starting at /LastChar + 1 (with
+    127 skipped if encountered). So this function simply appends the n
+    new widths to /Widths in byte-sorted order and bumps /LastChar.
+
+    /FirstChar is not touched. /Widths length grows from
+    (LastChar - FirstChar + 1) to (new_LastChar - FirstChar + 1).
+
+    Raises:
+        FontNotFoundError: /FirstChar or /LastChar missing or
+            non-integer (M.5 hardening per F.28 atlas).
+    """
+    fc_obj = font_dict.get("/FirstChar")
+    lc_obj = font_dict.get("/LastChar")
+    if fc_obj is None or lc_obj is None:
+        raise FontNotFoundError(
+            "simple-font extension requires /FirstChar and /LastChar; "
+            f"got /FirstChar={fc_obj!r}, /LastChar={lc_obj!r}"
+        )
+    try:
+        fc = int(fc_obj)
+        lc = int(lc_obj)
+    except (TypeError, ValueError) as exc:
+        raise FontNotFoundError(f"malformed /FirstChar or /LastChar: {exc}") from exc
+    del lc  # only used to satisfy the M.5 guard's int() conversion check.
+
+    raw_widths: list[object] = []
+    if "/Widths" in font_dict:
+        raw_widths = list(font_dict["/Widths"])  # type: ignore[call-overload]
+    widths: list[float] = [float(w) for w in raw_widths]  # type: ignore[arg-type]
+
+    # Sort assignments by byte to handle the 127-skip case (allocation
+    # might produce e.g. [126, 128] if old LC=125; emit them in order).
+    sorted_assignments = sorted(new_assignments)
+    new_max = sorted_assignments[-1][0]
+
+    # Pad /Widths only when the gap between LC and the first allocated
+    # byte > 1 (e.g. 127 skipped). Such gap-bytes never get referenced
+    # in any /Differences entry — they're padding for index consistency.
+    expected_len = new_max - fc + 1
+    while len(widths) < expected_len:
+        widths.append(0.0)
+
+    for byte_slot, _glyph_name, width in sorted_assignments:
+        widths[byte_slot - fc] = width
+
+    font_dict["/Widths"] = pikepdf.Array(widths)
+    font_dict["/LastChar"] = new_max
