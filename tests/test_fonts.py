@@ -873,3 +873,83 @@ class TestFontFile2CacheEviction:
             assert r2_after is not r1, (
                 "evict on one page must clear entries for every page referencing the same font dict"
             )
+
+
+# ── ARY-349: _font_dict_key cache-key repair (pikepdf >=10.5.1) ──────────
+
+
+class TestFontDictKeyCacheRepair:
+    """Regression probes for ARY-349.
+
+    Pre-fix, ``_font_dict_key`` called ``font_dict.owner`` — an attribute
+    that pikepdf 10.5.1 removed. The ``except (AttributeError, TypeError)``
+    swallowed the failure and returned ``None``, which caused
+    ``_FONTFILE2_CACHE`` to never populate (the IMP-1 manual eviction in
+    ``_extend_tier2`` was a runtime no-op). The fix takes ``pdf`` as an
+    explicit parameter so the cache key is always constructible under
+    pikepdf >=10.5.1.
+    """
+
+    def test_font_dict_key_returns_stable_key_across_pikepdf_versions(self) -> None:
+        """``_font_dict_key`` produces a deterministic 3-tuple of ints.
+
+        Required acceptance check: under pikepdf 10.5.1 the helper must
+        return a real key (not None) and repeated calls on the same
+        ``(pdf, font_dict)`` pair must compare equal so that
+        ``_FONTFILE2_CACHE`` lookups hit.
+        """
+        from pdf_edit_engine.fonts import _font_dict_key
+
+        fixture = CORPUS / "cidfont_synthetic.pdf"
+        if not fixture.exists():
+            pytest.skip("cidfont_synthetic.pdf not in corpus")
+
+        with pikepdf.Pdf.open(str(fixture)) as pdf:
+            font_dict = pdf.pages[0]["/Resources"]["/Font"]["/F1"]
+
+            key = _font_dict_key(pdf, font_dict)
+            assert isinstance(key, tuple), "key must be a tuple"
+            assert len(key) == 3, "key must have 3 components (id, gen0, gen1)"
+            assert all(isinstance(part, int) for part in key), (
+                "every component of the cache key must be an int"
+            )
+
+            # Stability: a second call on the same arguments must return
+            # an equal tuple — otherwise dict-keyed lookups would miss
+            # and the cache would stay permanently empty.
+            key_again = _font_dict_key(pdf, font_dict)
+            assert key == key_again, (
+                "_font_dict_key must be stable across calls on the same "
+                "(pdf, font_dict) — required for _FONTFILE2_CACHE to hit"
+            )
+
+    def test_font_dict_key_cache_populates_after_fix(self) -> None:
+        """``font_has_codepoint`` populates ``_FONTFILE2_CACHE`` end-to-end.
+
+        Pre-fix this would assert 0 entries — ``_font_dict_key`` returned
+        None on every call so the populate-on-success line was skipped.
+        Post-fix the cache picks up at least one entry per Identity-H
+        font we probed.
+        """
+        from pdf_edit_engine.fonts import _FONTFILE2_CACHE, font_has_codepoint
+
+        fixture = CORPUS / "cidfont_synthetic.pdf"
+        if not fixture.exists():
+            pytest.skip("cidfont_synthetic.pdf not in corpus")
+
+        # Snapshot the existing cache so unrelated test side effects do
+        # not influence the assertion.
+        baseline_size = len(_FONTFILE2_CACHE)
+
+        with pikepdf.Pdf.open(str(fixture)) as pdf:
+            font_dict = pdf.pages[0]["/Resources"]["/Font"]["/F1"]
+            # Probe with an arbitrary codepoint — the return value isn't
+            # what's under test; the populate side effect is.
+            font_has_codepoint(pdf, font_dict, ord("A"))
+
+        # After the fix, at least one new entry must have landed.
+        assert len(_FONTFILE2_CACHE) > baseline_size, (
+            "_FONTFILE2_CACHE failed to populate; ARY-349 regression — "
+            "_font_dict_key likely returned None and the populate path "
+            "was skipped (the IMP-1 manual eviction would also be a no-op)"
+        )

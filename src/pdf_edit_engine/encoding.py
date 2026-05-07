@@ -36,9 +36,23 @@ class FontResolver:
     Args:
         font_dict: The pikepdf font dictionary object.
         font_name: The font resource name (e.g., 'F1').
+        pdf: The open ``pikepdf.Pdf`` that owns ``font_dict``. Optional
+            for backward compatibility — when ``None`` (e.g. unit tests
+            that build resolvers from synthetic dicts), the
+            ``fonts.font_has_codepoint`` cmap-coverage check is
+            bypassed and ``can_encode`` falls back to its pre-pikepdf-
+            10.5.1 best-effort behaviour. Required for the ARY-349
+            fix (pikepdf 10.5.1 dropped the back-pointer attribute on
+            ``Object``, so the cache key in ``fonts._font_dict_key``
+            must receive ``pdf`` out-of-band).
     """
 
-    def __init__(self, font_dict: pikepdf.Dictionary, font_name: str) -> None:
+    def __init__(
+        self,
+        font_dict: pikepdf.Dictionary,
+        font_name: str,
+        pdf: pikepdf.Pdf | None = None,
+    ) -> None:
         self._font_name = font_name
         self._encoding_type: str = "Custom"
         self._is_cid: bool = False
@@ -60,6 +74,7 @@ class FontResolver:
         # the fonts.font_has_codepoint cmap-coverage check (no fontTools
         # import in this module — preserves dep-boundary table).
         self._font_dict: pikepdf.Dictionary = font_dict
+        self._pdf: pikepdf.Pdf | None = pdf
         self._first_char: int | None = None
         self._last_char: int | None = None
         self._widths_keys: frozenset[int] = frozenset()
@@ -331,7 +346,15 @@ class FontResolver:
                         continue
 
                 # Check 3: codepoint covered by the embedded /FontFile2.
-                if not font_has_codepoint(self._font_dict, ord(ch)):
+                # Skipped when ``self._pdf`` is None (pre-ARY-349 callers
+                # that constructed FontResolver without a pdf reference,
+                # e.g. unit tests). pikepdf 10.5.1 removed the back-
+                # pointer attribute that earlier versions exposed on
+                # Object, so the pdf must be threaded in explicitly to
+                # key the _FONTFILE2_CACHE.
+                if self._pdf is not None and not font_has_codepoint(
+                    self._pdf, self._font_dict, ord(ch)
+                ):
                     missing.append(ch)
                     continue
         return (len(missing) == 0, missing)
@@ -364,7 +387,16 @@ class FontResolverCache:
     ``extend_subset`` mutates a shared font (ARY-278).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, pdf: pikepdf.Pdf | None = None) -> None:
+        # ``pdf`` is threaded into each FontResolver so that the
+        # ``fonts.font_has_codepoint`` coverage check can build a stable
+        # _FONTFILE2_CACHE key under pikepdf 10.5.1 (which removed the
+        # back-pointer attribute that earlier versions exposed on
+        # Object — see ARY-349). Optional for backward compatibility
+        # with callers that don't have the pdf in scope (notably
+        # ``locator.ContentStreamInterpreter``, which only decodes
+        # text and never needs the cmap-coverage check).
+        self._pdf: pikepdf.Pdf | None = pdf
         self._cache: dict[tuple[int, int, str], FontResolver] = {}
 
     def clear(self) -> None:
@@ -414,7 +446,7 @@ class FontResolverCache:
             font_key = font_name if font_name.startswith("/") else f"/{font_name}"
             font_obj = page["/Resources"]["/Font"][font_key]
             font_dict = pikepdf.Dictionary(font_obj)  # type: ignore[arg-type]
-            self._cache[key] = FontResolver(font_dict, font_name)
+            self._cache[key] = FontResolver(font_dict, font_name, self._pdf)
         return self._cache[key]
 
 

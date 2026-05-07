@@ -24,26 +24,43 @@ logger = logging.getLogger(__name__)
 # Cache parsed TTFont per (PDF instance id, font dict objgen) tuple to
 # avoid re-parsing the embedded /FontFile2 on every can_encode call.
 #
-# Cache key includes id(font_dict.owner) because objgen alone collides
-# across PDFs — two different `pikepdf.Pdf.open` instances both having
-# a font at object 7,0 would alias each other. id() of the owning Pdf
-# is unique per live Python object; cache entries become unreachable
-# when their owning Pdf is garbage-collected.
+# Cache key includes id(pdf) (the Pdf is passed in explicitly because
+# pikepdf 10.5.1 removed the back-pointer accessor that earlier
+# versions exposed on Object — see ARY-349). objgen alone would
+# collide across PDFs — two different `pikepdf.Pdf.open` instances
+# both having a font at object 7,0 would alias each other. id() of
+# the owning Pdf is unique per live Python object; cache entries
+# become unreachable when their owning Pdf is garbage-collected.
 _FONTFILE2_CACHE: dict[tuple[int, int, int], frozenset[int]] = {}
 
 
-def _font_dict_key(font_dict: pikepdf.Object) -> tuple[int, int, int] | None:
-    """Cache key tuple. None if the font_dict has no stable identity."""
-    try:
-        owner = font_dict.owner
-        if owner is None:
-            return None
-        return (id(owner), int(font_dict.objgen[0]), int(font_dict.objgen[1]))
-    except (AttributeError, TypeError):
-        return None
+def _font_dict_key(pdf: pikepdf.Pdf, font_dict: pikepdf.Object) -> tuple[int, int, int]:
+    """Cache key tuple for ``_FONTFILE2_CACHE``.
+
+    Identifies a font dict by ``(id(pdf), *objgen)``. The Pdf parameter
+    is passed explicitly because pikepdf 10.5.1 removed the back-pointer
+    attribute that earlier versions exposed on ``Object``; recovering
+    the owning Pdf from a font dict is no longer possible without an
+    out-of-band reference. Callers thread ``pdf`` through from the
+    public-API entry point that opened it.
+
+    Args:
+        pdf: The open ``pikepdf.Pdf`` that owns ``font_dict``.
+        font_dict: The font dictionary (or descendant CIDFont dict).
+
+    Returns:
+        A 3-tuple ``(id(pdf), gen_0, gen_1)`` suitable for use as a
+        ``dict`` key. Always constructible — there is no failure path.
+    """
+    objgen = font_dict.objgen
+    return (id(pdf), int(objgen[0]), int(objgen[1]))
 
 
-def font_has_codepoint(font_dict: pikepdf.Object, codepoint: int) -> bool:
+def font_has_codepoint(
+    pdf: pikepdf.Pdf,
+    font_dict: pikepdf.Object,
+    codepoint: int,
+) -> bool:
     """Return True iff the font's embedded /FontFile2 covers ``codepoint``.
 
     Used by ``encoding.FontResolver.can_encode`` to verify glyph coverage
@@ -58,6 +75,10 @@ def font_has_codepoint(font_dict: pikepdf.Object, codepoint: int) -> bool:
     where coverage cannot be verified.
 
     Args:
+        pdf: The open ``pikepdf.Pdf`` that owns ``font_dict``. Required
+            since pikepdf 10.5.1 (the previous back-pointer accessor on
+            ``font_dict`` is gone) — used as part of the cache key to
+            keep entries from different PDFs from aliasing each other.
         font_dict: The pikepdf font dictionary or descendant CIDFont dict.
         codepoint: Unicode codepoint to check.
 
@@ -65,8 +86,8 @@ def font_has_codepoint(font_dict: pikepdf.Object, codepoint: int) -> bool:
         True if the codepoint has a glyph in the embedded font binary,
         OR if /FontFile2 cannot be loaded (best-effort fallback).
     """
-    cache_key = _font_dict_key(font_dict)
-    if cache_key is not None and cache_key in _FONTFILE2_CACHE:
+    cache_key = _font_dict_key(pdf, font_dict)
+    if cache_key in _FONTFILE2_CACHE:
         return codepoint in _FONTFILE2_CACHE[cache_key]
 
     try:
@@ -101,8 +122,7 @@ def font_has_codepoint(font_dict: pikepdf.Object, codepoint: int) -> bool:
         logger.debug("font_has_codepoint: TTFont parse failed", exc_info=True)
         return True
 
-    if cache_key is not None:
-        _FONTFILE2_CACHE[cache_key] = frozenset(covered)
+    _FONTFILE2_CACHE[cache_key] = frozenset(covered)
     return codepoint in covered
 
 
@@ -948,9 +968,8 @@ def _extend_tier2(
         # can_encode() against a codepoint that step 1 just added would
         # observe the stale pre-injection covered set, return False, and
         # trigger a redundant re-extension.
-        _evict_key = _font_dict_key(font_dict)
-        if _evict_key is not None:
-            _FONTFILE2_CACHE.pop(_evict_key, None)
+        _evict_key = _font_dict_key(pdf, font_dict)
+        _FONTFILE2_CACHE.pop(_evict_key, None)
 
         # Apply PDF-level metadata updates using Tier 1 helpers.
         _append_to_unicode_cmap(font_dict, new_cmap_entries, pdf)

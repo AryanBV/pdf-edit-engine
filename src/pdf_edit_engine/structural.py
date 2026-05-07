@@ -1364,11 +1364,11 @@ def replace_block(
     """
     validate_output_path(output_path)
 
-    # Per-call cache (ARY-283)
-    resolver_cache = FontResolverCache()
-
     pdf = open_pdf(pdf_path)
     try:
+        # Per-call cache (ARY-283); pdf threaded for ARY-349 cache key.
+        resolver_cache = FontResolverCache(pdf)
+
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
         result, _, _ = _replace_block_on_page(
@@ -1437,11 +1437,11 @@ def batch_replace_block(
     if not replacements:
         return []
 
-    # Per-call cache (ARY-283)
-    resolver_cache = FontResolverCache()
-
     pdf = open_pdf(pdf_path)
     try:
+        # Per-call cache (ARY-283); pdf threaded for ARY-349 cache key.
+        resolver_cache = FontResolverCache(pdf)
+
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
 
@@ -1603,9 +1603,6 @@ def insert_text_block(
     """
     validate_output_path(output_path)
 
-    # Per-call cache (ARY-283)
-    resolver_cache = FontResolverCache()
-
     # CRIT-1: capture extension events for honest FidelityReport surfacing.
     # Mirrors the canonical pattern in surgeon._apply_single_replacement
     # (surgeon.py:579-657, 905-921) so insert_text_block produces the same
@@ -1617,6 +1614,9 @@ def insert_text_block(
 
     pdf = open_pdf(pdf_path)
     try:
+        # Per-call cache (ARY-283); pdf threaded for ARY-349 cache key.
+        resolver_cache = FontResolverCache(pdf)
+
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
 

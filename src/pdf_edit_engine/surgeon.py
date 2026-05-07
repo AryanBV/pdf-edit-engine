@@ -1131,13 +1131,16 @@ def replace(
     if not dry_run:
         validate_output_path(output_path)
 
-    # Per-call caches (ARY-283): every public entrypoint owns its caches
-    # and threads them to helpers; no module-level shared state.
-    resolver_cache = FontResolverCache()
-    width_cache = GlyphWidthCache()
-
     pdf = open_pdf(pdf_path)
     try:
+        # Per-call caches (ARY-283): every public entrypoint owns its caches
+        # and threads them to helpers; no module-level shared state.
+        # ``pdf`` is threaded into the cache so FontResolver.can_encode's
+        # cmap-coverage check can key _FONTFILE2_CACHE under pikepdf 10.5.1
+        # (ARY-349).
+        resolver_cache = FontResolverCache(pdf)
+        width_cache = GlyphWidthCache()
+
         if pdf.is_encrypted:
             raise PDFEditError("Cannot edit encrypted PDF")
 
@@ -1351,12 +1354,12 @@ def replace_all(
     if not matches:
         return []
 
-    # Per-call caches (ARY-283)
-    resolver_cache = FontResolverCache()
-    width_cache = GlyphWidthCache()
-
     pdf = open_pdf(pdf_path)
     try:
+        # Per-call caches (ARY-283); pdf threaded for ARY-349 cache key.
+        resolver_cache = FontResolverCache(pdf)
+        width_cache = GlyphWidthCache()
+
         if pdf.is_encrypted:
             raise PDFEditError("Cannot edit encrypted PDF")
 
@@ -1475,12 +1478,12 @@ def batch_replace(
         validate_output_path(output_path)
     from pdf_edit_engine.locator import find
 
-    # Per-call caches (ARY-283)
-    resolver_cache = FontResolverCache()
-    width_cache = GlyphWidthCache()
-
     pdf = open_pdf(pdf_path)
     try:
+        # Per-call caches (ARY-283); pdf threaded for ARY-349 cache key.
+        resolver_cache = FontResolverCache(pdf)
+        width_cache = GlyphWidthCache()
+
         if pdf.is_encrypted:
             raise PDFEditError("Cannot edit encrypted PDF")
 
