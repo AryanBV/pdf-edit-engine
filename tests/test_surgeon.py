@@ -935,3 +935,67 @@ class TestKerningDecisionDeadzone:
         assert tz == 150.0
         assert deg is not None
         assert deg.kind == "kerning_widened"
+
+
+# ── Phase 13.5: M10 SOW e2e (the launch gate) ────────────────────────────
+
+
+_M10_SOW = "C:/New Project/pdf-marketing/m10-launch/sow.pdf"
+_need_m10_sow = pytest.mark.skipif(
+    not Path(_M10_SOW).exists(),
+    reason="M10 SOW not present at C:/New Project/pdf-marketing/m10-launch/sow.pdf",
+)
+
+
+@_need_m10_sow
+def test_simple_font_extension_via_m10_sow(tmp_path: Path) -> None:
+    """Sarah Chen → Søren Müller on the M10 SOW (the actual launch gate).
+
+    The M10 SOW's title block uses a /TrueType + /WinAnsiEncoding +
+    /FontFile2 font (BCDEEE+Calibri-Bold). Pre-Phase-13, the
+    ``is_cid_font`` gate at structural.py:864-865 short-circuited this
+    case to ``return False`` and replace() emitted a
+    font_extension_failed Degradation.
+
+    Phase 13 wires in the non-CID Tier 1.5 path. This e2e is the
+    contract-level proof that the launch gate now passes:
+
+    - replace() returns success=True
+    - font_action == "extended"
+    - glyphs_missing == {ø, ü}  (the two accented glyphs in
+      "Søren Müller" not in F1's embedded subset)
+    - degradations contain font_coverage_substituted (severity=warning)
+      since the outline source is a system font (Calibri-Bold or a
+      metric-equivalent like Carlito-Bold)
+    - degradations do NOT contain font_extension_failed
+    - get_text(out) contains the new string
+
+    Phase 13.4.2 verification (per Defect 5 in
+    experiments/v013_block_3_execution/prompt-defects.md): the assertion
+    ``"font_coverage_substituted" in kinds`` IS present below — Phase
+    13.4.2 is satisfied by this assertion's existence, not by a separate
+    addition.
+    """
+    match = _first_match(_M10_SOW, "Sarah Chen")
+    out = str(tmp_path / "sow_edited.pdf")
+
+    result = replace(_M10_SOW, match, "Søren Müller", out, reflow=False)
+
+    assert result.success is True, (
+        f"M10 SOW launch gate failed: {result.fidelity_report.degradations}"
+    )
+    assert result.font_action == "extended"
+    assert set(result.fidelity_report.glyphs_missing) == {"ø", "ü"}
+    kinds = [d.kind for d in result.fidelity_report.degradations]
+    assert "font_coverage_substituted" in kinds, (
+        f"expected font_coverage_substituted in degradations; got {kinds}"
+    )
+    assert "font_extension_failed" not in kinds, (
+        f"font_extension_failed must not be present; got {kinds}"
+    )
+
+    # Rendering verification — output text must contain the new string.
+    out_text = get_text(out)
+    assert "Søren Müller" in out_text, (
+        f"output PDF text does not contain 'Søren Müller'; first 200 chars: {out_text[:200]!r}"
+    )
