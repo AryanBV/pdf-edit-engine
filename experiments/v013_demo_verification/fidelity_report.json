@@ -8,9 +8,14 @@
   ],
   "degradations": [
     {
-      "kind": "font_extension_failed",
-      "detail": "FontNotFoundError",
-      "severity": "error"
+      "kind": "font_coverage_substituted",
+      "detail": "tier=1.5,chars=ø,ü",
+      "severity": "warning"
+    },
+    {
+      "kind": "kerning_compressed",
+      "detail": "Tz 87%",
+      "severity": "warning"
     }
   ]
 }
