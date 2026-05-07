@@ -18,10 +18,10 @@ import pikepdf
 from pdf_edit_engine._pathutil import open_pdf, validate_output_path
 from pdf_edit_engine.encoding import FontResolverCache
 from pdf_edit_engine.errors import OperatorError
+from pdf_edit_engine.fonts import _FONT_EXTEND_FAIL_EXCS
 from pdf_edit_engine.locator import _build_index, _resolve_pages
 from pdf_edit_engine.models import ContentElement, Degradation, EditResult, FidelityReport
 from pdf_edit_engine.reflow import (
-    _FONT_EXTEND_FAIL_EXCS,
     _build_replacement_ops,
     _expand_to_bt_et,
     _find_bt_et_blocks,
@@ -1370,7 +1370,7 @@ def replace_block(
     pdf = open_pdf(pdf_path)
     try:
         # Per-call cache (ARY-283); pdf threaded for ARY-349 cache key.
-        resolver_cache = FontResolverCache(pdf)
+        resolver_cache = FontResolverCache()
 
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
@@ -1443,7 +1443,7 @@ def batch_replace_block(
     pdf = open_pdf(pdf_path)
     try:
         # Per-call cache (ARY-283); pdf threaded for ARY-349 cache key.
-        resolver_cache = FontResolverCache(pdf)
+        resolver_cache = FontResolverCache()
 
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
@@ -1618,7 +1618,7 @@ def insert_text_block(
     pdf = open_pdf(pdf_path)
     try:
         # Per-call cache (ARY-283); pdf threaded for ARY-349 cache key.
-        resolver_cache = FontResolverCache(pdf)
+        resolver_cache = FontResolverCache()
 
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]

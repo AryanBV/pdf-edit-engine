@@ -18,6 +18,7 @@ from pdf_edit_engine.errors import (
     PDFEditError,
     ReflowError,
 )
+from pdf_edit_engine.fonts import _FONT_EXTEND_FAIL_EXCS
 from pdf_edit_engine.models import (
     Degradation,
     Edit,
@@ -655,7 +656,16 @@ def _apply_single_replacement(
                         severity="warning",
                     )
                 )
-        except (FontNotFoundError, PDFEditError) as exc:
+        except _FONT_EXTEND_FAIL_EXCS as exc:
+            # Aligns surgeon's font-extension catch with reflow.py:1093 +
+            # structural.py:883/1691. The prior tuple
+            # (FontNotFoundError, PDFEditError) caught FontNotFoundError /
+            # EncodingError / OperatorError / ReflowError but missed
+            # OSError (filesystem) and TTLibError (corrupt /FontFile2),
+            # which would escape the EditResult and propagate out of
+            # replace() unhandled. PLAN_AMENDMENTS M.6 test 12 documents
+            # the contract that TTLibError surfaces as a Degradation, not
+            # a raised exception.
             return EditResult(
                 success=False,
                 original_text=match.matched_text,
@@ -1138,7 +1148,7 @@ def replace(
         # ``pdf`` is threaded into the cache so FontResolver.can_encode's
         # cmap-coverage check can key _FONTFILE2_CACHE under pikepdf 10.5.1
         # (ARY-349).
-        resolver_cache = FontResolverCache(pdf)
+        resolver_cache = FontResolverCache()
         width_cache = GlyphWidthCache()
 
         if pdf.is_encrypted:
@@ -1357,7 +1367,7 @@ def replace_all(
     pdf = open_pdf(pdf_path)
     try:
         # Per-call caches (ARY-283); pdf threaded for ARY-349 cache key.
-        resolver_cache = FontResolverCache(pdf)
+        resolver_cache = FontResolverCache()
         width_cache = GlyphWidthCache()
 
         if pdf.is_encrypted:
@@ -1481,7 +1491,7 @@ def batch_replace(
     pdf = open_pdf(pdf_path)
     try:
         # Per-call caches (ARY-283); pdf threaded for ARY-349 cache key.
-        resolver_cache = FontResolverCache(pdf)
+        resolver_cache = FontResolverCache()
         width_cache = GlyphWidthCache()
 
         if pdf.is_encrypted:

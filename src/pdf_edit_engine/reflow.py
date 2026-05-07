@@ -9,10 +9,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import pikepdf
-from fontTools.ttLib import TTLibError  # type: ignore[import-untyped]
 
 from pdf_edit_engine._pathutil import open_pdf
-from pdf_edit_engine.errors import EncodingError, FontNotFoundError, ReflowError
+from pdf_edit_engine.errors import ReflowError
+from pdf_edit_engine.fonts import _FONT_EXTEND_FAIL_EXCS
 from pdf_edit_engine.models import (
     ContentElement,
     Degradation,
@@ -31,16 +31,6 @@ if TYPE_CHECKING:
     from pdf_edit_engine.encoding import FontResolver, FontResolverCache
 
 logger = logging.getLogger(__name__)
-
-# Exception tuple for font-extension failures that should degrade to an
-# EditResult failure instead of propagating. Kept as a single constant so
-# all three call sites (reflow_paragraph, structural._extend_font,
-# structural.insert_text_block) stay aligned — the prior asymmetry where
-# reflow caught OSError but structural caught OperatorError was an
-# inconsistency that let a deleted/permission-denied system font take
-# down replace_block while degrading gracefully in reflow (ultrareview
-# bug_002).
-_FONT_EXTEND_FAIL_EXCS = (FontNotFoundError, EncodingError, OSError, TTLibError)
 
 # Parsed content stream ops — using Any mirrors surgeon.py convention.
 _Ops = list[Any]
@@ -991,7 +981,7 @@ def reflow_paragraph(
     from pdf_edit_engine.encoding import FontResolverCache as _FontResolverCache
 
     if resolver_cache is None:
-        resolver_cache = _FontResolverCache(pdf)
+        resolver_cache = _FontResolverCache()
 
     # INV-B-3 contract: reflow_paragraph is a public API entry that
     # consumes a TextMatch. Refuse stale matches so the caller cannot

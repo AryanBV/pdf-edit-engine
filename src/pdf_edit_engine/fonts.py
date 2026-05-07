@@ -7,57 +7,33 @@ import logging
 from pathlib import Path
 
 import pikepdf
-from fontTools.ttLib import TTFont  # type: ignore[import-untyped]
+from fontTools.ttLib import TTFont, TTLibError  # type: ignore[import-untyped]
 from pdfminer.cmapdb import CMapParser, FileUnicodeMap
 
 from pdf_edit_engine._pathutil import open_pdf
-from pdf_edit_engine.errors import FontNotFoundError
+from pdf_edit_engine.errors import EncodingError, FontNotFoundError
 from pdf_edit_engine.models import FontInfo
 from pdf_edit_engine.system_fonts import _strip_subset_prefix
 
 logger = logging.getLogger(__name__)
 
 
+# Exception tuple for font-extension failures that should degrade to an
+# EditResult failure instead of propagating. Single canonical home (this
+# module — font extension is what the tuple describes); reflow,
+# structural, and surgeon all import from here. The prior asymmetry
+# where each caller maintained its own catch list let a corrupt
+# /FontFile2 (TTLibError) escape surgeon while reflow + structural
+# degraded gracefully — Phase 13.4 probe 12 surfaced this. Centralising
+# the tuple here is the root fix; widening any single module's catch
+# would have been a patch.
+_FONT_EXTEND_FAIL_EXCS = (FontNotFoundError, EncodingError, OSError, TTLibError)
+
+
 # ── Public coverage helper (used by encoding.FontResolver.can_encode) ────
 
 
-# Cache parsed TTFont per (PDF instance id, font dict objgen) tuple to
-# avoid re-parsing the embedded /FontFile2 on every can_encode call.
-#
-# Cache key includes id(pdf) (the Pdf is passed in explicitly because
-# pikepdf 10.5.1 removed the back-pointer accessor that earlier
-# versions exposed on Object — see ARY-349). objgen alone would
-# collide across PDFs — two different `pikepdf.Pdf.open` instances
-# both having a font at object 7,0 would alias each other. id() of
-# the owning Pdf is unique per live Python object; cache entries
-# become unreachable when their owning Pdf is garbage-collected.
-_FONTFILE2_CACHE: dict[tuple[int, int, int], frozenset[int]] = {}
-
-
-def _font_dict_key(pdf: pikepdf.Pdf, font_dict: pikepdf.Object) -> tuple[int, int, int]:
-    """Cache key tuple for ``_FONTFILE2_CACHE``.
-
-    Identifies a font dict by ``(id(pdf), *objgen)``. The Pdf parameter
-    is passed explicitly because pikepdf 10.5.1 removed the back-pointer
-    attribute that earlier versions exposed on ``Object``; recovering
-    the owning Pdf from a font dict is no longer possible without an
-    out-of-band reference. Callers thread ``pdf`` through from the
-    public-API entry point that opened it.
-
-    Args:
-        pdf: The open ``pikepdf.Pdf`` that owns ``font_dict``.
-        font_dict: The font dictionary (or descendant CIDFont dict).
-
-    Returns:
-        A 3-tuple ``(id(pdf), gen_0, gen_1)`` suitable for use as a
-        ``dict`` key. Always constructible — there is no failure path.
-    """
-    objgen = font_dict.objgen
-    return (id(pdf), int(objgen[0]), int(objgen[1]))
-
-
 def font_has_codepoint(
-    pdf: pikepdf.Pdf,
     font_dict: pikepdf.Object,
     codepoint: int,
 ) -> bool:
@@ -74,11 +50,22 @@ def font_has_codepoint(
     absent or unparseable so that can_encode does not regress on fonts
     where coverage cannot be verified.
 
+    No caching: a prior implementation kept a module-global
+    ``_FONTFILE2_CACHE`` keyed on ``(id(pdf), *objgen)`` to avoid
+    re-parsing on every call. That cache had two latent issues —
+    ``id(pdf)`` recycles across closed Pdf instances, and the cache
+    populate site (FontResolverCache._make_resolver, which copied the
+    indirect font_obj into a direct ``pikepdf.Dictionary`` with
+    objgen=(0,0)) never matched the eviction sites in
+    ``_extend_tier2`` / ``_extend_simple_tier_15`` (which had the
+    real objgen). Phase 13.4 probes surfaced both issues. The cache
+    has been functionally a no-op since pikepdf 10.5.1 (cf. ARY-349
+    diagnosis), so deleting it has zero observable performance
+    regression for users who shipped against 10.5.1+. A clean per-
+    Pdf-instance cache may be re-introduced in a later release if
+    profiling identifies this path as a hot spot.
+
     Args:
-        pdf: The open ``pikepdf.Pdf`` that owns ``font_dict``. Required
-            since pikepdf 10.5.1 (the previous back-pointer accessor on
-            ``font_dict`` is gone) — used as part of the cache key to
-            keep entries from different PDFs from aliasing each other.
         font_dict: The pikepdf font dictionary or descendant CIDFont dict.
         codepoint: Unicode codepoint to check.
 
@@ -86,10 +73,6 @@ def font_has_codepoint(
         True if the codepoint has a glyph in the embedded font binary,
         OR if /FontFile2 cannot be loaded (best-effort fallback).
     """
-    cache_key = _font_dict_key(pdf, font_dict)
-    if cache_key in _FONTFILE2_CACHE:
-        return codepoint in _FONTFILE2_CACHE[cache_key]
-
     try:
         # /FontDescriptor is on the font dict itself for simple fonts;
         # for Type0/CID it lives on the descendant CIDFont. Caller passes
@@ -122,7 +105,6 @@ def font_has_codepoint(
         logger.debug("font_has_codepoint: TTFont parse failed", exc_info=True)
         return True
 
-    _FONTFILE2_CACHE[cache_key] = frozenset(covered)
     return codepoint in covered
 
 
@@ -984,17 +966,11 @@ def _extend_tier2(
         embedded.save(buf)
         fd["/FontFile2"] = pdf.make_stream(buf.getvalue())
 
-        # IMP-1: evict the stale covered-codepoints cache for this font
-        # dict. Cache is keyed on font_dict.objgen; pikepdf MAY update
-        # objgen on stream rewrite (Agent H exercised this without
-        # observable corruption — mechanism unclear), but we evict
-        # defensively so font_has_codepoint observes the just-injected
-        # glyphs on the next query. Without eviction, a subsequent
-        # can_encode() against a codepoint that step 1 just added would
-        # observe the stale pre-injection covered set, return False, and
-        # trigger a redundant re-extension.
-        _evict_key = _font_dict_key(pdf, font_dict)
-        _FONTFILE2_CACHE.pop(_evict_key, None)
+        # No cache eviction needed: the prior _FONTFILE2_CACHE was
+        # deleted (see font_has_codepoint docstring). Every subsequent
+        # font_has_codepoint call now re-parses /FontFile2 fresh, so
+        # the just-injected glyphs are observed on the next query
+        # without explicit invalidation.
 
         # Apply PDF-level metadata updates using Tier 1 helpers.
         _append_to_unicode_cmap(font_dict, new_cmap_entries, pdf)
@@ -1111,17 +1087,16 @@ def _extend_simple_tier_15(
             new_assignments.append((byte_slot, glyph_name, width))
 
         # 5. Re-serialize embedded font, replace /FontFile2 stream.
-        # Mirrors _extend_tier2's pattern (fonts.py:960):
+        # Mirrors _extend_tier2's pattern (fonts.py:955):
         #     fd["/FontFile2"] = pdf.make_stream(buf.getvalue())
         buf = io.BytesIO()
         embedded.save(buf)
         fd["/FontFile2"] = pdf.make_stream(buf.getvalue())
 
-        # 5b. Invalidate /FontFile2 coverage cache for this font dict.
-        # _FONTFILE2_CACHE is keyed on (id(pdf), *objgen) post-13.2.3;
-        # underlying bytes have changed, so cached coverage is stale.
-        cache_key = _font_dict_key(pdf, font_dict)
-        _FONTFILE2_CACHE.pop(cache_key, None)
+        # No cache invalidation needed: _FONTFILE2_CACHE was deleted
+        # (see font_has_codepoint docstring). font_has_codepoint
+        # re-parses /FontFile2 on every call, so the just-injected
+        # glyphs are observed without explicit eviction.
 
         # 6. PDF-side updates: /Encoding /Differences, /Widths, bounds.
         _extend_simple_encoding(pdf, font_dict, new_assignments)
