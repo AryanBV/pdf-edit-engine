@@ -8,8 +8,9 @@ from pathlib import Path
 import pikepdf
 import pytest
 
+from pdf_edit_engine import structural as _structural
 from pdf_edit_engine.locator import get_text
-from pdf_edit_engine.models import EditResult
+from pdf_edit_engine.models import Degradation, EditResult
 from pdf_edit_engine.reflow import detect_paragraphs
 from pdf_edit_engine.structural import (
     batch_replace_block,
@@ -666,15 +667,13 @@ class TestDeleteBlock:
         assert result.original_text
         assert "simple test document" in result.original_text
 
-    def test_overflow_path_is_wired_no_false_positive(self, tmp_path: Path) -> None:
-        """IMP-2 regression guard: delete_block's overflow branch is
-        currently unreachable (the helper's "below page boundary"
-        warning fires only for positive delta_y, but delete_block
-        always passes delta_y = -deleted_height). A normal delete
-        must NOT spuriously emit overflow_shift_* Degradations or
-        flip overflow_detected. If a future change makes the path
-        reachable AND the typed Degradation wiring breaks, this
-        guard plus the surgeon test together pin the contract.
+    def test_overflow_path_no_false_positive(self, tmp_path: Path) -> None:
+        """M-8 negative-case guard: delete_block's overflow branch is
+        currently unreachable from the production caller (the helper's
+        "below page boundary" warning fires only for positive delta_y,
+        but delete_block always passes delta_y = -deleted_height).
+        A normal delete must NOT spuriously emit overflow_shift_*
+        Degradations or flip overflow_detected.
         """
         out = str(tmp_path / "out.pdf")
         result = delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), out)
@@ -683,6 +682,55 @@ class TestDeleteBlock:
         assert not any(
             d.kind.startswith("overflow_shift_") for d in result.fidelity_report.degradations
         )
+
+    def test_overflow_path_emits_typed_degradation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """M-8 positive-case: when ``_shift_content_below_inplace`` does
+        return a "below page boundary" warning (the contract that
+        ``delete_block`` checks for), the typed Degradation emission at
+        ``structural.py:1948-1956`` MUST fire — kind=overflow_shift_clamped,
+        severity=warning, and ``overflow_detected=True`` on the report.
+
+        The production code path is currently unreachable from
+        ``delete_block`` (delta_y is always negative there) but the
+        emission is wired defensively. This monkeypatch test exercises
+        the contract directly so the wiring is regression-guarded.
+        """
+        from pikepdf import Page, Pdf
+
+        original_shift = _structural._shift_content_below_inplace
+
+        def _forced_overflow_shift(
+            pdf: Pdf,
+            page_obj: Page,
+            page_num: int,
+            y_threshold: float,
+            delta_y: float,
+        ) -> list[str]:
+            # Run the real shift so the PDF stays well-formed, then
+            # append the warning string the production code keys on.
+            warnings = original_shift(pdf, page_obj, page_num, y_threshold, delta_y)
+            warnings.append("element extends below page boundary (y=-5.0)")
+            return warnings
+
+        monkeypatch.setattr(_structural, "_shift_content_below_inplace", _forced_overflow_shift)
+
+        out = str(tmp_path / "out_overflow.pdf")
+        result = delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), out)
+
+        assert result.success is True
+        assert result.fidelity_report.overflow_detected is True
+        overflow_degs = [
+            d for d in result.fidelity_report.degradations if d.kind == "overflow_shift_clamped"
+        ]
+        assert overflow_degs, (
+            "expected overflow_shift_clamped Degradation; got "
+            f"{result.fidelity_report.degradations!r}"
+        )
+        assert isinstance(overflow_degs[0], Degradation)
+        assert overflow_degs[0].severity == "warning"
+        assert "vertical" in overflow_degs[0].detail
 
 
 @_need_resume

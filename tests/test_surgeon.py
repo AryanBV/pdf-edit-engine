@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pikepdf
@@ -21,6 +22,14 @@ CORPUS_DIR = Path(__file__).parent / "corpus"
 RESUME_PDF = str(CORPUS_DIR / "Aryan_BV_Resume_2026.pdf")
 SIMPLE_PDF = str(CORPUS_DIR / "reportlab_simple.pdf")
 MULTIPAGE_PDF = str(CORPUS_DIR / "reportlab_multipage.pdf")
+
+# M-10: out-of-repo SOW fixture path. CI (and contributors without the
+# marketing fixture on disk) override via the M10_SOW_PDF env-var; the
+# default points at the original on-disk location so the launch-gate
+# author's local runs are unchanged. Mirrors the RESUME_PDF precedent
+# above. The skipif at the use-site keeps the test SKIPPED when the
+# resolved path is missing, so the default state in CI is unchanged.
+_M10_SOW = os.environ.get("M10_SOW_PDF", "C:/New Project/pdf-marketing/m10-launch/sow.pdf")
 
 _need_resume = pytest.mark.skipif(
     not Path(RESUME_PDF).exists(), reason="Aryan_BV_Resume_2026.pdf not in corpus"
@@ -956,10 +965,9 @@ class TestKerningDecisionDeadzone:
 # ── Phase 13.5: M10 SOW e2e (the launch gate) ────────────────────────────
 
 
-_M10_SOW = "C:/New Project/pdf-marketing/m10-launch/sow.pdf"
 _need_m10_sow = pytest.mark.skipif(
     not Path(_M10_SOW).exists(),
-    reason="M10 SOW not present at C:/New Project/pdf-marketing/m10-launch/sow.pdf",
+    reason=f"M10 SOW not present at {_M10_SOW} (set M10_SOW_PDF to override)",
 )
 
 

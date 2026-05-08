@@ -743,34 +743,8 @@ class TestTier1_5GlyphInjection:
 
 @_need_resume
 class TestFontFile2CacheEviction:
-    """Double-extension behavior: a second ``extend_subset`` call on the
-    same font dict re-reads ``/FontFile2`` from the live PDF and produces
-    a stable, fresh extension event for the new codepoint without
-    leaking pre-existing state from the first extension.
-
-    Class name retained for git-blame continuity. The pre-Phase-13.4
-    rationale referenced the module-global ``_FONTFILE2_CACHE``, which
-    was deleted as a root fix during Phase 13.4 (ARY-348) — the cache
-    had populate/evict key-mismatch and cross-Pdf ``id(pdf)`` recycling
-    issues and had been functionally a no-op since pikepdf 10.5.1. Post-
-    deletion, ``font_has_codepoint`` re-parses ``/FontFile2`` on every
-    call, so the property under test is no longer cache eviction but
-    the same behavioral guarantee that originally motivated the cache
-    eviction: double-extension on the same logical font dict must
-    report each call's codepoint as a fresh extension, not as a
-    spuriously-rediscovered pre-existing one.
-
-    Behavioral test (no white-box poking of internal caches).
-    Double-extension scenario: ø at step 1, then ü on the same logical
-    font dict at step 2. Step 2 must report ü as a fresh extension
-    with no stale ø entry leaking from step 1.
-
-    Single-source-of-truth char selection: ø and ü are both verified
-    missing from every embedded font on the resume corpus page 0 (F1
-    cmap has 94 ASCII-range entries; verified during plan dev). ø is
-    shared with ``tests/test_structural.py::TestInsertTextBlockHonesty``
-    so future maintainers don't re-derive the choice.
-    """
+    """regression guard: double-extension on the same font does not
+    produce spurious extra Degradations."""
 
     def test_double_extension_different_codepoints(self, tmp_path: Path) -> None:
         if find_font("Calibri-Bold") is None:
