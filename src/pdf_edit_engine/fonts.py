@@ -35,6 +35,15 @@ logger = logging.getLogger(__name__)
 # would have been a patch.
 _FONT_EXTEND_FAIL_EXCS = (FontNotFoundError, EncodingError, OSError, TTLibError)
 
+# Hard upper bound on composite-glyph nesting. Real Latin composites
+# nest 2-3 deep; the deepest known commercial font hits ~16. 64 leaves
+# headroom for unforeseen typography while clearly bounding adversarial
+# inputs (per F-B-03 / INV-W0-8). Hitting this bound is a content
+# signal, not a config knob — surfaced as font_extension_failed via
+# _FONT_EXTEND_FAIL_EXCS at the caller. Adding RecursionError to the
+# fail-tuple would be a patch; the depth cap is the root fix.
+MAX_COMPOSITE_DEPTH = 64
+
 
 @contextlib.contextmanager
 def _with_fonttools_translation(context: str) -> Iterator[None]:
@@ -408,6 +417,7 @@ def _collect_component_names(
     glyph: object,
     font: TTFont,
     _seen: set[str] | None = None,
+    _depth: int = 0,
 ) -> list[str]:
     """Recursively enumerate component glyph names for a composite glyph.
 
@@ -417,16 +427,33 @@ def _collect_component_names(
     every referenced component name in injection order (leaves first,
     roots last). Returns an empty list for simple (non-composite) glyphs.
 
+    Recursion is bounded by ``MAX_COMPOSITE_DEPTH`` (INV-W0-8 / F-B-03).
+    A pathological or adversarial composite chain deeper than the cap
+    raises ``FontNotFoundError`` rather than ``RecursionError``, so the
+    failure routes through the existing ``_FONT_EXTEND_FAIL_EXCS`` catch
+    at the caller and surfaces as a ``font_extension_failed`` Degradation.
+
     Args:
         glyph: A fontTools Glyph object.
         font: The TTFont the glyph belongs to (for recursive lookups).
         _seen: Internal visited set to prevent cycles.
+        _depth: Internal recursion depth counter; bounded by
+            ``MAX_COMPOSITE_DEPTH``.
 
     Returns:
         Deduplicated list of component glyph names in injection order.
+
+    Raises:
+        FontNotFoundError: If the composite glyph chain depth exceeds
+            ``MAX_COMPOSITE_DEPTH`` (INV-W0-8).
     """
     if _seen is None:
         _seen = set()
+    if _depth > MAX_COMPOSITE_DEPTH:
+        raise FontNotFoundError(
+            f"composite glyph depth exceeds {MAX_COMPOSITE_DEPTH} "
+            f"for {getattr(glyph, 'name', '<unnamed>')}"
+        )
     if not hasattr(glyph, "isComposite") or not glyph.isComposite():
         return []
     order: list[str] = []
@@ -437,7 +464,7 @@ def _collect_component_names(
         _seen.add(name)
         if name in font["glyf"].glyphs:
             sub = font["glyf"][name]
-            order.extend(_collect_component_names(sub, font, _seen))
+            order.extend(_collect_component_names(sub, font, _seen, _depth + 1))
         order.append(name)
     return order
 
