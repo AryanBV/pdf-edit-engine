@@ -107,15 +107,24 @@ def _fast_lookup(postscript_name: str) -> str | None:
         candidates.append(f"{stem}bi.ttf")
         candidates.append(f"{stem}z.ttf")
 
+    # Deferred import to avoid circular dependency with fonts.py
+    # (fonts → system_fonts via _strip_subset_prefix at module load).
+    from pdf_edit_engine.fonts import _with_fonttools_translation
+
     for font_dir in _font_directories():
         for candidate in candidates:
             path = font_dir / candidate
             if path.is_file():
-                # Verify the PostScript name actually matches
+                # Verify the PostScript name actually matches. Per
+                # Skeptic-A: TTFont() defers parsing — wrap the
+                # constructor AND the downstream `font["name"]` access.
                 try:
-                    font = TTFont(str(path), fontNumber=0)
-                    ps_name = font["name"].getDebugName(6)
-                    font.close()
+                    with _with_fonttools_translation(f"_filename_heuristic:{path.name}"):
+                        font = TTFont(str(path), fontNumber=0)
+                        try:
+                            ps_name = font["name"].getDebugName(6)
+                        finally:
+                            font.close()
                     if ps_name and ps_name == postscript_name:
                         return str(path)
                 except Exception:  # noqa: BLE001
@@ -125,6 +134,10 @@ def _fast_lookup(postscript_name: str) -> str | None:
 
 def _build_font_cache() -> dict[str, str]:
     """Scan all system font files and build PostScript name → path mapping."""
+    # Deferred import to avoid circular dependency with fonts.py
+    # (fonts → system_fonts via _strip_subset_prefix at module load).
+    from pdf_edit_engine.fonts import _with_fonttools_translation
+
     cache: dict[str, str] = {}
     for font_dir in _font_directories():
         for ext in ("**/*.ttf", "**/*.otf", "**/*.ttc"):
@@ -132,22 +145,33 @@ def _build_font_cache() -> dict[str, str]:
                 try:
                     if path.suffix.lower() == ".ttc":
                         # TrueType Collection: scan all faces
-                        font = TTFont(str(path), fontNumber=0)
-                        num_fonts = font.reader.numFonts if hasattr(font.reader, "numFonts") else 1
-                        font.close()
+                        with _with_fonttools_translation(f"_build_font_cache:ttc:{path.name}"):
+                            font = TTFont(str(path), fontNumber=0)
+                            num_fonts = (
+                                font.reader.numFonts if hasattr(font.reader, "numFonts") else 1
+                            )
+                            font.close()
                         for i in range(num_fonts):
                             try:
-                                f = TTFont(str(path), fontNumber=i)
-                                ps_name = f["name"].getDebugName(6)
-                                f.close()
+                                with _with_fonttools_translation(
+                                    f"_build_font_cache:ttc_face:{path.name}#{i}"
+                                ):
+                                    f = TTFont(str(path), fontNumber=i)
+                                    try:
+                                        ps_name = f["name"].getDebugName(6)
+                                    finally:
+                                        f.close()
                                 if ps_name and ps_name not in cache:
                                     cache[ps_name] = str(path)
                             except Exception:  # noqa: BLE001
                                 continue
                     else:
-                        font = TTFont(str(path), fontNumber=0)
-                        ps_name = font["name"].getDebugName(6)
-                        font.close()
+                        with _with_fonttools_translation(f"_build_font_cache:single:{path.name}"):
+                            font = TTFont(str(path), fontNumber=0)
+                            try:
+                                ps_name = font["name"].getDebugName(6)
+                            finally:
+                                font.close()
                         if ps_name and ps_name not in cache:
                             cache[ps_name] = str(path)
                 except Exception:  # noqa: BLE001

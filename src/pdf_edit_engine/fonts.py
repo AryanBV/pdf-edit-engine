@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
+import struct
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pikepdf
 from fontTools.ttLib import TTFont, TTLibError  # type: ignore[import-untyped]
@@ -14,6 +17,9 @@ from pdf_edit_engine._pathutil import open_pdf
 from pdf_edit_engine.errors import EncodingError, FontNotFoundError
 from pdf_edit_engine.models import FontInfo
 from pdf_edit_engine.system_fonts import _strip_subset_prefix
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +34,52 @@ logger = logging.getLogger(__name__)
 # the tuple here is the root fix; widening any single module's catch
 # would have been a patch.
 _FONT_EXTEND_FAIL_EXCS = (FontNotFoundError, EncodingError, OSError, TTLibError)
+
+
+@contextlib.contextmanager
+def _with_fonttools_translation(context: str) -> Iterator[None]:
+    """Translate fontTools exceptions on a fontTools-using block.
+
+    INV-C-7: every fontTools entry point in ``src/pdf_edit_engine/`` runs
+    inside this manager. Catch list is **narrowed deliberately** per
+    Skeptic-B masking-risk rebuttal:
+    ``(TTLibError, AssertionError, struct.error, OSError, MemoryError,
+    OverflowError)``. Programmer errors (``KeyError``, ``IndexError``,
+    ``AttributeError``, ``ValueError``) propagate as-is so typos surface
+    in tests rather than silently rebrand to ``FontNotFoundError``.
+
+    Per Skeptic-A: fontTools defers parsing — the ``TTFont(BytesIO(...))``
+    constructor SUCCEEDS even on a truncated ``/FontFile2``; the
+    ``AssertionError`` fires later in ``getGlyphOrder()`` /
+    ``getBestCmap()`` / ``glyf`` table accesses. The wrapped block must
+    enclose every downstream lazy call AND ``embedded.save(buf)``
+    (which can raise during fontTools serialization), not just the
+    constructor.
+
+    A forensic ``logger.error`` line preserves the original exception
+    type and message for debugging even though ``{exc}`` is dropped from
+    the user-visible ``FontNotFoundError`` message (R-13).
+
+    Args:
+        context: Short identifier of the call site (e.g.
+            ``"_extend_simple_tier_15:/F1"``) — included in the log line
+            to localise failures.
+
+    Raises:
+        FontNotFoundError: when any of the caught exception types fires
+            inside the ``with`` block. ``__cause__`` is set to the
+            original exception so the chain is preserved.
+    """
+    try:
+        yield
+    except (TTLibError, AssertionError, struct.error, OSError, MemoryError, OverflowError) as exc:
+        logger.error(
+            "fontTools boundary [%s]: %s: %s",
+            context,
+            type(exc).__name__,
+            exc,
+        )
+        raise FontNotFoundError(f"font_extension_failed: {type(exc).__name__}") from exc
 
 
 # ── Public coverage helper (used by encoding.FontResolver.can_encode) ────
@@ -94,13 +146,14 @@ def font_has_codepoint(
             return True
 
         font_bytes = font_file_obj.read_bytes()
-        tt = TTFont(io.BytesIO(font_bytes))
-        try:
-            best_cmap = tt.getBestCmap() or {}
-            glyph_order = set(tt.getGlyphOrder())
-            covered: set[int] = {cp for cp, gname in best_cmap.items() if gname in glyph_order}
-        finally:
-            tt.close()
+        with _with_fonttools_translation("font_has_codepoint"):
+            tt = TTFont(io.BytesIO(font_bytes))
+            try:
+                best_cmap = tt.getBestCmap() or {}
+                glyph_order = set(tt.getGlyphOrder())
+                covered: set[int] = {cp for cp, gname in best_cmap.items() if gname in glyph_order}
+            finally:
+                tt.close()
     except Exception:  # noqa: BLE001 — best-effort, downstream still works
         logger.debug("font_has_codepoint: TTFont parse failed", exc_info=True)
         return True
@@ -623,12 +676,13 @@ def _analyze_from_page(
 
     # Extract font binary and load with fonttools
     font_bytes, embedded_type = _extract_font_bytes(fd)
-    font = TTFont(io.BytesIO(font_bytes))
-    try:
-        glyph_count = len(font.getGlyphOrder())
-        font_cmap = font.getBestCmap()
-    finally:
-        font.close()
+    with _with_fonttools_translation(f"analyze_subset:{font_name}"):
+        font = TTFont(io.BytesIO(font_bytes))
+        try:
+            glyph_count = len(font.getGlyphOrder())
+            font_cmap = font.getBestCmap()
+        finally:
+            font.close()
 
     return FontInfo(
         name=font_name,
@@ -752,40 +806,43 @@ def extend_subset(
 
     # Extract and load the embedded font
     font_bytes, _embedded_type = _extract_font_bytes(fd)
-    embedded_font = TTFont(io.BytesIO(font_bytes))
-    try:
-        embedded_cmap = embedded_font.getBestCmap() or {}
+    with _with_fonttools_translation(f"extend_subset:{font_name}"):
+        embedded_font = TTFont(io.BytesIO(font_bytes))
+        try:
+            embedded_cmap = embedded_font.getBestCmap() or {}
 
-        # Split additional_chars into two groups:
-        #   tier1_chars  - glyph already in embedded font, only needs a
-        #                  /ToUnicode + /W + /CIDToGIDMap entry
-        #   tier15_chars - glyph missing from embedded font, needs full
-        #                  in-place injection (Tier 1.5)
-        tier1_chars: list[str] = []
-        tier15_chars: list[str] = []
-        seen: set[str] = set()
-        for ch in additional_chars:
-            if ch in seen:
-                continue
-            seen.add(ch)
-            if ord(ch) in embedded_cmap:
-                tier1_chars.append(ch)
-            else:
-                tier15_chars.append(ch)
+            # Split additional_chars into two groups:
+            #   tier1_chars  - glyph already in embedded font, only needs a
+            #                  /ToUnicode + /W + /CIDToGIDMap entry
+            #   tier15_chars - glyph missing from embedded font, needs full
+            #                  in-place injection (Tier 1.5)
+            tier1_chars: list[str] = []
+            tier15_chars: list[str] = []
+            seen: set[str] = set()
+            for ch in additional_chars:
+                if ch in seen:
+                    continue
+                seen.add(ch)
+                if ord(ch) in embedded_cmap:
+                    tier1_chars.append(ch)
+                else:
+                    tier15_chars.append(ch)
 
-        # Apply Tier 1 for chars whose glyph is already in the embedded
-        # font (no font-file change needed).
-        if tier1_chars:
-            _extend_tier1(
-                pdf,
-                font_dict,
-                cid_font,
-                embedded_font,
-                embedded_cmap,
-                "".join(tier1_chars),
-            )
-    finally:
-        embedded_font.close()
+            # Apply Tier 1 for chars whose glyph is already in the embedded
+            # font (no font-file change needed). _extend_tier1 reads
+            # embedded_font["hmtx"] / getGlyphID — fontTools lazy calls
+            # that must be inside this translation block.
+            if tier1_chars:
+                _extend_tier1(
+                    pdf,
+                    font_dict,
+                    cid_font,
+                    embedded_font,
+                    embedded_cmap,
+                    "".join(tier1_chars),
+                )
+        finally:
+            embedded_font.close()
 
     # Tier 1.5 handles the remaining chars whose glyphs are absent from
     # the embedded font. If there are none, we are done with Tier 1.
@@ -920,76 +977,79 @@ def _extend_tier2(
 
     # Load the embedded font (so we can extend it in place)
     embedded_bytes = bytes(fd["/FontFile2"].read_bytes())
-    embedded = TTFont(io.BytesIO(embedded_bytes))
-    system = TTFont(system_path)
-    try:
-        units_per_em = embedded["head"].unitsPerEm
-        new_cmap_entries: dict[int, str] = {}
-        new_w_entries: dict[int, float] = {}
+    with _with_fonttools_translation(f"_extend_tier2:{ps_name}"):
+        embedded = TTFont(io.BytesIO(embedded_bytes))
+        system = TTFont(system_path)
+        try:
+            units_per_em = embedded["head"].unitsPerEm
+            new_cmap_entries: dict[int, str] = {}
+            new_w_entries: dict[int, float] = {}
 
-        # Compute a collision-free starting GID for new glyphs.
-        # Under Identity-H, CID == GID, so the new GID must be above
-        # BOTH the current glyph order length AND any CID already used
-        # by the ToUnicode CMap (which, for some synthetic/retain_gids
-        # fonts, references CIDs beyond the embedded font's glyph
-        # count). Pad the glyph order with unique .notdef placeholders
-        # up to that point so fontTools preserves the slot numbering.
-        existing_cmap_cids = _parse_existing_tounicode(font_dict).keys()
-        max_existing_cid = max(existing_cmap_cids, default=-1)
-        safe_start = max(len(embedded.getGlyphOrder()), max_existing_cid + 1)
-        _pad_glyph_order(embedded, safe_start)
+            # Compute a collision-free starting GID for new glyphs.
+            # Under Identity-H, CID == GID, so the new GID must be above
+            # BOTH the current glyph order length AND any CID already used
+            # by the ToUnicode CMap (which, for some synthetic/retain_gids
+            # fonts, references CIDs beyond the embedded font's glyph
+            # count). Pad the glyph order with unique .notdef placeholders
+            # up to that point so fontTools preserves the slot numbering.
+            existing_cmap_cids = _parse_existing_tounicode(font_dict).keys()
+            max_existing_cid = max(existing_cmap_cids, default=-1)
+            safe_start = max(len(embedded.getGlyphOrder()), max_existing_cid + 1)
+            _pad_glyph_order(embedded, safe_start)
 
-        for ch in additional_chars:
-            cp = ord(ch)
-            # Skip if already in the embedded cmap (defensive — caller
-            # should have routed through Tier 1 first).
-            if cp in (embedded.getBestCmap() or {}):
-                continue
-            new_gid = _inject_glyph_in_place(embedded, system, ch)
+            for ch in additional_chars:
+                cp = ord(ch)
+                # Skip if already in the embedded cmap (defensive — caller
+                # should have routed through Tier 1 first).
+                if cp in (embedded.getBestCmap() or {}):
+                    continue
+                new_gid = _inject_glyph_in_place(embedded, system, ch)
 
-            new_cmap_entries[new_gid] = ch
-            # Width comes from the newly-injected glyph's hmtx entry
-            # (which we just copied from the system font).
-            glyph_name = (system.getBestCmap() or {})[cp]
-            raw_w = float(system["hmtx"][glyph_name][0])
-            new_w_entries[new_gid] = raw_w * 1000.0 / units_per_em
+                new_cmap_entries[new_gid] = ch
+                # Width comes from the newly-injected glyph's hmtx entry
+                # (which we just copied from the system font).
+                glyph_name = (system.getBestCmap() or {})[cp]
+                raw_w = float(system["hmtx"][glyph_name][0])
+                new_w_entries[new_gid] = raw_w * 1000.0 / units_per_em
 
-        if not new_cmap_entries:
-            # Every requested char was already in the embedded cmap —
-            # nothing to do at the font level. Caller's PDF-level
-            # metadata is already up to date via Tier 1 or a previous
-            # extension.
+            if not new_cmap_entries:
+                # Every requested char was already in the embedded cmap —
+                # nothing to do at the font level. Caller's PDF-level
+                # metadata is already up to date via Tier 1 or a previous
+                # extension.
+                return "full_extension"
+
+            # Re-serialize the extended embedded font and replace /FontFile2.
+            # embedded.save() is fontTools-driven and CAN raise during
+            # serialization — must stay inside the translator block.
+            buf = io.BytesIO()
+            embedded.save(buf)
+            fd["/FontFile2"] = pdf.make_stream(buf.getvalue())
+
+            # No cache eviction needed: the prior _FONTFILE2_CACHE was
+            # deleted (see font_has_codepoint docstring). Every subsequent
+            # font_has_codepoint call now re-parses /FontFile2 fresh, so
+            # the just-injected glyphs are observed on the next query
+            # without explicit invalidation.
+
+            # Apply PDF-level metadata updates using Tier 1 helpers.
+            _append_to_unicode_cmap(font_dict, new_cmap_entries, pdf)
+            _append_w_entries(cid_font, new_w_entries)
+            _update_cid_to_gid_map(
+                cid_font,
+                {cid: cid for cid in new_cmap_entries},
+                pdf,
+            )
+
+            logger.info(
+                "Tier 1.5 (in-place glyph injection) from %s: %d new glyph(s) appended",
+                system_path,
+                len(new_cmap_entries),
+            )
             return "full_extension"
-
-        # Re-serialize the extended embedded font and replace /FontFile2.
-        buf = io.BytesIO()
-        embedded.save(buf)
-        fd["/FontFile2"] = pdf.make_stream(buf.getvalue())
-
-        # No cache eviction needed: the prior _FONTFILE2_CACHE was
-        # deleted (see font_has_codepoint docstring). Every subsequent
-        # font_has_codepoint call now re-parses /FontFile2 fresh, so
-        # the just-injected glyphs are observed on the next query
-        # without explicit invalidation.
-
-        # Apply PDF-level metadata updates using Tier 1 helpers.
-        _append_to_unicode_cmap(font_dict, new_cmap_entries, pdf)
-        _append_w_entries(cid_font, new_w_entries)
-        _update_cid_to_gid_map(
-            cid_font,
-            {cid: cid for cid in new_cmap_entries},
-            pdf,
-        )
-
-        logger.info(
-            "Tier 1.5 (in-place glyph injection) from %s: %d new glyph(s) appended",
-            system_path,
-            len(new_cmap_entries),
-        )
-        return "full_extension"
-    finally:
-        embedded.close()
-        system.close()
+        finally:
+            embedded.close()
+            system.close()
 
 
 # ── Simple-font (non-CID) Tier 1.5 path ──────────────────────────────────
@@ -1059,58 +1119,66 @@ def _extend_simple_tier_15(
     if substituted_name is not None and substitution_log is not None:
         substitution_log.append(substituted_name)
 
-    # 3. Open both fonts (close in finally per existing pattern)
-    embedded = TTFont(io.BytesIO(ff2.read_bytes()))
-    system = TTFont(system_path)
-    try:
-        # 4. Inject each missing glyph; collect (byte, glyph_name, width).
-        # Consecutive low-end allocation: bytes start at /LastChar + 1.
-        used_bytes = _used_bytes_in_encoding(font_dict)
-        last_char = int(font_dict.get("/LastChar") or 0)
-        free_bytes = _allocate_free_bytes(used_bytes, len(additional_chars), last_char=last_char)
-        new_assignments: list[tuple[int, str, float]] = []
+    # 3. Open both fonts (close in finally per existing pattern). Per
+    # Skeptic-A: TTFont(BytesIO(...)) defers parsing — getBestCmap /
+    # getGlyphOrder / glyf-table accesses fire downstream. Wrap the
+    # entire fontTools-using block, including embedded.save(buf).
+    with _with_fonttools_translation(f"_extend_simple_tier_15:{ps_name}"):
+        embedded = TTFont(io.BytesIO(ff2.read_bytes()))
+        system = TTFont(system_path)
+        try:
+            # 4. Inject each missing glyph; collect (byte, glyph_name, width).
+            # Consecutive low-end allocation: bytes start at /LastChar + 1.
+            used_bytes = _used_bytes_in_encoding(font_dict)
+            last_char = int(font_dict.get("/LastChar") or 0)
+            free_bytes = _allocate_free_bytes(
+                used_bytes, len(additional_chars), last_char=last_char
+            )
+            new_assignments: list[tuple[int, str, float]] = []
 
-        for ch, byte_slot in zip(additional_chars, free_bytes, strict=True):
-            cp = ord(ch)
-            # Standard Adobe Glyph List name (e.g. ø → "oslash"); fall
-            # back to uniXXXX for codepoints AGL doesn't cover.
-            glyph_name = _glyph_name_for_codepoint(cp)
-            # Inject outline; reuses CID Tier 1.5 helper verbatim
-            _inject_glyph_in_place(embedded, system, ch)
-            # Width from hmtx (after injection, so entry exists). Helper
-            # raises FontNotFoundError on missing glyph_name (would
-            # indicate _inject_glyph_in_place partial-failed) or
-            # unitsPerEm == 0 (corrupt font metadata) — both surfaced as
-            # font_extension_failed via _FONT_EXTEND_FAIL_EXCS at the
-            # call site (M.4 hardening).
-            width = _glyph_width_from_hmtx(embedded, glyph_name)
-            new_assignments.append((byte_slot, glyph_name, width))
+            for ch, byte_slot in zip(additional_chars, free_bytes, strict=True):
+                cp = ord(ch)
+                # Standard Adobe Glyph List name (e.g. ø → "oslash"); fall
+                # back to uniXXXX for codepoints AGL doesn't cover.
+                glyph_name = _glyph_name_for_codepoint(cp)
+                # Inject outline; reuses CID Tier 1.5 helper verbatim
+                _inject_glyph_in_place(embedded, system, ch)
+                # Width from hmtx (after injection, so entry exists). Helper
+                # raises FontNotFoundError on missing glyph_name (would
+                # indicate _inject_glyph_in_place partial-failed) or
+                # unitsPerEm == 0 (corrupt font metadata) — both surfaced as
+                # font_extension_failed via _FONT_EXTEND_FAIL_EXCS at the
+                # call site (M.4 hardening).
+                width = _glyph_width_from_hmtx(embedded, glyph_name)
+                new_assignments.append((byte_slot, glyph_name, width))
 
-        # 5. Re-serialize embedded font, replace /FontFile2 stream.
-        # Mirrors _extend_tier2's pattern (fonts.py:955):
-        #     fd["/FontFile2"] = pdf.make_stream(buf.getvalue())
-        buf = io.BytesIO()
-        embedded.save(buf)
-        fd["/FontFile2"] = pdf.make_stream(buf.getvalue())
+            # 5. Re-serialize embedded font, replace /FontFile2 stream.
+            # Mirrors _extend_tier2's pattern (fonts.py:955):
+            #     fd["/FontFile2"] = pdf.make_stream(buf.getvalue())
+            # embedded.save() can raise during fontTools serialization —
+            # must stay inside the translator block.
+            buf = io.BytesIO()
+            embedded.save(buf)
+            fd["/FontFile2"] = pdf.make_stream(buf.getvalue())
 
-        # No cache invalidation needed: _FONTFILE2_CACHE was deleted
-        # (see font_has_codepoint docstring). font_has_codepoint
-        # re-parses /FontFile2 on every call, so the just-injected
-        # glyphs are observed without explicit eviction.
+            # No cache invalidation needed: _FONTFILE2_CACHE was deleted
+            # (see font_has_codepoint docstring). font_has_codepoint
+            # re-parses /FontFile2 on every call, so the just-injected
+            # glyphs are observed without explicit eviction.
 
-        # 6. PDF-side updates: /Encoding /Differences, /Widths, bounds.
-        _extend_simple_encoding(pdf, font_dict, new_assignments)
-        _extend_simple_widths(font_dict, new_assignments)
+            # 6. PDF-side updates: /Encoding /Differences, /Widths, bounds.
+            _extend_simple_encoding(pdf, font_dict, new_assignments)
+            _extend_simple_widths(font_dict, new_assignments)
 
-        logger.info(
-            "Tier 1.5 (simple-font) extension from %s: %d character(s) added",
-            system_path,
-            len(additional_chars),
-        )
-        return "full_extension"
-    finally:
-        embedded.close()
-        system.close()
+            logger.info(
+                "Tier 1.5 (simple-font) extension from %s: %d character(s) added",
+                system_path,
+                len(additional_chars),
+            )
+            return "full_extension"
+        finally:
+            embedded.close()
+            system.close()
 
 
 def _glyph_name_for_codepoint(cp: int) -> str:

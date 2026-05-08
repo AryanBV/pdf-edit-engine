@@ -185,6 +185,23 @@ class EditResult:
         ):
             self.warnings.append("Overflow detected: replacement extends past available space.")
 
+        # INV-J-9 contract enforcement: font_action="failed" implies the
+        # FidelityReport carries at least one font-affecting Degradation
+        # (kind in FONT_AFFECTING_KINDS). Without this guard, a code path
+        # that constructs EditResult(font_action="failed") with the
+        # default-factory FidelityReport silently inherits
+        # ``font_preserved=True`` — a lying-success surfaced by F-C-05
+        # at structural.py:1003 / :1026. Fails loudly at construction so
+        # future paths cannot regress (mirrors INV-J-3 trip-wire shape).
+        if self.font_action == "failed" and not any(
+            d.kind in FONT_AFFECTING_KINDS for d in self.fidelity_report.degradations
+        ):
+            raise ValueError(
+                "INV-J-9: font_action='failed' requires a Degradation with "
+                "kind in FONT_AFFECTING_KINDS; got "
+                f"degradations={self.fidelity_report.degradations!r}"
+            )
+
 
 @dataclass
 class Edit:

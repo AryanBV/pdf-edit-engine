@@ -13,6 +13,7 @@ import pikepdf
 from pdf_edit_engine._pathutil import open_pdf
 from pdf_edit_engine.encoding import FontResolver, FontResolverCache
 from pdf_edit_engine.errors import OperatorError
+from pdf_edit_engine.fonts import _with_fonttools_translation
 from pdf_edit_engine.fragments import TJReconstructor
 from pdf_edit_engine.models import (
     ContentElement,
@@ -734,9 +735,17 @@ def _build_font_info(
 
                     font_stream = fd["/FontFile2"]
                     font_bytes = font_stream.read_bytes()
-                    tt = TTFont(_io.BytesIO(font_bytes))
-                    glyph_count = len(tt.getGlyphOrder())
-                    tt.close()
+                    # INV-C-7: wrap the TTFont construction AND the
+                    # downstream lazy getGlyphOrder() (per Skeptic-A,
+                    # parsing is deferred). Translator narrows fontTools
+                    # exceptions to FontNotFoundError; the outer
+                    # `except Exception` then triggers the /W fallback.
+                    with _with_fonttools_translation("get_fonts:glyph_count"):
+                        tt = TTFont(_io.BytesIO(font_bytes))
+                        try:
+                            glyph_count = len(tt.getGlyphOrder())
+                        finally:
+                            tt.close()
                 except Exception:  # noqa: BLE001 — fonttools can raise many types
                     # Fallback: count /W entries
                     if "/W" in cid_dict:

@@ -999,6 +999,8 @@ def _replace_block_on_page(
     # Extend body font
     if not can_enc:
         if not resolver.is_cid_font:
+            # F-C-05 / INV-J-9: must carry a font-affecting Degradation
+            # so font_preserved correctly resolves to False.
             return (
                 EditResult(
                     success=False,
@@ -1009,6 +1011,19 @@ def _replace_block_on_page(
                         "Font cannot encode text and no extensible "
                         "(Type0/Identity-H) font available in bbox"
                     ],
+                    fidelity_report=FidelityReport(
+                        font_substituted=None,
+                        overflow_detected=False,
+                        reflow_applied=False,
+                        glyphs_missing=list(missing),
+                        degradations=[
+                            Degradation(
+                                kind="font_extension_failed",
+                                detail="non_cid_body_font",
+                                severity="error",
+                            ),
+                        ],
+                    ),
                 ),
                 0.0,
                 bbox[3],
@@ -1022,6 +1037,8 @@ def _replace_block_on_page(
             substitution_log=substitution_log,
             coverage_tier_log=coverage_tier_log,
         ):
+            # F-C-05 / INV-J-9: must carry a font-affecting Degradation
+            # so font_preserved correctly resolves to False.
             return (
                 EditResult(
                     success=False,
@@ -1031,6 +1048,19 @@ def _replace_block_on_page(
                     warnings=[
                         f"Font extension failed for body font '{clean_name}' (missing: {missing!r})"
                     ],
+                    fidelity_report=FidelityReport(
+                        font_substituted=None,
+                        overflow_detected=False,
+                        reflow_applied=False,
+                        glyphs_missing=list(missing),
+                        degradations=[
+                            Degradation(
+                                kind="font_extension_failed",
+                                detail="_extend_font_returned_false",
+                                severity="error",
+                            ),
+                        ],
+                    ),
                 ),
                 0.0,
                 bbox[3],
