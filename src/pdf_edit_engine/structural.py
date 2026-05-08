@@ -15,7 +15,7 @@ from typing import Any, Literal
 
 import pikepdf
 
-from pdf_edit_engine._pathutil import open_pdf, validate_output_path
+from pdf_edit_engine._pathutil import _save_pdf, open_pdf, validate_output_path
 from pdf_edit_engine.encoding import FontResolverCache
 from pdf_edit_engine.errors import OperatorError
 from pdf_edit_engine.fonts import _FONT_EXTEND_FAIL_EXCS
@@ -676,7 +676,7 @@ def shift_content_below(
         )
 
         overflow = any("below page boundary" in w for w in warnings)
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
         _invalidate_locator_cache()
 
         return EditResult(
@@ -1421,7 +1421,7 @@ def replace_block(
         # those still go orphan when the user asks us to replace the
         # region with unrelated text.
         _remove_orphaned_annotations(page_obj, bbox, new_text)
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
         _invalidate_locator_cache()
         return result
     finally:
@@ -1591,7 +1591,7 @@ def batch_replace_block(
                 # whether the per-bbox surgery hit content.
                 _remove_orphaned_annotations(page_obj, adjusted_bbox, new_text)
 
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
         _invalidate_locator_cache()
 
         # Return results in original input order
@@ -1794,7 +1794,7 @@ def insert_text_block(
         # Write back
         new_stream = pikepdf.unparse_content_stream(ops)
         page_obj.Contents = pdf.make_stream(new_stream)
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
         _invalidate_locator_cache()
 
         overflow = any("below page boundary" in w for w in shift_warnings)
@@ -1850,7 +1850,7 @@ def delete_block(
         matched_elems, op_indices = _collect_elements_in_bbox(elements, bbox)
 
         if not matched_elems:
-            pdf.save(output_path)
+            _save_pdf(pdf, output_path)
             return EditResult(
                 success=True,
                 original_text="",
@@ -1919,7 +1919,7 @@ def delete_block(
                 -deleted_height,
             )
 
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
         _invalidate_locator_cache()
 
         overflow = any("below page boundary" in w for w in warnings)
