@@ -88,14 +88,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - **INV-J-5 + INV-J-8 invariant probes** registered in
   `docs/decisions.md` and `docs/ultimate-audit-charter.md` Layer J.
 
-### Fixed
-
-- **`_FONTFILE2_CACHE` cross-PDF collision.** The Phase 5 cache was
-  keyed on `(objgen[0], objgen[1])` which alias across `pikepdf.Pdf.open`
-  instances (two PDFs both having a font at object 7,0 collide). Now
-  keyed on `(id(font_dict.owner), objgen[0], objgen[1])` so each PDF
-  instance has its own cache namespace.
-
 ### Removed
 
 - **`_FONTFILE2_CACHE` and `_font_dict_key` removed.** The
@@ -252,8 +244,8 @@ surfaced; all 9 are root-fixed structurally — see
 
 ### Known scope limits
 
-- **ARY-279** (CFF / OpenType Tier 1.5) deferred to v0.1.3. `_inject_glyph_in_place` still raises `FontNotFoundError` when the embedded font has no `glyf` table.
-- **ARY-280** (reproducible real-Chrome fixture generator) deferred to v0.1.3 alongside ARY-279. The existing `.claude/Acme Corporation —Chrome.pdf` fixture is gated behind `skipif(not present)`.
+- **ARY-279** (CFF / OpenType Tier 1.5) deferred to v0.1.4. `_inject_glyph_in_place` still raises `FontNotFoundError` when the embedded font has no `glyf` table.
+- **ARY-280** (reproducible real-Chrome fixture generator) deferred to v0.1.4 alongside ARY-279. The existing `.claude/Acme Corporation —Chrome.pdf` fixture is gated behind `skipif(not present)`.
 - **Narrow single-line paragraph with inline continuation**: when `paragraph.paragraph_width` is narrower than the replacement because the paragraph was detected from a visual span (e.g. "Sarah Johnson" in a font-change) that shares the visual line with continuing text in a different font, reflow shifts content below the paragraph but cannot move the inline continuation on the same line. The replacement widens horizontally and overlaps the continuation. The audit's INV-J-3 contract guard ensures callers see an "overflow" warning when this happens; full geometric fix tracked for v0.1.3.
 
 ### Verified

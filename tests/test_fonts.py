@@ -743,28 +743,27 @@ class TestTier1_5GlyphInjection:
 
 @_need_resume
 class TestFontFile2CacheEviction:
-    """IMP-1: ``_FONTFILE2_CACHE`` is evicted after every ``/FontFile2``
-    write so subsequent ``font_has_codepoint`` queries observe the
-    just-injected glyphs.
+    """Double-extension behavior: a second ``extend_subset`` call on the
+    same font dict re-reads ``/FontFile2`` from the live PDF and produces
+    a stable, fresh extension event for the new codepoint without
+    leaking pre-existing state from the first extension.
 
-    The bug is latent at v0.1.3 — Agent H's compounding diagnostic
-    exercised double-extension on the same font dict without observable
-    corruption. Likely pikepdf updates ``objgen`` on stream rewrite, so
-    the cache key changes naturally and the stale entry is never
-    consulted. Per the prompt's IMP-1 directive: "ship the eviction
-    defensively". The test is a regression guard against future
-    regressions where:
+    Class name retained for git-blame continuity. The pre-Phase-13.4
+    rationale referenced the module-global ``_FONTFILE2_CACHE``, which
+    was deleted as a root fix during Phase 13.4 (ARY-348) — the cache
+    had populate/evict key-mismatch and cross-Pdf ``id(pdf)`` recycling
+    issues and had been functionally a no-op since pikepdf 10.5.1. Post-
+    deletion, ``font_has_codepoint`` re-parses ``/FontFile2`` on every
+    call, so the property under test is no longer cache eviction but
+    the same behavioral guarantee that originally motivated the cache
+    eviction: double-extension on the same logical font dict must
+    report each call's codepoint as a fresh extension, not as a
+    spuriously-rediscovered pre-existing one.
 
-    1. pikepdf changes such that ``objgen`` is preserved across stream
-       rewrites (cache key would no longer change naturally), OR
-    2. a refactor introduces a code path that calls
-       ``font_has_codepoint`` for the just-injected codepoint in the
-       same pdf-object scope, making the cache key collision explicit.
-
-    Behavioral test (no white-box poking of ``_FONTFILE2_CACHE``).
-    Double-extension scenario per the prompt's spec: ø at step 1, then
-    ü on the same logical font dict at step 2. Step 2 must report ü as
-    a fresh extension with no stale ø entry leaking from step 1.
+    Behavioral test (no white-box poking of internal caches).
+    Double-extension scenario: ø at step 1, then ü on the same logical
+    font dict at step 2. Step 2 must report ü as a fresh extension
+    with no stale ø entry leaking from step 1.
 
     Single-source-of-truth char selection: ø and ü are both verified
     missing from every embedded font on the resume corpus page 0 (F1
@@ -828,7 +827,8 @@ class TestFontFile2CacheEviction:
             )
             assert chars_part != "ø", (
                 "step 2 has a stale ø-only coverage Degradation "
-                f"({d!r}) — _FONTFILE2_CACHE may be leaking pre-step-1 state"
+                f"({d!r}) — font_has_codepoint may be misreading the "
+                "live /FontFile2 and leaking pre-step-1 state"
             )
 
     def test_resolver_cache_shared_font_cross_page_evict(self, tmp_path: Path) -> None:

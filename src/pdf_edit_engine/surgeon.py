@@ -1153,10 +1153,11 @@ def replace(
     pdf = open_pdf(pdf_path)
     try:
         # Per-call caches (ARY-283): every public entrypoint owns its caches
-        # and threads them to helpers; no module-level shared state.
-        # ``pdf`` is threaded into the cache so FontResolver.can_encode's
-        # cmap-coverage check can key _FONTFILE2_CACHE under pikepdf 10.5.1
-        # (ARY-349).
+        # and threads them to helpers; no module-level shared state. The
+        # module-level ``_FONTFILE2_CACHE`` referenced by earlier comments
+        # was deleted in Phase 13.4 (ARY-348); ``font_has_codepoint`` now
+        # re-parses ``/FontFile2`` on each call, so no PDF-keyed cache
+        # threading is required.
         resolver_cache = FontResolverCache()
         width_cache = GlyphWidthCache()
 

@@ -117,6 +117,14 @@ def _build_simple_winansi_pdf(
         glyphs=[glyph_order[gid] for gid in sorted(used_gids) if gid < len(glyph_order)]
     )
     subsetter.subset(sub_font)
+    # M-11: pin head timestamps so the fixture build is byte-stable.
+    # fontTools' default save behavior writes time.time() into
+    # head.created and head.modified, which makes consecutive rebuilds
+    # produce different byte streams. Pin both to 0 so every rebuild
+    # produces the same /FontFile2 payload — required by Phase 13.4
+    # double-extension probes that rely on byte-stable inputs.
+    sub_font["head"].created = 0
+    sub_font["head"].modified = 0
     buf = io.BytesIO()
     sub_font.save(buf)
     font_bytes = buf.getvalue()
@@ -163,6 +171,14 @@ def _build_simple_winansi_pdf(
 
     raw_ps = full.get("name").getDebugName(6) or "ArialMT"
     ps_name = str(raw_ps)
+    # M-12 note: full /BaseFont normalization to a synthetic name (Option B
+    # in the Phase D plan) would let the fixture be platform-portable, but
+    # it would break ``_extend_simple_tier_15`` — the extender does its
+    # system-font lookup by /BaseFont PostScript name, and a synthetic
+    # name has no system font to source glyphs from. Eliminating the
+    # system-font dependency entirely requires a vendored TTF stub
+    # (Option A), which is out of scope for this commit. The probes that
+    # consume this fixture remain gated behind ``_no_ttf_simple``.
     bbox = [
         full["head"].xMin,
         full["head"].yMin,
@@ -212,8 +228,11 @@ def _build_simple_winansi_pdf(
     pdf.pages.append(pikepdf.Page(page_dict))
 
     # static_id=True yields a constant /ID array (not derived from
-    # current time / random), giving byte-stable output across runs.
-    pdf.save(str(out_path), static_id=True)
+    # current time / random); compress_streams=False disables zlib
+    # compression whose output varies between runs even on identical
+    # input. Combined with the head.created/modified=0 pin above, the
+    # fixture is fully byte-stable across runs.
+    pdf.save(str(out_path), static_id=True, compress_streams=False)
     pdf.close()
     full.close()
     return True

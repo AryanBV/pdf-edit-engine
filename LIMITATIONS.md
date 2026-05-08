@@ -26,7 +26,17 @@
 - CJK fonts with 30,000+ glyphs have not been tested
 - Type 3 fonts (bitmap/procedural) are not supported for extension
 - Emoji and other multi-codepoint characters cannot be rendered if the font lacks those glyphs (reported via `FidelityReport.degradations` as `font_extension_failed`)
-- Non-CID font extension is supported for **simple TrueType + WinAnsi + `/FontFile2`** fonts (Phase 13). Replacements requiring missing glyphs trigger `_extend_simple_tier_15`, which sources the outline from a system font (or metric-equivalent fallback like Carlito for Calibri) and surfaces via `FidelityReport.font_substituted` AND a `font_coverage_substituted` Degradation. Still NOT supported: `/FontFile3` (CFF/OpenType) outlines (tracked as ARY-279 for v0.1.4); `/Type1` fonts (would require Type1 charstring surgery — out of scope); MacRoman simple fonts (architecturally similar to WinAnsi but untested in v0.1.3); CJK fonts with 30,000+ glyphs (untested). The dispatcher in `extend_subset()` raises `FontNotFoundError` for all these cases, which surfaces as a `font_extension_failed` Degradation through the public API.
+- Non-CID font extension is supported for **simple TrueType + WinAnsi + `/FontFile2`** fonts (Phase 13). Replacements requiring missing glyphs trigger `_extend_simple_tier_15`, which sources the outline from a system font (or metric-equivalent fallback like Carlito for Calibri) and surfaces via `FidelityReport.font_substituted` AND a `font_coverage_substituted` Degradation. Still NOT supported: `/FontFile3` (CFF/OpenType) outlines (tracked as ARY-279 for v0.1.4); `/Type1` fonts (would require Type1 charstring surgery — out of scope); MacRoman simple fonts (architecturally similar to WinAnsi but untested in v0.1.3); CJK fonts with 30,000+ glyphs (untested). The dispatcher in `extend_subset()` raises `FontNotFoundError` for all these cases.
+
+  Most public-API entry points surface failure modes as typed
+  `Degradation` entries on `EditResult.fidelity_report.degradations`.
+  Coverage is enforced for the documented kinds via INV-J-9
+  (added in v0.1.3, commit 01: `font_action="failed"` implies a
+  `Degradation` of kind in `FONT_AFFECTING_KINDS`). Other failure
+  modes (e.g., reflow abort, glyph-coverage gaps) are surfaced
+  opportunistically and may not always carry a typed entry.
+  See `docs/v0.1.3-release-notes.md` §Honesty fixes for the full
+  coverage matrix.
 
 ## Encoding
 

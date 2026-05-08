@@ -9,7 +9,10 @@ Phase 13.4 (ARY-348). 12 probes split into:
 
 The probes pin behaviour of helpers added in Phase 13.1 and the dispatcher
 branch added in Phase 13.2. Probe 5 (`test_double_extension_no_byte_collision`)
-is load-bearing on Phase 13.2.3's `_font_dict_key` repair.
+is load-bearing on Phase 13.4's cache-deletion architecture; it tests
+``extend_subset`` end-to-end without the deprecated ``_FONTFILE2_CACHE``
+indirection (the module-global cache was removed in ARY-348; queries now
+re-parse ``/FontFile2`` directly).
 """
 
 from __future__ import annotations
@@ -242,10 +245,11 @@ def test_promote_encoding_name_to_dict() -> None:
 def test_double_extension_no_byte_collision(tmp_path: Path) -> None:
     """Probe 5: two consecutive extensions allocate distinct bytes.
 
-    Load-bearing on Phase 13.2.3's _font_dict_key repair and Phase 13.1's
-    step 5b cache eviction. Without the chain, _used_bytes_in_encoding
-    fails to see the first /Differences override and the second
-    extension would re-allocate the same byte.
+    Load-bearing on Phase 13.4's cache-deletion architecture: the
+    deprecated ``_FONTFILE2_CACHE`` indirection is gone, so
+    ``_used_bytes_in_encoding`` reads the first /Differences override
+    directly from the live font dict on the second call. Without that
+    direct read, the second extension would re-allocate the same byte.
     """
     src = _ensure_simple_winansi_pdf()
     work = tmp_path / "double.pdf"

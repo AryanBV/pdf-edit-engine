@@ -976,8 +976,10 @@ def reflow_paragraph(
     """
     # Preserve the 0.1.1 public signature. When the caller does not pass a
     # cache, construct one internally — per-call ownership is maintained.
-    # ``pdf`` is threaded so the FontResolver can key _FONTFILE2_CACHE
-    # under pikepdf 10.5.1 (ARY-349).
+    # The module-level ``_FONTFILE2_CACHE`` referenced by earlier comments
+    # was deleted in Phase 13.4 (ARY-348); ``font_has_codepoint`` now re-
+    # parses ``/FontFile2`` on each call, so no PDF-keyed cache threading
+    # is required.
     from pdf_edit_engine.encoding import FontResolverCache as _FontResolverCache
 
     if resolver_cache is None:

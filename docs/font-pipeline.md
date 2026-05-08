@@ -135,7 +135,7 @@ resolver together.
 - **CFF / OpenType outlines are not supported.** `_inject_glyph_in_place`
   at `fonts.py` raises `FontNotFoundError` when the embedded
   font's `/FontFile3` carries Type1C charstrings rather than a `glyf`
-  table. Tracked in ARY-279 for v0.1.3.
+  table. Tracked in ARY-279 for v0.1.4.
 - **Type 3 fonts (bitmap/procedural) are not supported** for extension.
 - **unitsPerEm mismatch** between the embedded and system font is
   treated as a hard failure (no rescaling).
