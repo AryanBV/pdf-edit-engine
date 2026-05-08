@@ -15,7 +15,7 @@ from pdfminer.cmapdb import CMapParser, FileUnicodeMap
 
 from pdf_edit_engine._pathutil import open_pdf
 from pdf_edit_engine.errors import EncodingError, FontNotFoundError
-from pdf_edit_engine.models import FontInfo
+from pdf_edit_engine.models import Degradation, FontInfo
 from pdf_edit_engine.system_fonts import _strip_subset_prefix
 
 if TYPE_CHECKING:
@@ -757,6 +757,7 @@ def extend_subset(
     full_font_path: str | Path | None = None,
     *,
     substitution_log: list[str] | None = None,
+    degradations: list[Degradation] | None = None,
 ) -> str:
     """Extend a font's character coverage in the open PDF object.
 
@@ -780,6 +781,15 @@ def extend_subset(
             the caller can populate ``FidelityReport.font_substituted``.
             Pass ``None`` (default) when the caller doesn't need
             substitution visibility.
+        degradations: Optional list to capture typed Degradation events
+            from the extension path. F-D-CC9 plumbing — when Tier 1.5
+            resolves to a system font whose canonical realpath lives in
+            a per-platform user-writable directory, a
+            ``Degradation(kind="font_substituted_from_user_fonts",
+            severity="warning")`` is appended so callers can surface
+            the security-relevant origin via
+            ``FidelityReport.degradations``. Pass ``None`` (default)
+            when the caller does not consume Degradations.
 
     Returns:
         Extension tier used: ``'cmap_only'`` or ``'full_extension'``.
@@ -816,6 +826,7 @@ def extend_subset(
             additional_chars=additional_chars,
             full_font_path=full_font_path,
             substitution_log=substitution_log,
+            degradations=degradations,
         )
     elif subtype == "/Type1":
         msg = (
@@ -884,6 +895,7 @@ def extend_subset(
         "".join(tier15_chars),
         full_font_path,
         substitution_log,
+        degradations,
     )
 
 
@@ -939,6 +951,7 @@ def _extend_tier2(
     additional_chars: str,
     full_font_path: str | Path | None,
     substitution_log: list[str] | None = None,
+    degradations: list[Degradation] | None = None,
 ) -> str:
     """Tier 1.5 in-place glyph injection (root fix for ARY-276 Mode 2).
 
@@ -987,20 +1000,34 @@ def _extend_tier2(
 
     if full_font_path is not None:
         system_path: str | None = str(full_font_path)
+        origin: str = "system"  # explicit override — caller-supplied path
         substituted_name: str | None = None
     else:
         found = _find_font_with_origin(ps_name)
         if found is None:
             system_path = None
+            origin = "system"
             substituted_name = None
         else:
-            system_path, substituted_name = found
+            system_path, origin, substituted_name = found
     if system_path is None or not Path(system_path).is_file():
         msg = f"System font not found for '{ps_name}'. Install the font or provide full_font_path."
         raise FontNotFoundError(msg)
     # INV-C-4: surface metric-equivalent substitution to caller.
     if substituted_name is not None and substitution_log is not None:
         substitution_log.append(substituted_name)
+    # F-D-CC9: surface user-fonts origin (severity="warning"; not in
+    # FONT_AFFECTING_KINDS — the font WAS used, but the caller should
+    # know the outline came from a user-writable directory that an
+    # unprivileged process could have primed).
+    if origin == "user" and degradations is not None:
+        degradations.append(
+            Degradation(
+                kind="font_substituted_from_user_fonts",
+                detail=f"path={system_path}",
+                severity="warning",
+            )
+        )
 
     # Load the embedded font (so we can extend it in place)
     embedded_bytes = bytes(fd["/FontFile2"].read_bytes())
@@ -1089,6 +1116,7 @@ def _extend_simple_tier_15(
     additional_chars: str,
     full_font_path: str | Path | None = None,
     substitution_log: list[str] | None = None,
+    degradations: list[Degradation] | None = None,
 ) -> str:
     """Tier 1.5 in-place glyph injection for simple (non-CID) TrueType fonts.
 
@@ -1140,11 +1168,22 @@ def _extend_simple_tier_15(
                 f"system font for {ps_name!r} not found and no full_font_path provided"
             )
         system_path = str(full_font_path)
+        origin = "system"  # explicit override — caller-supplied path
         substituted_name = None
     else:
-        system_path, substituted_name = found
+        system_path, origin, substituted_name = found
     if substituted_name is not None and substitution_log is not None:
         substitution_log.append(substituted_name)
+    # F-D-CC9: surface user-fonts origin (severity="warning"; not in
+    # FONT_AFFECTING_KINDS — origin surface, not a fidelity break).
+    if origin == "user" and degradations is not None:
+        degradations.append(
+            Degradation(
+                kind="font_substituted_from_user_fonts",
+                detail=f"path={system_path}",
+                severity="warning",
+            )
+        )
 
     # 3. Open both fonts (close in finally per existing pattern). Per
     # Skeptic-A: TTFont(BytesIO(...)) defers parsing — getBestCmap /

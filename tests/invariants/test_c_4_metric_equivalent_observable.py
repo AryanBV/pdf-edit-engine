@@ -34,21 +34,26 @@ if TYPE_CHECKING:
 
 def test_inv_c_4_resolver_reports_substitute(monkeypatch: pytest.MonkeyPatch) -> None:
     """``_find_font_with_origin`` returns the substitute name when a
-    metric equivalent is used; ``None`` second-element when the exact
-    font was found."""
-    monkeypatch.setattr(sf, "_FONT_CACHE", {"Carlito-Regular": "/fake/carlito.ttf"})
+    metric equivalent is used; ``None`` substitute when the exact
+    font was found.
+
+    Cache entries are now ``(path, origin)`` tuples (F-D-CC9 v0.1.3);
+    the resolver returns ``(path, origin, substituted_name)``.
+    """
+    monkeypatch.setattr(sf, "_FONT_CACHE", {"Carlito-Regular": ("/fake/carlito.ttf", "system")})
     monkeypatch.setitem(_METRIC_EQUIVALENTS, "ZzNonExistent", ["Carlito-Regular"])
 
     found = sf._find_font_with_origin("ZzNonExistent")
     assert found is not None, "metric-equivalent fallback should resolve"
-    path, substituted = found
+    path, origin, substituted = found
     assert path == "/fake/carlito.ttf"
+    assert origin == "metric_equivalent"
     assert substituted == "Carlito-Regular"
 
-    # Conversely: an exact-name hit reports None substitute.
-    monkeypatch.setattr(sf, "_FONT_CACHE", {"ExactFont": "/fake/exact.ttf"})
+    # Conversely: an exact-name hit reports None substitute and origin from cache.
+    monkeypatch.setattr(sf, "_FONT_CACHE", {"ExactFont": ("/fake/exact.ttf", "system")})
     found2 = sf._find_font_with_origin("ExactFont")
-    assert found2 == ("/fake/exact.ttf", None)
+    assert found2 == ("/fake/exact.ttf", "system", None)
 
 
 def test_inv_c_4_metric_equivalent_observable_e2e(resume_pdf: Path, tmp_path: Path) -> None:

@@ -401,8 +401,9 @@ def test_extend_subset_propagates_substitution_log(
 
     fake_substitute_name = "Carlito-Regular"
 
-    def fake_resolver(_name: str) -> tuple[str, str | None]:
-        return (str(fake_font_path), fake_substitute_name)
+    def fake_resolver(_name: str) -> tuple[str, str, str | None]:
+        # (path, origin, substituted_name) — F-D-CC9 v0.1.3 shape.
+        return (str(fake_font_path), "metric_equivalent", fake_substitute_name)
 
     monkeypatch.setattr(sf, "_find_font_with_origin", fake_resolver)
 
@@ -441,8 +442,9 @@ def test_extend_subset_no_substitution_when_exact_match(
     embedded.save(str(fake_font_path))
     embedded.close()
 
-    def fake_resolver(_name: str) -> tuple[str, str | None]:
-        return (str(fake_font_path), None)  # None = exact match
+    def fake_resolver(_name: str) -> tuple[str, str, str | None]:
+        # (path, origin, substituted_name) — F-D-CC9 v0.1.3 shape.
+        return (str(fake_font_path), "system", None)  # None = exact match
 
     monkeypatch.setattr(sf, "_find_font_with_origin", fake_resolver)
 

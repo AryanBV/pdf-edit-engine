@@ -549,7 +549,8 @@ class TestInsertTextBlockHonesty:
 
         monkeypatch.setattr(
             "pdf_edit_engine.system_fonts._find_font_with_origin",
-            lambda ps_name: (real_path, "Carlito-Regular"),
+            # (path, origin, substituted_name) — F-D-CC9 v0.1.3 shape.
+            lambda ps_name: (real_path, "metric_equivalent", "Carlito-Regular"),
         )
 
         out = str(tmp_path / "out.pdf")
