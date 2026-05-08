@@ -7,11 +7,12 @@ from pathlib import Path
 import pikepdf
 
 from pdf_edit_engine._pathutil import (
-    open_pdf as _open_pdf,
-)
-from pdf_edit_engine._pathutil import (
+    _save_pdf,
     validate_output_dir,
     validate_output_path,
+)
+from pdf_edit_engine._pathutil import (
+    open_pdf as _open_pdf,
 )
 from pdf_edit_engine.errors import PDFEditError
 
@@ -48,7 +49,7 @@ def merge_pdfs(pdf_paths: list[str], output_path: str) -> str:
                 other = _open_pdf(path)
                 others.append(other)
                 pdf.pages.extend(other.pages)
-            pdf.save(output_path)
+            _save_pdf(pdf, output_path)
         finally:
             for other in others:
                 other.close()
@@ -74,7 +75,7 @@ def split_pdf(pdf_path: str, output_dir: str) -> list[str]:
             new_pdf = pikepdf.Pdf.new()
             new_pdf.pages.append(page)
             out = str(out_dir / f"page_{i}.pdf")
-            new_pdf.save(out)
+            _save_pdf(new_pdf, out)
             outputs.append(out)
     return outputs
 
@@ -96,7 +97,7 @@ def reorder_pages(pdf_path: str, page_order: list[int], output_path: str) -> str
         new_pdf = pikepdf.Pdf.new()
         for i in page_order:
             new_pdf.pages.append(pdf.pages[i])
-        new_pdf.save(output_path)
+        _save_pdf(new_pdf, output_path)
     return output_path
 
 
@@ -123,7 +124,7 @@ def rotate_pages(pdf_path: str, pages: list[int], angle: int, output_path: str) 
             rotate_val = page.get("/Rotate")
             existing = int(rotate_val) if rotate_val is not None else 0
             page["/Rotate"] = (existing + angle) % 360
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
     return output_path
 
 
@@ -143,7 +144,7 @@ def delete_pages(pdf_path: str, pages: list[int], output_path: str) -> str:
         _validate_page_indices(pages, len(pdf.pages), "delete_pages")
         for i in sorted(pages, reverse=True):
             del pdf.pages[i]
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
     return output_path
 
 
@@ -168,7 +169,7 @@ def crop_pages(
             page["/CropBox"] = pikepdf.Array(
                 [pikepdf.Object.parse(str(v).encode()) for v in box],
             )
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
     return output_path
 
 
@@ -200,7 +201,7 @@ def edit_metadata(pdf_path: str, metadata: dict[str, str], output_path: str) -> 
             for key, value in metadata.items():
                 xmp_key = _simple_to_xmp.get(key, key)
                 meta[xmp_key] = value
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
     return output_path
 
 
@@ -220,7 +221,7 @@ def add_bookmark(pdf_path: str, title: str, page: int, output_path: str) -> str:
     with _open_pdf(pdf_path) as pdf:
         with pdf.open_outline() as outline:
             outline.root.append(pikepdf.OutlineItem(title, page))
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
     return output_path
 
 
@@ -243,7 +244,8 @@ def encrypt_pdf(
     """
     validate_output_path(output_path)
     with _open_pdf(pdf_path) as pdf:
-        pdf.save(
+        _save_pdf(
+            pdf,
             output_path,
             encryption=pikepdf.Encryption(owner=owner_pass, user=user_pass),
         )
@@ -263,7 +265,7 @@ def decrypt_pdf(pdf_path: str, password: str, output_path: str) -> str:
     """
     validate_output_path(output_path)
     with _open_pdf(pdf_path, password=password) as pdf:
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
     return output_path
 
 
@@ -314,7 +316,7 @@ def add_hyperlink(
         if "/Annots" not in target_page:
             target_page["/Annots"] = pikepdf.Array()
         target_page["/Annots"].append(annot)
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
     return output_path
 
 
@@ -361,7 +363,7 @@ def add_highlight(
         if "/Annots" not in target_page:
             target_page["/Annots"] = pikepdf.Array()
         target_page["/Annots"].append(annot)
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
     return output_path
 
 
@@ -386,7 +388,7 @@ def flatten_annotations(pdf_path: str, output_path: str) -> str:
             page_obj = page.obj
             if "/Annots" in page_obj:
                 del page_obj["/Annots"]
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
     return output_path
 
 
@@ -426,7 +428,7 @@ def fill_form(pdf_path: str, field_values: dict[str, str], output_path: str) -> 
         if "/Fields" in acroform:
             _fill_fields(acroform["/Fields"])
         acroform["/NeedAppearances"] = True
-        pdf.save(output_path)
+        _save_pdf(pdf, output_path)
     return output_path
 
 
@@ -451,7 +453,7 @@ def add_watermark(pdf_path: str, watermark_path: str, output_path: str) -> str:
             watermark_page = watermark.pages[0]
             for page in pdf.pages:
                 page.add_underlay(watermark_page, None)
-            pdf.save(output_path)
+            _save_pdf(pdf, output_path)
         finally:
             watermark.close()
     return output_path

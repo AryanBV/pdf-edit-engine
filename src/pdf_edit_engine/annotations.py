@@ -8,8 +8,8 @@ from typing import Any
 
 import pikepdf
 
+from pdf_edit_engine._pathutil import _save_pdf, validate_output_path
 from pdf_edit_engine._pathutil import open_pdf as _open_pdf
-from pdf_edit_engine._pathutil import validate_output_path
 from pdf_edit_engine.errors import PDFEditError
 
 
@@ -113,7 +113,7 @@ def update_annotation_uri(
         if "/A" not in target:
             target["/A"] = pikepdf.Dictionary({"/S": pikepdf.Name("/URI")})
         target["/A"]["/URI"] = pikepdf.String(new_uri)
-        pdf.save(out)
+        _save_pdf(pdf, out)
 
 
 def delete_annotation(
@@ -135,7 +135,7 @@ def delete_annotation(
     with _open_pdf(path, allow_overwriting_input=allow_overwrite) as pdf:
         page_obj = pdf.pages[annot.page]
         if "/Annots" not in page_obj:
-            pdf.save(out)
+            _save_pdf(pdf, out)
             return
         annots_list: list[Any] = list(page_obj["/Annots"])  # type: ignore[call-overload]
         if 0 <= annot.index < len(annots_list):
@@ -144,7 +144,7 @@ def delete_annotation(
             page_obj["/Annots"] = pdf.make_indirect(pikepdf.Array(annots_list))
         else:
             del page_obj["/Annots"]  # type: ignore[operator]
-        pdf.save(out)
+        _save_pdf(pdf, out)
 
 
 def move_annotation(
@@ -177,7 +177,7 @@ def move_annotation(
         if hasattr(target, "resolve"):
             target = target.resolve()
         target["/Rect"] = pikepdf.Array([float(v) for v in new_rect])
-        pdf.save(out)
+        _save_pdf(pdf, out)
 
 
 def add_annotation(
@@ -226,4 +226,4 @@ def add_annotation(
         if "/Annots" not in page_obj:
             page_obj["/Annots"] = pikepdf.Array([])
         page_obj["/Annots"].append(pdf.make_indirect(annot))
-        pdf.save(out)
+        _save_pdf(pdf, out)

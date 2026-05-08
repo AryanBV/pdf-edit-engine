@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 import pikepdf
 
@@ -170,7 +171,7 @@ def open_pdf(
         raise PDFEditError(f"I/O error opening PDF: {exc}") from None
 
 
-def _save_pdf(pdf: pikepdf.Pdf, output_path: str | Path) -> None:
+def _save_pdf(pdf: pikepdf.Pdf, output_path: str | Path, **save_kwargs: Any) -> None:
     """Save a Pdf, translating pikepdf and filesystem errors to ``PDFEditError``.
 
     This is the **single canonical save entry point** for this package.
@@ -179,14 +180,18 @@ def _save_pdf(pdf: pikepdf.Pdf, output_path: str | Path) -> None:
     architectural violation that re-introduces F-C-01 (post-validate /
     pre-save TOCTOU exposing raw ``PermissionError``).
 
-    The signature mirrors ``open_pdf``'s narrow surface: positional
-    ``pdf`` and ``output_path`` only. Kwargs (linearize, encryption,
-    etc.) are intentionally not exposed here — callers needing them can
-    extend on a follow-up.
+    The signature mirrors ``open_pdf``'s narrow surface for the common
+    case (positional ``pdf`` and ``output_path``) and forwards any
+    additional keyword arguments to ``pikepdf.Pdf.save`` so callers
+    that genuinely need ``encryption=``, ``linearize=``, etc. retain
+    centralized exception translation.
 
     Args:
         pdf: An open ``pikepdf.Pdf`` to serialize.
         output_path: Filesystem path where the PDF will be written.
+        **save_kwargs: Forwarded verbatim to ``pikepdf.Pdf.save``.
+            Reserve for cases (encryption, linearize) where the
+            underlying API requires them; the common path passes none.
 
     Raises:
         PDFEditError: For any save-time failure — permission denied,
@@ -194,7 +199,7 @@ def _save_pdf(pdf: pikepdf.Pdf, output_path: str | Path) -> None:
             disk full, sharing violation, pikepdf serialization failure.
     """
     try:
-        pdf.save(str(output_path))
+        pdf.save(str(output_path), **save_kwargs)
     except pikepdf.PdfError as exc:
         logger.error("pdf.save: pikepdf.PdfError: %s", exc)
         raise PDFEditError(f"Cannot save PDF: {type(exc).__name__}") from None
