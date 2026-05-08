@@ -160,9 +160,18 @@ def _assert_match_addressable(
     try:
         decoded = resolver.decode(raw[bp : bp + bw])
     except KeyError as exc:
+        # F-C-03 / INV-W0-9: drop {exc} (the missing CID bytes) from the
+        # user-visible message; type name is stable across encoding
+        # variants and the full forensic detail lives in the log below.
+        logger.error(
+            "stale TextMatch decode failure at op %d byte %d",
+            op_idx,
+            bp,
+            exc_info=True,
+        )
         raise OperatorError(
             f"Stale TextMatch: bytes at op {op_idx} byte {bp} cannot be "
-            f"decoded by the current font ({exc}). Re-run find()."
+            f"decoded by the current font ({type(exc).__name__}). Re-run find()."
         ) from exc
     if decoded != first.unicode_char:
         raise OperatorError(
@@ -1175,8 +1184,9 @@ def replace(
 
         # v0.1.3 Phase 6: track if reflow was attempted but threw, so we can
         # surface reflow_aborted_to_simple on the simple-replacement result.
+        # F-C-03 / INV-W0-9 (commit 07): the companion ``reflow_abort_msg``
+        # local was deleted with the str(exc)[:80] truncation it carried.
         reflow_abort_reason: str | None = None
-        reflow_abort_msg: str = ""
         # Check if reflow is needed: replacement wider than original
         if reflow:
             try:
@@ -1239,8 +1249,12 @@ def replace(
                     )
                     # v0.1.3 Phase 6: capture the abort reason; surface it on the
                     # simple-replacement EditResult below as reflow_aborted_to_simple.
+                    # F-C-03 / INV-W0-9: drop the str(exc)[:80] truncation — it
+                    # was a length cap mitigating the same exception-bytes leak
+                    # we now close at source. The bare type name is the stable
+                    # user-visible signal; full traceback is in the logger.warning
+                    # above.
                     reflow_abort_reason = type(exc).__name__
-                    reflow_abort_msg = str(exc)[:80] if str(exc) else ""
 
         # ops already parsed above for the addressability check; reuse it.
         result, _ = _apply_single_replacement(
@@ -1259,16 +1273,13 @@ def replace(
         # and threw, before the simple-replacement fallback ran. The
         # Degradation is added to the simple-replacement result's
         # FidelityReport so callers see why complex reflow was skipped.
+        # F-C-03 / INV-W0-9: detail is just the exception type name; the
+        # str(exc)[:80] suffix is gone (forensic detail in logger.warning).
         if reflow_abort_reason is not None:
-            detail = (
-                f"{reflow_abort_reason}: {reflow_abort_msg}"
-                if reflow_abort_msg
-                else reflow_abort_reason
-            )
             result.fidelity_report.degradations.append(
                 Degradation(
                     kind="reflow_aborted_to_simple",
-                    detail=detail,
+                    detail=reflow_abort_reason,
                     severity="warning",
                 )
             )

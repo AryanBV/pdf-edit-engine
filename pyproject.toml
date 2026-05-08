@@ -76,6 +76,25 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "TCH"]
 # BLE001 — broad except in defensive try-blocks that just skip the test.
 "tests/**/*.py" = ["SLF001", "PLR2004", "BLE001"]
 
+# F-C-03 / INV-W0-9 — exception-bytes hygiene (no native ruff rule).
+# User-visible sinks (raise messages, EditResult.warnings entries,
+# Degradation.detail) MUST NOT interpolate ``{exc}`` or ``str(exc)`` —
+# pikepdf / fontTools / OS exception bodies can carry attacker-controlled
+# bytes (file paths, struct offsets, partial PDF object snippets) and
+# leaking them is a passive information-disclosure vector. The convention
+# is ``f"...{type(exc).__name__}"`` for the user-visible string and a
+# ``logger.error("...", exc_info=True)`` BEFORE the raise/warn so the
+# forensic traceback survives in logs. Forensic ``logger.error/.warning/
+# .debug/.info`` calls themselves are exempt.
+#
+# Ruff has no native lint for "f-string interpolates a specific identifier"
+# without a custom plugin, and adding a plugin is out of scope. Enforcement
+# lives in ``tests/invariants/test_w0_9_no_exc_bytes_in_user_text.py`` —
+# an AST probe that walks every ``.py`` under ``src/pdf_edit_engine/`` and
+# fails on any user-visible sink that interpolates ``exc``. New code paths
+# triggering the probe must either (a) replace ``{exc}`` with
+# ``{type(exc).__name__}`` or (b) demote the sink to ``logger.*``.
+
 [tool.mypy]
 strict = true
 packages = ["pdf_edit_engine"]

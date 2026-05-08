@@ -1719,7 +1719,16 @@ def insert_text_block(
                 resolver_cache.evict(page_obj, clean_name)
                 resolver = resolver_cache.get_resolver(page_obj, clean_name)
             except _FONT_EXTEND_FAIL_EXCS as exc:
-                logger.warning("Font extension failed for insert", exc_info=True)
+                # F-C-03 / INV-W0-9: drop {exc} from the user-visible
+                # warnings list and Degradation.detail; the type name is
+                # the stable signal across upstream version drift, and the
+                # full traceback survives in this logger.warning.
+                logger.warning(
+                    "Font extension failed for insert (clean_name=%s missing=%r)",
+                    clean_name,
+                    missing,
+                    exc_info=True,
+                )
                 # CRIT-1 expansion: failure path also surfaces a typed
                 # Degradation. Pre-fix this branch returned an EditResult
                 # without fidelity_report, so the default-factory
@@ -1731,7 +1740,8 @@ def insert_text_block(
                     new_text=text,
                     font_action="failed",
                     warnings=[
-                        f"Font extension failed for '{clean_name}' (missing: {missing!r}): {exc}"
+                        f"Font extension failed for '{clean_name}' "
+                        f"(missing: {missing!r}): {type(exc).__name__}"
                     ],
                     fidelity_report=FidelityReport(
                         font_substituted=None,

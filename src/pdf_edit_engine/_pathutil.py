@@ -157,7 +157,10 @@ def open_pdf(
     except pikepdf.PasswordError:
         raise PDFEditError("PDF is password-protected") from None
     except pikepdf.PdfError as exc:
-        raise PDFEditError(f"Cannot open PDF: {exc}") from None
+        # F-C-03 / INV-W0-9: forensic detail to logs only; user-visible
+        # text is the exception type name (no attacker-controlled bytes).
+        logger.error("pikepdf.Pdf.open: pikepdf.PdfError", exc_info=True)
+        raise PDFEditError(f"Cannot open PDF: {type(exc).__name__}") from None
     except FileNotFoundError:
         raise PDFEditError(f"PDF file not found: {Path(path).name}") from None
     except IsADirectoryError:
@@ -168,7 +171,9 @@ def open_pdf(
         # Catches network-FS, EBADF, ENOSPC, EIO, sharing-violations, etc.
         # INV-L-1 says no raw OSError reaches a caller; the three subclasses
         # above are the common cases — this is the residual.
-        raise PDFEditError(f"I/O error opening PDF: {exc}") from None
+        # F-C-03 / INV-W0-9: forensic detail to logs only.
+        logger.error("pikepdf.Pdf.open: OSError", exc_info=True)
+        raise PDFEditError(f"I/O error opening PDF: {type(exc).__name__}") from None
 
 
 def _save_pdf(pdf: pikepdf.Pdf, output_path: str | Path, **save_kwargs: Any) -> None:
@@ -201,7 +206,11 @@ def _save_pdf(pdf: pikepdf.Pdf, output_path: str | Path, **save_kwargs: Any) -> 
     try:
         pdf.save(str(output_path), **save_kwargs)
     except pikepdf.PdfError as exc:
-        logger.error("pdf.save: pikepdf.PdfError: %s", exc)
+        # F-C-03 / INV-W0-9: %s of an exception object renders str(exc),
+        # which can leak attacker-controlled bytes. Use exc_info=True for
+        # forensic detail in logs and the bare type name for everything
+        # else.
+        logger.error("pdf.save: pikepdf.PdfError", exc_info=True)
         raise PDFEditError(f"Cannot save PDF: {type(exc).__name__}") from None
     except IsADirectoryError:
         logger.error("pdf.save: IsADirectoryError on %r", str(output_path))
@@ -210,5 +219,6 @@ def _save_pdf(pdf: pikepdf.Pdf, output_path: str | Path, **save_kwargs: Any) -> 
         logger.error("pdf.save: PermissionError on %r", str(output_path))
         raise PDFEditError(f"Permission denied saving PDF: {Path(output_path).name}") from None
     except OSError as exc:
-        logger.error("pdf.save: OSError: %s: %s", type(exc).__name__, exc)
+        # F-C-03 / INV-W0-9: same rationale as the PdfError branch.
+        logger.error("pdf.save: OSError", exc_info=True)
         raise PDFEditError(f"I/O error saving PDF: {type(exc).__name__}") from None

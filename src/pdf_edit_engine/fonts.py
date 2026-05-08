@@ -1334,7 +1334,11 @@ def _extend_simple_widths(
         fc = int(fc_obj)
         lc = int(lc_obj)
     except (TypeError, ValueError) as exc:
-        raise FontNotFoundError(f"malformed /FirstChar or /LastChar: {exc}") from exc
+        # F-C-03 / INV-W0-9: drop {exc} (attacker-controlled bytes from a
+        # malformed PDF) from the user-visible message. Forensic detail
+        # survives in the logger.error.
+        logger.error("malformed /FirstChar or /LastChar in simple-font", exc_info=True)
+        raise FontNotFoundError(f"malformed /FirstChar or /LastChar: {type(exc).__name__}") from exc
     del lc  # only used to satisfy the M.5 guard's int() conversion check.
 
     raw_widths: list[object] = []

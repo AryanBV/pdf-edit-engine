@@ -564,7 +564,13 @@ def _build_index(
     try:
         elements = interpreter.interpret()
     except (UnicodeDecodeError, ValueError, TypeError, KeyError) as exc:
-        raise OperatorError(f"Failed to parse content stream on page {page_number}: {exc}") from exc
+        # F-C-03 / INV-W0-9: drop {exc} from the user-visible message — a
+        # malformed content stream can carry attacker-controlled bytes.
+        # Forensic traceback is captured by the logger.error below.
+        logger.error("content-stream interpret failed on page %d", page_number, exc_info=True)
+        raise OperatorError(
+            f"Failed to parse content stream on page {page_number}: {type(exc).__name__}"
+        ) from exc
 
     if pdf_path is not None:
         _cached_elements[page_number] = elements
