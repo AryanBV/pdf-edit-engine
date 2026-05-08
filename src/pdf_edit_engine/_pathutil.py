@@ -11,12 +11,15 @@ violation of architectural intent.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 import pikepdf
 
 from pdf_edit_engine.errors import PDFEditError
+
+logger = logging.getLogger(__name__)
 
 
 def _path_traverses_link(path: str) -> bool:
@@ -72,7 +75,10 @@ def validate_output_path(path: str) -> None:
         raise PDFEditError(
             f"Output path traverses a symlink or junction (refused for safety): {path}"
         )
-    p = Path(path).resolve()
+    try:
+        p = Path(path).resolve()
+    except (OSError, ValueError) as exc:
+        raise PDFEditError(f"Invalid output path: {type(exc).__name__}") from exc
     if p.is_dir():
         raise PDFEditError(f"Output path is an existing directory: {path}")
     if not p.parent.exists():
@@ -95,7 +101,10 @@ def validate_output_dir(path: str) -> None:
         raise PDFEditError(
             f"Output directory traverses a symlink or junction (refused for safety): {path}"
         )
-    p = Path(path).resolve()
+    try:
+        p = Path(path).resolve()
+    except (OSError, ValueError) as exc:
+        raise PDFEditError(f"Invalid output directory: {type(exc).__name__}") from exc
     if p.is_file():
         raise PDFEditError(f"Output directory path is an existing file: {path}")
 
@@ -159,3 +168,42 @@ def open_pdf(
         # INV-L-1 says no raw OSError reaches a caller; the three subclasses
         # above are the common cases — this is the residual.
         raise PDFEditError(f"I/O error opening PDF: {exc}") from None
+
+
+def _save_pdf(pdf: pikepdf.Pdf, output_path: str | Path) -> None:
+    """Save a Pdf, translating pikepdf and filesystem errors to ``PDFEditError``.
+
+    This is the **single canonical save entry point** for this package.
+    Every internal site that calls ``pdf.save(...)`` must route through
+    this helper; raw ``pdf.save`` outside ``_pathutil`` is an
+    architectural violation that re-introduces F-C-01 (post-validate /
+    pre-save TOCTOU exposing raw ``PermissionError``).
+
+    The signature mirrors ``open_pdf``'s narrow surface: positional
+    ``pdf`` and ``output_path`` only. Kwargs (linearize, encryption,
+    etc.) are intentionally not exposed here — callers needing them can
+    extend on a follow-up.
+
+    Args:
+        pdf: An open ``pikepdf.Pdf`` to serialize.
+        output_path: Filesystem path where the PDF will be written.
+
+    Raises:
+        PDFEditError: For any save-time failure — permission denied,
+            target is a directory, target's parent vanished mid-flight,
+            disk full, sharing violation, pikepdf serialization failure.
+    """
+    try:
+        pdf.save(str(output_path))
+    except pikepdf.PdfError as exc:
+        logger.error("pdf.save: pikepdf.PdfError: %s", exc)
+        raise PDFEditError(f"Cannot save PDF: {type(exc).__name__}") from None
+    except IsADirectoryError:
+        logger.error("pdf.save: IsADirectoryError on %r", str(output_path))
+        raise PDFEditError("Save target is an existing directory") from None
+    except PermissionError:
+        logger.error("pdf.save: PermissionError on %r", str(output_path))
+        raise PDFEditError(f"Permission denied saving PDF: {Path(output_path).name}") from None
+    except OSError as exc:
+        logger.error("pdf.save: OSError: %s: %s", type(exc).__name__, exc)
+        raise PDFEditError(f"I/O error saving PDF: {type(exc).__name__}") from None

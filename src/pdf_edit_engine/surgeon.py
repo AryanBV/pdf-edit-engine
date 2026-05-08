@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 import pikepdf
 
-from pdf_edit_engine._pathutil import open_pdf, validate_output_path
+from pdf_edit_engine._pathutil import _save_pdf, open_pdf, validate_output_path
 from pdf_edit_engine.encoding import FontResolver, FontResolverCache
 from pdf_edit_engine.errors import (
     EncodingError,
@@ -1229,7 +1229,7 @@ def replace(
                             resolver_cache,
                         )
                         if result.success and not dry_run:
-                            pdf.save(output_path)
+                            _save_pdf(pdf, output_path)
                         _invalidate_locator_cache()
                         return result
                 except (ReflowError, OperatorError, EncodingError, KeyError, ValueError) as exc:
@@ -1276,7 +1276,7 @@ def replace(
         if result.success and not dry_run:
             new_stream = pikepdf.unparse_content_stream(ops)
             page.Contents = pdf.make_stream(new_stream)
-            pdf.save(output_path)
+            _save_pdf(pdf, output_path)
 
         # Invalidate locator cache since PDF content changed
         _invalidate_locator_cache()
@@ -1456,7 +1456,7 @@ def replace_all(
             results.extend(page_results)
 
         if any_success and not dry_run:
-            pdf.save(output_path)
+            _save_pdf(pdf, output_path)
 
         _invalidate_locator_cache()
         return results
@@ -1588,7 +1588,7 @@ def batch_replace(
                 page.Contents = pdf.make_stream(new_stream)
 
         if any_success and not dry_run:
-            pdf.save(output_path)
+            _save_pdf(pdf, output_path)
 
         _invalidate_locator_cache()
 
