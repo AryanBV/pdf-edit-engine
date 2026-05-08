@@ -128,7 +128,10 @@ def test_output_opens_valid(entry: dict[str, object], tmp_path: Path) -> None:
     output = str(tmp_path / "valid.pdf")
     result = _try_replace(pdf_path, expected, "X" * len(expected), output)
     if not result.success:
-        pytest.skip(f"replace did not succeed: {result.font_action}")
+        # Imperative pytest.xfail is implicitly non-strict (xpass leaves
+        # the test xfailed, never xpass-fails); the locked "xfail(strict=False)
+        # shape" maps onto this call when the precondition is dynamic (m-7).
+        pytest.xfail(reason=f"replace did not succeed: {result.font_action}")
     with pikepdf.open(output) as pdf:
         assert len(pdf.pages) > 0
 
@@ -145,7 +148,8 @@ def test_replacement_text_in_output(
     output = str(tmp_path / "check_text.pdf")
     result = _try_replace(pdf_path, expected, replacement, output)
     if not result.success:
-        pytest.skip(f"replace did not succeed: {result.font_action}")
+        # Imperative pytest.xfail is implicitly non-strict (m-7).
+        pytest.xfail(reason=f"replace did not succeed: {result.font_action}")
     out_text = get_text(output)
     # Allow minor length variation from TJ fragment boundaries
     z_run = "Z" * max(len(expected) - 2, 3)

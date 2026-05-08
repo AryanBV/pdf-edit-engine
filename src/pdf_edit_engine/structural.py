@@ -861,7 +861,7 @@ def _extend_font(
     can, missing = r.can_encode(text)
     if can:
         return True
-    # v0.1.3 Phase 13: simple (non-CID) fonts now extend via _extend_simple_tier_15
+    # v0.1.3 Phase 13: simple (non-CID) fonts now extend via _extend_simple_tier_one_five
     # in fonts.extend_subset()'s subtype dispatcher. Falls through unconditionally;
     # the dispatcher itself rejects unsupported subtypes (Type1, /FontFile3) with
     # FontNotFoundError, which the _FONT_EXTEND_FAIL_EXCS catch below converts to

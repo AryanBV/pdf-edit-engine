@@ -31,7 +31,7 @@ from pdf_edit_engine.fonts import (
     _allocate_free_bytes,
     _collect_component_names,
     _extend_simple_encoding,
-    _extend_simple_tier_15,
+    _extend_simple_tier_one_five,
     _extend_simple_widths,
     _glyph_name_for_codepoint,
     extend_subset,
@@ -334,7 +334,7 @@ def test_extend_subset_rejects_truetype_with_fontfile3() -> None:
     Mirrors the dispatcher's defensive rejection — a /Subtype=/TrueType
     font dict that carries /FontFile3 (CFF/OpenType outlines) cannot be
     extended because Tier 1.5 requires a /FontFile2 glyf table. The
-    dispatcher rejects before reaching `_extend_simple_tier_15`.
+    dispatcher rejects before reaching `_extend_simple_tier_one_five`.
     """
     pdf = pikepdf.Pdf.new()
     page_dict = pikepdf.Dictionary(
@@ -365,13 +365,13 @@ def test_extend_subset_rejects_truetype_with_fontfile3() -> None:
 
 
 def test_simple_tier_15_raises_on_missing_fontfile2() -> None:
-    """Probe 8 (M.6): _extend_simple_tier_15 raises when /FontFile2 absent."""
+    """Probe 8 (M.6): _extend_simple_tier_one_five raises when /FontFile2 absent."""
     pdf = pikepdf.Pdf.new()
     font_dict = _make_simple_font_dict(pdf, with_fontfile2=False)
     fd = font_dict["/FontDescriptor"]
 
     with pytest.raises(FontNotFoundError, match="/FontFile2"):
-        _extend_simple_tier_15(pdf, font_dict, fd, additional_chars="ø")
+        _extend_simple_tier_one_five(pdf, font_dict, fd, additional_chars="ø")
 
 
 @_no_ttf_simple
@@ -403,7 +403,7 @@ def test_simple_tier_15_raises_on_missing_system_font_no_fallback(tmp_path: Path
     font_dict["/BaseFont"] = pikepdf.Name("/NoSuchFontXyzzy12345")
 
     with pytest.raises(FontNotFoundError):
-        _extend_simple_tier_15(pdf, font_dict, fd, additional_chars="ø", full_font_path=None)
+        _extend_simple_tier_one_five(pdf, font_dict, fd, additional_chars="ø", full_font_path=None)
 
 
 def test_extend_simple_widths_gap_fills_skipped_byte() -> None:

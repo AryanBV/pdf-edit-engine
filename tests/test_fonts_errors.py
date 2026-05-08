@@ -108,7 +108,7 @@ def test_extend_subset_type1_raises(tmp_path: Path) -> None:
 
     Phase 13.1.1 replaced the v0.1.2 ``subtype != "/Type0"`` gate with a
     subtype-aware switch: /Type0 takes the existing CID path, /TrueType
-    is now ROUTED to ``_extend_simple_tier_15`` (the entire point of
+    is now ROUTED to ``_extend_simple_tier_one_five`` (the entire point of
     Phase 13), and /Type1 is explicitly rejected because Adobe Type1
     charstring surgery is out of scope for v0.1.3. This test pins the
     /Type1-rejection branch; the /Type0 path keeps its own coverage at

@@ -71,7 +71,7 @@ def _with_fonttools_translation(context: str) -> Iterator[None]:
 
     Args:
         context: Short identifier of the call site (e.g.
-            ``"_extend_simple_tier_15:/F1"``) — included in the log line
+            ``"_extend_simple_tier_one_five:/F1"``) — included in the log line
             to localise failures.
 
     Raises:
@@ -118,7 +118,7 @@ def font_has_codepoint(
     populate site (FontResolverCache._make_resolver, which copied the
     indirect font_obj into a direct ``pikepdf.Dictionary`` with
     objgen=(0,0)) never matched the eviction sites in
-    ``_extend_tier2`` / ``_extend_simple_tier_15`` (which had the
+    ``_extend_tier2`` / ``_extend_simple_tier_one_five`` (which had the
     real objgen). Phase 13.4 probes surfaced both issues. The cache
     has been functionally a no-op since pikepdf 10.5.1 (cf. ARY-349
     diagnosis), so deleting it has zero observable performance
@@ -163,7 +163,11 @@ def font_has_codepoint(
                 covered: set[int] = {cp for cp, gname in best_cmap.items() if gname in glyph_order}
             finally:
                 tt.close()
-    except Exception:  # noqa: BLE001 — best-effort, downstream still works
+    except (TTLibError, OSError):
+        # Narrowed catch (m-11): fontTools parse failures and IO errors
+        # only. Best-effort True so can_encode does not regress; downstream
+        # extension path will still raise FontNotFoundError if the font
+        # turns out to be uninjectable.
         logger.debug("font_has_codepoint: TTFont parse failed", exc_info=True)
         return True
 
@@ -819,7 +823,7 @@ def extend_subset(
                 f"got /FontFile3 (CFF/OpenType) or /FontFile (Type1) for {font_name}"
             )
             raise FontNotFoundError(msg)
-        return _extend_simple_tier_15(
+        return _extend_simple_tier_one_five(
             pdf,
             font_dict,
             fd,
@@ -1109,7 +1113,7 @@ def _extend_tier2(
 # ── Simple-font (non-CID) Tier 1.5 path ──────────────────────────────────
 
 
-def _extend_simple_tier_15(
+def _extend_simple_tier_one_five(
     pdf: pikepdf.Pdf,
     font_dict: pikepdf.Object,
     fd: pikepdf.Object,
@@ -1189,7 +1193,7 @@ def _extend_simple_tier_15(
     # Skeptic-A: TTFont(BytesIO(...)) defers parsing — getBestCmap /
     # getGlyphOrder / glyf-table accesses fire downstream. Wrap the
     # entire fontTools-using block, including embedded.save(buf).
-    with _with_fonttools_translation(f"_extend_simple_tier_15:{ps_name}"):
+    with _with_fonttools_translation(f"_extend_simple_tier_one_five:{ps_name}"):
         embedded = TTFont(io.BytesIO(ff2.read_bytes()))
         system = TTFont(system_path)
         try:
@@ -1252,7 +1256,7 @@ def _glyph_name_for_codepoint(cp: int) -> str:
 
     Returns the AGL name (e.g. ``"oslash"`` for U+00F8) when one exists;
     otherwise falls back to the canonical ``uniXXXX`` form. Used by
-    ``_extend_simple_tier_15`` to populate /Encoding /Differences with
+    ``_extend_simple_tier_one_five`` to populate /Encoding /Differences with
     PDF-spec-conformant glyph names.
     """
     from fontTools.agl import UV2AGL  # type: ignore[import-untyped]
@@ -1273,8 +1277,10 @@ def _glyph_width_from_hmtx(font: TTFont, glyph_name: str) -> float:
     if glyph_name not in metrics:
         raise FontNotFoundError(f"glyph {glyph_name!r} missing from embedded hmtx after injection")
     upem = font["head"].unitsPerEm
-    if upem == 0:
-        raise FontNotFoundError(f"unitsPerEm is 0 for glyph {glyph_name!r}; cannot normalize width")
+    if upem <= 0:
+        raise FontNotFoundError(
+            f"unitsPerEm must be > 0 for glyph {glyph_name!r}, got {upem}; cannot normalize width"
+        )
     raw = float(metrics[glyph_name][0])
     result: float = raw * 1000.0 / upem
     return result
@@ -1317,7 +1323,17 @@ def _allocate_free_bytes(used: set[int], n: int, *, last_char: int) -> list[int]
     Raises:
         FontNotFoundError: when no contiguous run of n free bytes
             exists in [last_char+1, 255].
+        ValueError: when ``n < 0`` or ``last_char`` is outside [-1, 255].
     """
+    # Defense-in-depth guards (m-1, m-2): unreachable under the current
+    # call graph (caller always passes n=len(additional_chars) ≥ 1 and a
+    # PDF-validated /LastChar), but cheap to enforce at the helper boundary.
+    if n == 0:
+        return []
+    if n < 0:
+        raise ValueError(f"n must be >= 0, got {n}")
+    if last_char < -1 or last_char > 255:
+        raise ValueError(f"last_char out of range [-1, 255]: {last_char}")
     free: list[int] = []
     for byte in range(last_char + 1, 256):
         if byte == 127:
@@ -1387,8 +1403,13 @@ def _extend_simple_widths(
 
     Raises:
         FontNotFoundError: /FirstChar or /LastChar missing or
-            non-integer (M.5 hardening per F.28 atlas).
+            non-integer (M.5 hardening per F.28 atlas), or any allocated
+            ``byte_slot`` < /FirstChar (m-5 defense-in-depth).
     """
+    # Defense-in-depth guard (m-4): unreachable under the current call
+    # graph (caller filters n>=1 in extend_subset), but cheap to enforce.
+    if not new_assignments:
+        return
     fc_obj = font_dict.get("/FirstChar")
     lc_obj = font_dict.get("/LastChar")
     if fc_obj is None or lc_obj is None:
@@ -1425,6 +1446,13 @@ def _extend_simple_widths(
         widths.append(0.0)
 
     for byte_slot, _glyph_name, width in sorted_assignments:
+        # Defense-in-depth guard (m-5): _allocate_free_bytes only emits
+        # bytes ≥ /LastChar + 1 ≥ /FirstChar, so this is unreachable under
+        # the current call graph; cheap to enforce at the indexing boundary.
+        if byte_slot < fc:
+            raise FontNotFoundError(
+                f"byte_slot {byte_slot} < /FirstChar {fc}; allocator/encoding inconsistency"
+            )
         widths[byte_slot - fc] = width
 
     font_dict["/Widths"] = pikepdf.Array(widths)

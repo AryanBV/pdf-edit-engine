@@ -15,7 +15,7 @@
 > sentences that drift from this updated empirical truth; the original
 > analysis is preserved for the reasoning-trail audit.
 >
-> Reference numbers (locked from preflight 4B):
+> Reference numbers (locked from preflight 4B) for /F1 (Calibri-Bold; hosts "Sarah Chen"):
 > - `glyf_total_slots = 6954`
 > - `real_glyph_names = 116`
 > - `placeholder_glyph0XXXX = 6838`

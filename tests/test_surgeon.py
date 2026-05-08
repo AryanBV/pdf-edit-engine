@@ -241,7 +241,7 @@ class TestEncodingFailure:
         v0.1.3 Phase 13 note: this test exercises the **non-CID
         extension's no-AGL-name failure path**. SIMPLE_PDF
         (`reportlab_simple.pdf`) is a /TrueType + /WinAnsiEncoding font
-        which Phase 13's dispatcher routes to `_extend_simple_tier_15`
+        which Phase 13's dispatcher routes to `_extend_simple_tier_one_five`
         rather than rejecting at the `is_cid_font` gate (now dropped).
         The replacement chars are CJK (U+4F60 \u4f60, U+597D \u597d),
         which `_glyph_name_for_codepoint` resolves to `uni4F60` and
