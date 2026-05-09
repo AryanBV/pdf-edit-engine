@@ -173,7 +173,7 @@ def _build_simple_winansi_pdf(
     ps_name = str(raw_ps)
     # M-12 note: full /BaseFont normalization to a synthetic name (Option B
     # in the Phase D plan) would let the fixture be platform-portable, but
-    # it would break ``_extend_simple_tier_15`` — the extender does its
+    # it would break ``_extend_simple_tier_one_five`` — the extender does its
     # system-font lookup by /BaseFont PostScript name, and a synthetic
     # name has no system font to source glyphs from. Eliminating the
     # system-font dependency entirely requires a vendored TTF stub

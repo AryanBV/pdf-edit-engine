@@ -69,7 +69,7 @@ DegradationKind = Literal[
     "font_coverage_extended",
     "font_coverage_substituted",
     # F-D-CC9 (v0.1.3): emitted by Tier 1.5 (`fonts._extend_tier2` /
-    # `fonts._extend_simple_tier_15`) when the resolved system font
+    # `fonts._extend_simple_tier_one_five`) when the resolved system font
     # came from a per-platform user-writable directory. Severity
     # ``"warning"``. NOT in FONT_AFFECTING_KINDS — origin surface
     # rather than a fidelity break (the font WAS found and used).
