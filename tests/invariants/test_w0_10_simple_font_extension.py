@@ -35,6 +35,20 @@ from tests._simple_font_fixture import (
     _no_ttf_simple,
 )
 
+
+def _build_word_style_fixture(out_path: Path) -> Path:
+    """Build a Word-style simple-font fixture (zero widths for non-body bytes).
+
+    Used by INV-W0-10.6/.7/.8 to exercise the heal-in-place path. Mirrors
+    Microsoft Word's PDF export behavior: codepoints whose glyph isn't in
+    the body subset get /Widths=0, even when the encoding map has a name
+    for them. This is the precondition for the Tier 1.5 K-class bug.
+    """
+    built = _build_simple_winansi_pdf(out_path, zero_unused_widths=True)
+    if not built:
+        pytest.skip("no TrueType font available for Word-style fixture")
+    return out_path
+
 CORPUS = Path(__file__).parent.parent / "corpus"
 SIMPLE_WINANSI_PDF = CORPUS / "simple_winansi_subset.pdf"
 
@@ -219,6 +233,177 @@ def test_promote_encoding_name_to_dict() -> None:
     assert len(diffs) == 2
     assert int(diffs[0]) == 123
     assert diffs[1] == pikepdf.Name("/oslash")
+
+
+@_no_ttf_simple
+def test_extend_subset_heals_zero_width_standard_byte(tmp_path: Path) -> None:
+    """INV-W0-10.6: chars whose standard encoding byte is in [/FirstChar, /LastChar]
+    with zero pre-extension width must encode post-extension via the existing byte
+    (heal in place) rather than via a high-end /Differences entry.
+
+    Architectural root fix from 2026-05-09 Tier 1.5 K-class bug.
+
+    Symptom (pre-fix): when Word's PDF export reserves /Widths slots for unused
+    standard bytes with zero width, ``_extend_simple_tier_one_five`` allocates
+    a NEW high byte for the missing char and adds a /Differences override.
+    But ``encoding._build_reverse_map`` prefers the lowest byte, so the resolver
+    still picks the standard byte (whose width is still 0). Check 2 in
+    ``can_encode`` rejects it. Surgeon emits ``font_extension_failed``.
+
+    Universal contract: for ANY char whose standard encoding byte is in range
+    with zero pre-extension width, post-extension ``resolver.can_encode(ch)``
+    MUST return ``(True, [])``.
+    """
+    from pdf_edit_engine.encoding import FontResolver
+
+    work = _build_word_style_fixture(tmp_path / "k.pdf")
+
+    pdf = open_pdf(str(work))
+    try:
+        page = pdf.pages[0]
+        font_dict = page["/Resources"]["/Font"]["/F1"]
+        fc = int(font_dict["/FirstChar"])
+        lc = int(font_dict["/LastChar"])
+
+        # Fixture precondition: byte 75 ('K' standard WinAnsi) in /Widths range with zero width.
+        assert fc <= 75 <= lc, f"fixture must include byte 75 in /Widths range; got [{fc}, {lc}]"
+        pre_widths = list(font_dict["/Widths"])
+        assert float(pre_widths[75 - fc]) == 0.0, (
+            f"Word-style fixture must have zero width for byte 75; got {pre_widths[75 - fc]}"
+        )
+
+        # Pre-extension: K must be reported missing.
+        resolver = FontResolver(font_dict, font_name="F1")
+        can_enc_pre, missing_pre = resolver.can_encode("K")
+        assert not can_enc_pre, f"pre-extension: K should be missing; got missing={missing_pre}"
+
+        # Run the extension.
+        tier = extend_subset(pdf, page, "F1", "K")
+        assert tier == "full_extension"
+
+        # POST-EXTENSION CONTRACT: K must encode via SOME byte the resolver picks.
+        resolver_after = FontResolver(font_dict, font_name="F1")
+        can_enc_post, still_missing = resolver_after.can_encode("K")
+        assert can_enc_post, (
+            f"post-extension: can_encode('K') failed; still_missing={still_missing}. "
+            "Root: extension should heal /Widths[byte 75] in place rather than "
+            "allocating a new high byte that _build_reverse_map deprioritizes."
+        )
+
+        # Cleanliness: /Widths[byte 75] must be non-zero (heal in place).
+        post_widths = list(font_dict["/Widths"])
+        assert float(post_widths[75 - fc]) > 0.0, (
+            f"/Widths[byte 75] should be non-zero after heal; got {post_widths[75 - fc]}"
+        )
+
+        # No redundant /Differences entry for /K (the heal makes it unnecessary).
+        enc = font_dict.get("/Encoding")
+        if isinstance(enc, pikepdf.Dictionary) and enc.get("/Differences"):
+            diffs = list(enc["/Differences"])  # type: ignore[arg-type]
+            for item in diffs:
+                assert str(item) != "/K", (
+                    f"/Differences should NOT contain /K (use existing byte 75); got {diffs}"
+                )
+    finally:
+        pdf.close()
+
+
+@_no_ttf_simple
+def test_extend_subset_universal_mixed_groups(tmp_path: Path) -> None:
+    """INV-W0-10.7: extend_subset handles BOTH heal-in-place AND new-byte chars
+    in a single call. Universal contract — the partition logic must work
+    correctly when the same call has chars in both categories.
+
+    Group A (heal in place): chars whose standard byte is in [/FirstChar, /LastChar]
+    with zero width. Examples on the Hello-World fixture (range [32, 114]):
+    'K' (0x4B=75), 'M' (0x4D=77).
+
+    Group B (allocate new byte): chars whose standard byte is OUT of range.
+    Examples: 'ö' (0xF6=246), 'ø' (0xF8=248).
+
+    All chars across both groups must be encodable post-extension.
+    """
+    from pdf_edit_engine.encoding import FontResolver
+
+    work = _build_word_style_fixture(tmp_path / "mix.pdf")
+
+    pdf = open_pdf(str(work))
+    try:
+        page = pdf.pages[0]
+        font_dict = page["/Resources"]["/Font"]["/F1"]
+
+        # Mix: K (group A), M (group A), ö (group B)
+        chars = "KMö"
+        tier = extend_subset(pdf, page, "F1", chars)
+        assert tier == "full_extension"
+
+        resolver = FontResolver(font_dict, font_name="F1")
+        for ch in chars:
+            can_enc, missing = resolver.can_encode(ch)
+            assert can_enc, (
+                f"post-extension: can_encode({ch!r}) failed; missing={missing}. "
+                "Universal contract violated — partition logic must serve both groups."
+            )
+
+        # Group A bytes (75, 77) must have non-zero width post-extension.
+        fc = int(font_dict["/FirstChar"])
+        post_widths = list(font_dict["/Widths"])
+        for std_byte in (75, 77):
+            assert float(post_widths[std_byte - fc]) > 0.0, (
+                f"/Widths[byte {std_byte}] should be healed (non-zero); "
+                f"got {post_widths[std_byte - fc]}"
+            )
+
+        # Group B byte for ö must exist either via /Differences override OR
+        # via the standard WinAnsi byte 0xF6=246 (now extended into range).
+        # Either way, can_encode passed for ö above — that's the operative check.
+
+        # Group A glyph names (K, M) must NOT appear in /Differences (cleanliness).
+        enc = font_dict.get("/Encoding")
+        if isinstance(enc, pikepdf.Dictionary) and enc.get("/Differences"):
+            diffs = [str(d) for d in list(enc["/Differences"])]  # type: ignore[arg-type]
+            for forbidden in ("/K", "/M"):
+                assert forbidden not in diffs, (
+                    f"/Differences must not contain {forbidden} (Group A chars heal in place); "
+                    f"got {diffs}"
+                )
+    finally:
+        pdf.close()
+
+
+@_no_ttf_simple
+def test_replace_succeeds_for_in_range_zero_width_char(tmp_path: Path) -> None:
+    """INV-W0-10.8: end-to-end smoke test — surgeon.replace must succeed when the
+    new text contains a char whose standard byte is in /Widths range with zero
+    pre-extension width. Pre-fix this surfaced as ``font_extension_failed``.
+
+    Confirms the architectural fix composes through surgeon.replace's flow:
+    can_encode (pre) → extend_subset → can_encode (post) → encode + write operator.
+    """
+    work = _build_word_style_fixture(tmp_path / "input.pdf")
+    out = tmp_path / "output.pdf"
+
+    matches = find(str(work), "World")
+    assert matches, "fixture must contain 'World'"
+    # Replace 'd' with 'K' — same length, single Group A char added.
+    result = replace(str(work), matches[0], "WorlK", str(out))
+
+    degr_summary = [(d.kind, d.severity, d.detail) for d in result.fidelity_report.degradations]
+    assert result.success, (
+        f"expected success post-fix; got success=False, degradations={degr_summary}, "
+        f"font_action={result.font_action!r}"
+    )
+    failed_kinds = [
+        d.kind
+        for d in result.fidelity_report.degradations
+        if d.kind == "font_extension_failed"
+    ]
+    assert not failed_kinds, (
+        f"expected NO font_extension_failed Degradation; got {degr_summary}"
+    )
+    assert result.font_action == "extended", (
+        f"expected font_action='extended'; got {result.font_action!r}"
+    )
 
 
 @_no_ttf_simple

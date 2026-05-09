@@ -1189,42 +1189,130 @@ def _extend_simple_tier_one_five(
             )
         )
 
-    # 3. Open both fonts (close in finally per existing pattern). Per
+    # 3. Partition `additional_chars` into two groups based on whether the
+    # char's standard encoding byte already exists in [/FirstChar, /LastChar]
+    # with zero pre-extension width — Word's "reserved-but-unused" pattern.
+    #
+    # Architectural root fix (2026-05-09 RCA): the prior unconditional
+    # new-byte allocation interacted badly with three independently-correct
+    # components — encoding._build_reverse_map's lowest-byte preference,
+    # Word's zero-width sentinel for unused codepoints, and high-byte
+    # /Differences allocation. The resolver picked the still-zero-width
+    # standard byte, can_encode reported the char missing, and surgeon
+    # emitted font_extension_failed on chars that ARE present in the system
+    # font (e.g. capital K when body text didn't use K). The fix partitions:
+    #
+    # Group A (heal in place) — char's standard byte ∈ [fc, lc] with
+    #   /Widths==0 and no conflicting pre-existing /Differences override.
+    #   Inject the glyph; update /Widths[byte] = new_width. No /Differences
+    #   entry; /Encoding stays as Name. The standard byte already maps to
+    #   the right glyph name via /BaseEncoding, so no encoding mutation.
+    #
+    # Group B (allocate new byte) — everything else. Existing path:
+    #   _allocate_free_bytes from /LastChar+1, _extend_simple_encoding,
+    #   _extend_simple_widths. /Encoding promoted to Dict; /LastChar bumped.
+    fc_obj = font_dict.get("/FirstChar")
+    lc_obj = font_dict.get("/LastChar")
+    fc: int | None = int(fc_obj) if fc_obj is not None else None
+    lc: int | None = int(lc_obj) if lc_obj is not None else None
+
+    effective_b2u = _build_simple_effective_byte_to_unicode(font_dict)
+    # Lowest-byte-wins reverse (mirrors encoding._build_reverse_map so the
+    # partition decision matches what the resolver will actually pick).
+    effective_u2b: dict[str, int] = {}
+    for code in sorted(effective_b2u):
+        char = effective_b2u[code]
+        if char not in effective_u2b:
+            effective_u2b[char] = code
+
+    # Pre-existing /Differences (byte → glyph_name) for conflict detection.
+    # If a byte has a pre-existing /Differences override, /BaseEncoding's
+    # mapping at that byte is shadowed — fall back to Group B for that char.
+    preexisting_diffs: set[int] = set()
+    enc_pre = font_dict.get("/Encoding")
+    if isinstance(enc_pre, pikepdf.Dictionary):
+        diffs_obj = enc_pre.get("/Differences")
+        if diffs_obj is not None:
+            cur = 0
+            for item in list(diffs_obj):  # type: ignore[call-overload]
+                s = str(item)
+                if not s.startswith("/"):
+                    cur = int(item)
+                else:
+                    preexisting_diffs.add(cur)
+                    cur += 1
+
+    raw_widths: list[object] = []
+    if "/Widths" in font_dict:
+        raw_widths = list(font_dict["/Widths"])  # type: ignore[call-overload]
+    widths_pre: list[float] = [float(w) for w in raw_widths]  # type: ignore[arg-type]
+
+    # Per-char categorization with dedup. Prior code passed
+    # additional_chars through `zip(..., free_bytes, strict=True)` without
+    # dedup — duplicates produced redundant /Differences entries (observed
+    # in the cities-variant repro: two "/odieresis" entries for "Köö").
+    # Dedup here defensively.
+    seen: set[str] = set()
+    group_a: list[tuple[str, int, str]] = []  # (ch, std_byte, glyph_name)
+    group_b: list[tuple[str, str]] = []  # (ch, glyph_name)
+    for ch in additional_chars:
+        if ch in seen:
+            continue
+        seen.add(ch)
+        glyph_name = _glyph_name_for_codepoint(ord(ch))
+        std_byte = effective_u2b.get(ch)
+        eligible_for_a = (
+            std_byte is not None
+            and fc is not None
+            and lc is not None
+            and fc <= std_byte <= lc
+            and 0 <= std_byte - fc < len(widths_pre)
+            and widths_pre[std_byte - fc] == 0.0
+            and std_byte not in preexisting_diffs
+        )
+        if eligible_for_a:
+            assert std_byte is not None  # narrowed by eligible_for_a guard
+            group_a.append((ch, std_byte, glyph_name))
+        else:
+            group_b.append((ch, glyph_name))
+
+    # 4. Allocate new bytes for Group B (existing path).
+    used_bytes = _used_bytes_in_encoding(font_dict)
+    last_char_for_alloc = lc if lc is not None else 0
+    free_bytes = (
+        _allocate_free_bytes(used_bytes, len(group_b), last_char=last_char_for_alloc)
+        if group_b
+        else []
+    )
+
+    # 5. Open both fonts (close in finally per existing pattern). Per
     # Skeptic-A: TTFont(BytesIO(...)) defers parsing — getBestCmap /
-    # getGlyphOrder / glyf-table accesses fire downstream. Wrap the
-    # entire fontTools-using block, including embedded.save(buf).
+    # getGlyphOrder / glyf-table accesses fire downstream. Wrap the entire
+    # fontTools-using block, including embedded.save(buf).
     with _with_fonttools_translation(f"_extend_simple_tier_one_five:{ps_name}"):
         embedded = TTFont(io.BytesIO(ff2.read_bytes()))
         system = TTFont(system_path)
         try:
-            # 4. Inject each missing glyph; collect (byte, glyph_name, width).
-            # Consecutive low-end allocation: bytes start at /LastChar + 1.
-            used_bytes = _used_bytes_in_encoding(font_dict)
-            last_char = int(font_dict.get("/LastChar") or 0)
-            free_bytes = _allocate_free_bytes(
-                used_bytes, len(additional_chars), last_char=last_char
-            )
-            new_assignments: list[tuple[int, str, float]] = []
-
-            for ch, byte_slot in zip(additional_chars, free_bytes, strict=True):
-                cp = ord(ch)
-                # Standard Adobe Glyph List name (e.g. ø → "oslash"); fall
-                # back to uniXXXX for codepoints AGL doesn't cover.
-                glyph_name = _glyph_name_for_codepoint(cp)
-                # Inject outline; reuses CID Tier 1.5 helper verbatim
+            # 6. Inject glyphs for both groups; collect (byte, glyph_name, width).
+            # _glyph_width_from_hmtx raises FontNotFoundError on missing
+            # glyph_name (indicates _inject_glyph_in_place partial-failed)
+            # or unitsPerEm == 0 (corrupt font metadata) — both surfaced as
+            # font_extension_failed via _FONT_EXTEND_FAIL_EXCS at the call
+            # site (M.4 hardening).
+            group_a_assignments: list[tuple[int, str, float]] = []
+            for ch, std_byte, glyph_name in group_a:
                 _inject_glyph_in_place(embedded, system, ch)
-                # Width from hmtx (after injection, so entry exists). Helper
-                # raises FontNotFoundError on missing glyph_name (would
-                # indicate _inject_glyph_in_place partial-failed) or
-                # unitsPerEm == 0 (corrupt font metadata) — both surfaced as
-                # font_extension_failed via _FONT_EXTEND_FAIL_EXCS at the
-                # call site (M.4 hardening).
                 width = _glyph_width_from_hmtx(embedded, glyph_name)
-                new_assignments.append((byte_slot, glyph_name, width))
+                group_a_assignments.append((std_byte, glyph_name, width))
 
-            # 5. Re-serialize embedded font, replace /FontFile2 stream.
-            # Mirrors _extend_tier2's pattern (fonts.py:955):
-            #     fd["/FontFile2"] = pdf.make_stream(buf.getvalue())
+            group_b_assignments: list[tuple[int, str, float]] = []
+            for (ch, glyph_name), byte_slot in zip(group_b, free_bytes, strict=True):
+                _inject_glyph_in_place(embedded, system, ch)
+                width = _glyph_width_from_hmtx(embedded, glyph_name)
+                group_b_assignments.append((byte_slot, glyph_name, width))
+
+            # 7. Re-serialize embedded font (one save for both groups).
+            # Mirrors _extend_tier2's pattern (fonts.py:955).
             # embedded.save() can raise during fontTools serialization —
             # must stay inside the translator block.
             buf = io.BytesIO()
@@ -1233,17 +1321,24 @@ def _extend_simple_tier_one_five(
 
             # No cache invalidation needed: _FONTFILE2_CACHE was deleted
             # (see font_has_codepoint docstring). font_has_codepoint
-            # re-parses /FontFile2 on every call, so the just-injected
-            # glyphs are observed without explicit eviction.
+            # re-parses /FontFile2 on every call, so just-injected glyphs
+            # are observed without explicit eviction.
 
-            # 6. PDF-side updates: /Encoding /Differences, /Widths, bounds.
-            _extend_simple_encoding(pdf, font_dict, new_assignments)
-            _extend_simple_widths(font_dict, new_assignments)
+            # 8. PDF-side updates per group.
+            #   Group A → heal in place (no /Differences mutation, no /LastChar bump)
+            #   Group B → existing _extend_simple_encoding + _extend_simple_widths
+            if group_a_assignments:
+                _heal_simple_widths(font_dict, group_a_assignments)
+            if group_b_assignments:
+                _extend_simple_encoding(pdf, font_dict, group_b_assignments)
+                _extend_simple_widths(font_dict, group_b_assignments)
 
             logger.info(
-                "Tier 1.5 (simple-font) extension from %s: %d character(s) added",
+                "Tier 1.5 (simple-font) extension from %s: %d heal + %d new = %d total",
                 system_path,
-                len(additional_chars),
+                len(group_a_assignments),
+                len(group_b_assignments),
+                len(group_a_assignments) + len(group_b_assignments),
             )
             return "full_extension"
         finally:
@@ -1457,3 +1552,129 @@ def _extend_simple_widths(
 
     font_dict["/Widths"] = pikepdf.Array(widths)
     font_dict["/LastChar"] = new_max
+
+
+def _build_simple_effective_byte_to_unicode(font_dict: pikepdf.Object) -> dict[int, str]:
+    """Build the effective byte→unicode map from a simple font's /Encoding.
+
+    Mirrors ``encoding.FontResolver._init_winAnsi`` / ``_init_macRoman`` /
+    ``_init_custom`` for simple (non-CID) fonts. Used by
+    ``_extend_simple_tier_one_five``'s partition logic to identify chars
+    whose standard encoding byte can be HEALED in place rather than
+    allocated a new high byte and added to /Differences.
+
+    Encoding resolution (matches FontResolver):
+    - ``/Encoding = /WinAnsiEncoding | /MacRomanEncoding`` (Name) → standard table
+    - ``/Encoding = Dict { /BaseEncoding ..., /Differences [...] }`` → table
+      with /Differences overrides applied
+    - Missing or unrecognized → default to /WinAnsiEncoding
+
+    Args:
+        font_dict: The simple-font dictionary (read-only — no mutation).
+
+    Returns:
+        ``dict[byte, unicode_char]`` reflecting the font's effective byte→char
+        mapping per its current /Encoding state. Caller is expected to
+        reverse-map (preferring lowest byte) for char→byte lookups, mirroring
+        ``encoding._build_reverse_map``.
+    """
+    # Lazy imports keep the encoding boundary intact at module-load time
+    # (CLAUDE.md dependency-boundary table: encoding may not import fonts;
+    # fonts may lazy-import encoding helpers, mirroring ``font_has_codepoint``).
+    from pdfminer.encodingdb import EncodingDB
+
+    from pdf_edit_engine.encoding import _glyph_name_to_unicode
+
+    enc = font_dict.get("/Encoding")
+
+    if isinstance(enc, pikepdf.Dictionary):
+        base_obj = enc.get("/BaseEncoding")
+        base_name = str(base_obj) if base_obj is not None else "/WinAnsiEncoding"
+    elif enc is not None:
+        base_name = str(enc)
+    else:
+        base_name = "/WinAnsiEncoding"
+
+    if base_name == "/MacRomanEncoding":
+        base_table: dict[int, str] = dict(EncodingDB.mac2unicode)
+    else:
+        # /WinAnsiEncoding is the universal fallback (matches FontResolver).
+        base_table = dict(EncodingDB.win2unicode)
+
+    # Apply /Differences overrides when /Encoding is a Dict.
+    if isinstance(enc, pikepdf.Dictionary):
+        diffs_obj = enc.get("/Differences")
+        if diffs_obj is not None:
+            cur = 0
+            for item in list(diffs_obj):  # type: ignore[call-overload]
+                s = str(item)
+                if not s.startswith("/"):
+                    cur = int(item)
+                else:
+                    glyph_name = s.lstrip("/")
+                    unicode_char = _glyph_name_to_unicode(glyph_name)
+                    if unicode_char is not None:
+                        base_table[cur] = unicode_char
+                    cur += 1
+
+    return base_table
+
+
+def _heal_simple_widths(
+    font_dict: pikepdf.Object,
+    healed: list[tuple[int, str, float]],
+) -> None:
+    """Update existing /Widths entries for chars healed in place.
+
+    Distinct from ``_extend_simple_widths``: this helper updates an entry
+    that already exists in /Widths (zero-width sentinel from Word's PDF
+    export), without bumping /LastChar or appending new slots. Used for
+    Group A chars in ``_extend_simple_tier_one_five``'s partition logic
+    (architectural fix from 2026-05-09 Tier 1.5 K-class bug RCA).
+
+    Args:
+        font_dict: The simple-font dict (mutated in place).
+        healed: List of ``(byte_slot, glyph_name, width)`` tuples.
+            ``glyph_name`` is unused here but retained for API symmetry
+            with ``_extend_simple_widths``; the byte's mapping to the
+            glyph already comes from /BaseEncoding standardly, no
+            /Differences entry is needed.
+
+    Raises:
+        FontNotFoundError: /FirstChar missing or non-integer; or any
+            ``byte_slot`` is outside the existing /Widths array bounds.
+    """
+    if not healed:
+        return
+    fc_obj = font_dict.get("/FirstChar")
+    if fc_obj is None:
+        raise FontNotFoundError(
+            f"simple-font heal requires /FirstChar; got {fc_obj!r}"
+        )
+    try:
+        fc = int(fc_obj)
+    except (TypeError, ValueError) as exc:
+        # F-C-03 / INV-W0-9: forensic detail in logger; user-visible
+        # message drops {exc} (attacker-controlled bytes).
+        logger.error("malformed /FirstChar in simple-font heal", exc_info=True)
+        raise FontNotFoundError(f"malformed /FirstChar: {type(exc).__name__}") from exc
+
+    raw_widths: list[object] = []
+    if "/Widths" in font_dict:
+        raw_widths = list(font_dict["/Widths"])  # type: ignore[call-overload]
+    widths: list[float] = [float(w) for w in raw_widths]  # type: ignore[arg-type]
+
+    for byte_slot, _glyph_name, width in healed:
+        idx = byte_slot - fc
+        # Defense-in-depth (m-6): caller (partition logic) only emits
+        # byte_slots in [/FirstChar, /LastChar] with existing /Widths
+        # entries — but enforce at the indexing boundary.
+        if not (0 <= idx < len(widths)):
+            raise FontNotFoundError(
+                f"heal byte_slot {byte_slot} out of /Widths range "
+                f"[{fc}, {fc + len(widths) - 1}]; partition logic inconsistency"
+            )
+        widths[idx] = width
+
+    font_dict["/Widths"] = pikepdf.Array(widths)
+    # /LastChar is intentionally NOT touched — heal stays within existing range.

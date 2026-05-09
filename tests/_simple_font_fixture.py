@@ -47,6 +47,7 @@ def _build_simple_winansi_pdf(
     *,
     body_text: str = "Hello World",
     font_size: float = 12.0,
+    zero_unused_widths: bool = False,
 ) -> bool:
     """Construct a deterministic /TrueType + /WinAnsiEncoding + /FontFile2 PDF.
 
@@ -66,6 +67,13 @@ def _build_simple_winansi_pdf(
             Phase 13.4 tests can drive Tier 1.5 extension by replacing this
             text with accented Latin characters.
         font_size: Font size in points for the body line.
+        zero_unused_widths: When True, sets /Widths to 0 for codepoints in
+            [/FirstChar, /LastChar] NOT in ``body_text`` — mirroring Microsoft
+            Word's PDF export behavior. Default False preserves the original
+            fixture (full hmtx widths for the entire range), which is what
+            INV-W0-10.1 and 10.5 depend on. The Word-style mode (True) is
+            used by INV-W0-10.6/.7/.8 to exercise the heal-in-place path
+            (architectural fix from 2026-05-09 Tier 1.5 K-class bug RCA).
 
     Returns:
         True if the PDF was built, False if no TTF font is available.
@@ -132,8 +140,15 @@ def _build_simple_winansi_pdf(
     # Build /Widths covering [first_char, last_char]. Glyphs missing from the
     # body subset get a 0 width (legal for simple fonts; matches the Adobe
     # spec's "missing glyph" semantics).
+    body_codepoints: set[int] = set(body_cps) | {0x20}
     widths: list[int] = []
     for cp in range(first_char, last_char + 1):
+        if zero_unused_widths and cp not in body_codepoints:
+            # Word-style: codepoints not actually used in body text get
+            # zero width even when the encoding map has a name for them.
+            # Triggers the heal-in-place path in _extend_simple_tier_one_five.
+            widths.append(0)
+            continue
         gname = cp_map.get(cp)
         if gname:
             try:
