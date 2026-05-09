@@ -6,7 +6,7 @@ Windows directory junctions, mirroring ``_pathutil.validate_output_path``)
 and refuses entries whose real path escapes ``_font_directories()``.
 ``_find_font_with_origin`` returns ``(path, origin, substituted_name)``
 where ``origin`` is one of ``"system"``, ``"user"``,
-``"metric_equivalent"``. Tier 1.5 (``_extend_simple_tier_15`` /
+``"metric_equivalent"``. Tier 1.5 (``_extend_simple_tier_one_five`` /
 ``_extend_tier2``) emits
 ``Degradation(kind="font_substituted_from_user_fonts", severity="warning")``
 into the caller-supplied ``degradations`` list whenever ``origin == "user"``.
@@ -26,7 +26,7 @@ Two probes:
 
 2. **Extension probe** (cross-platform; monkeypatches
    ``_find_font_with_origin`` to return ``origin="user"``): asserts
-   ``_extend_simple_tier_15`` appends
+   ``_extend_simple_tier_one_five`` appends
    ``Degradation(kind="font_substituted_from_user_fonts")`` to the
    caller-supplied ``degradations`` list. Uses the same simple-font
    fixture as ``test_simple_extension.py``.
@@ -44,7 +44,7 @@ from fontTools.ttLib import TTFont
 
 import pdf_edit_engine.system_fonts as sf
 from pdf_edit_engine._pathutil import open_pdf
-from pdf_edit_engine.fonts import _extend_simple_tier_15
+from pdf_edit_engine.fonts import _extend_simple_tier_one_five
 from tests._simple_font_fixture import _find_ttf_for_simple_font, _no_ttf_simple
 
 if TYPE_CHECKING:
@@ -147,7 +147,7 @@ def test_inv_q_1_extension_emits_degradation_when_origin_is_user(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """``_extend_simple_tier_15`` appends
+    """``_extend_simple_tier_one_five`` appends
     ``Degradation(kind="font_substituted_from_user_fonts")`` to the
     caller-supplied ``degradations`` list when the resolved font has
     ``origin == "user"``.
@@ -186,7 +186,7 @@ def test_inv_q_1_extension_emits_degradation_when_origin_is_user(
         degradations: list[Degradation] = []
         # 'ø' is absent from the /WinAnsiEncoding subset → forces Tier 1.5.
         try:
-            _extend_simple_tier_15(
+            _extend_simple_tier_one_five(
                 pdf,
                 font_dict,
                 fd,

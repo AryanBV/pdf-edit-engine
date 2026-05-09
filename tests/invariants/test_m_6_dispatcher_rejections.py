@@ -1,18 +1,13 @@
-"""Invariant probes for the non-CID Tier 1.5 simple-font extension path.
+"""INV-M-6 — Module/dispatcher invariants for `extend_subset` rejections.
 
-Phase 13.4 (ARY-348). 12 probes split into:
+Seven probes covering dispatcher rejection failure modes (PLAN_AMENDMENTS
+M.6, lines 264-313): subtype refusals, /FontFile2/3 absence/presence,
+helper-level guards, and corrupt-/FontFile2 surfacing through
+`_FONT_EXTEND_FAIL_EXCS` as a `font_extension_failed` Degradation.
 
-- 5 plan-rev-5 probes (success canary, helper contracts, cache-collision
-  regression).
-- 7 M.6 probes from PLAN_AMENDMENTS lines 264-313 (dispatcher rejection
-  failure modes + helper-level guards + corrupt-/FontFile2 surfacing).
-
-The probes pin behaviour of helpers added in Phase 13.1 and the dispatcher
-branch added in Phase 13.2. Probe 5 (`test_double_extension_no_byte_collision`)
-is load-bearing on Phase 13.4's cache-deletion architecture; it tests
-``extend_subset`` end-to-end without the deprecated ``_FONTFILE2_CACHE``
-indirection (the module-global cache was removed in ARY-348; queries now
-re-parse ``/FontFile2`` directly).
+Relocated verbatim from `tests/test_simple_extension.py` per audit-charter
+`test_{layer}_{id}_*.py` convention. INV-M-6 minted as the next
+collision-free M-layer slot (INV-M-{1..5} taken).
 """
 
 from __future__ import annotations
@@ -22,15 +17,10 @@ from pathlib import Path
 
 import pikepdf
 import pytest
-from fontTools.ttLib import TTFont
 
 from pdf_edit_engine import replace
-from pdf_edit_engine._pathutil import open_pdf
 from pdf_edit_engine.errors import FontNotFoundError
 from pdf_edit_engine.fonts import (
-    _allocate_free_bytes,
-    _collect_component_names,
-    _extend_simple_encoding,
     _extend_simple_tier_one_five,
     _extend_simple_widths,
     _glyph_name_for_codepoint,
@@ -40,11 +30,10 @@ from pdf_edit_engine.locator import find
 from tests._identity_h_fixture import _build_identity_h_pdf, _no_ttf
 from tests._simple_font_fixture import (
     _build_simple_winansi_pdf,
-    _find_ttf_for_simple_font,
     _no_ttf_simple,
 )
 
-CORPUS = Path(__file__).parent / "corpus"
+CORPUS = Path(__file__).parent.parent / "corpus"
 SIMPLE_WINANSI_PDF = CORPUS / "simple_winansi_subset.pdf"
 CIDFONT_SYNTH_PDF = CORPUS / "cidfont_synthetic.pdf"
 
@@ -134,161 +123,12 @@ def _make_simple_font_dict(
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Plan rev 5 probes (5)
-# ──────────────────────────────────────────────────────────────────────────
-
-
-@_no_ttf_simple
-def test_simple_tier_15_success_via_synthetic_fixture(tmp_path: Path) -> None:
-    """Probe 1: end-to-end Tier 1.5 success on the simple-font fixture.
-
-    Replaces ASCII body text with accented Latin so the simple-font Tier
-    1.5 path runs in full: dispatcher → injection → /Encoding promotion
-    → /Widths bump → resolver eviction → second can_encode succeeds.
-    """
-    src = _ensure_simple_winansi_pdf()
-    work = tmp_path / "input.pdf"
-    shutil.copy(src, work)
-    out = tmp_path / "output.pdf"
-
-    matches = find(str(work), "World")
-    assert matches, "expected to find 'World' in fixture"
-    result = replace(str(work), matches[0], "Wörld", str(out))
-
-    degr_summary = [(d.kind, d.severity, d.detail) for d in result.fidelity_report.degradations]
-    assert result.success, (
-        f"expected Tier 1.5 success-path; got success=False, "
-        f"warnings={result.warnings}, degradations={degr_summary}"
-    )
-    assert result.font_action == "extended", (
-        f"expected font_action='extended' after Tier 1.5; got {result.font_action!r}"
-    )
-    kinds = [d.kind for d in result.fidelity_report.degradations]
-    assert any(k in {"font_coverage_substituted", "font_coverage_extended"} for k in kinds), (
-        f"expected coverage Degradation; got kinds={kinds}"
-    )
-
-
-def test_allocate_free_bytes_deterministic_and_consecutive() -> None:
-    """Probe 2: pin _allocate_free_bytes contract (consecutive + 127-skip + bounds)."""
-    # Same args twice → same return (deterministic ordering)
-    assert _allocate_free_bytes(set(), 2, last_char=122) == [123, 124]
-    assert _allocate_free_bytes(set(), 2, last_char=122) == [123, 124]
-
-    # 127 (DEL) is skipped; allocation continues at 128
-    assert _allocate_free_bytes({127}, 2, last_char=125) == [126, 128]
-
-    # Edge: last available byte is 255
-    assert _allocate_free_bytes(set(), 1, last_char=254) == [255]
-
-    # Exhaustion: no slots left above last_char=255
-    with pytest.raises(FontNotFoundError):
-        _allocate_free_bytes(set(), 1, last_char=255)
-
-
-@_no_ttf_simple
-def test_collect_component_names_resolves_composites() -> None:
-    """Probe 3: composite glyph component walk yields injection-order list.
-
-    Loads arial.ttf (or platform equivalent) and finds a real composite
-    glyph in its glyf table — synthesizing one inline would require
-    fabricating a TrueType binary which exceeds the bounded LOC budget
-    for a probe.
-    """
-    ttf = _find_ttf_for_simple_font()
-    assert ttf is not None, "_no_ttf_simple should have skipped"
-    font = TTFont(str(ttf))
-    try:
-        glyf = font["glyf"]
-        # Find first real composite glyph (accented Latin like Aacute,
-        # Ccedilla, etc. are usually composites in Arial)
-        composite_name: str | None = None
-        for gname in font.getGlyphOrder():
-            try:
-                g = glyf[gname]
-            except KeyError:
-                continue
-            if hasattr(g, "isComposite") and g.isComposite():
-                composite_name = gname
-                break
-        assert composite_name is not None, "no composite glyph found in test font"
-        components = _collect_component_names(glyf[composite_name], font)
-        assert isinstance(components, list)
-        assert len(components) >= 1, (
-            f"expected at least 1 component for composite {composite_name!r}; got {components}"
-        )
-
-        # Simple (non-composite) glyph — '.notdef' is always simple
-        simple = glyf[".notdef"]
-        assert _collect_component_names(simple, font) == []
-    finally:
-        font.close()
-
-
-def test_promote_encoding_name_to_dict() -> None:
-    """Probe 4: /Encoding=Name gets promoted to /Encoding=Dict on first /Differences add."""
-    pdf = pikepdf.Pdf.new()
-    font_dict = _make_simple_font_dict(pdf, encoding=pikepdf.Name("/WinAnsiEncoding"))
-    _extend_simple_encoding(pdf, font_dict, [(123, "oslash", 500.0)])
-
-    enc = font_dict["/Encoding"]
-    assert isinstance(enc, pikepdf.Dictionary), f"expected Dictionary, got {type(enc)}"
-    assert enc["/Type"] == pikepdf.Name("/Encoding")
-    assert enc["/BaseEncoding"] == pikepdf.Name("/WinAnsiEncoding")
-    diffs = list(enc["/Differences"])
-    assert len(diffs) == 2
-    assert int(diffs[0]) == 123
-    assert diffs[1] == pikepdf.Name("/oslash")
-
-
-@_no_ttf_simple
-def test_double_extension_no_byte_collision(tmp_path: Path) -> None:
-    """Probe 5: two consecutive extensions allocate distinct bytes.
-
-    Load-bearing on Phase 13.4's cache-deletion architecture: the
-    deprecated ``_FONTFILE2_CACHE`` indirection is gone, so
-    ``_used_bytes_in_encoding`` reads the first /Differences override
-    directly from the live font dict on the second call. Without that
-    direct read, the second extension would re-allocate the same byte.
-    """
-    src = _ensure_simple_winansi_pdf()
-    work = tmp_path / "double.pdf"
-    shutil.copy(src, work)
-
-    pdf = open_pdf(str(work))
-    page = pdf.pages[0]
-
-    # First extension
-    _ = extend_subset(pdf, page, "F1", "ø")
-    fd1 = page["/Resources"]["/Font"]["/F1"]
-    enc1 = fd1["/Encoding"]
-    assert isinstance(enc1, pikepdf.Dictionary)
-    diffs1 = list(enc1["/Differences"])
-    first_byte = int(diffs1[0])
-
-    # Second extension — different codepoint
-    _ = extend_subset(pdf, page, "F1", "ü")
-    fd2 = page["/Resources"]["/Font"]["/F1"]
-    enc2 = fd2["/Encoding"]
-    assert isinstance(enc2, pikepdf.Dictionary)
-    diffs2 = list(enc2["/Differences"])
-
-    # /Differences now lists [byte_a /name_a byte_b /name_b ...]
-    bytes_used = [int(item) for item in diffs2 if not str(item).startswith("/")]
-    assert len(bytes_used) >= 2, f"expected at least 2 byte slots in /Differences; got {diffs2}"
-    assert len(set(bytes_used)) == len(bytes_used), f"byte collision detected: {bytes_used}"
-    assert first_byte in bytes_used
-    second_byte = next(b for b in bytes_used if b != first_byte)
-    assert second_byte != first_byte
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# M.6 probes (7) — PLAN_AMENDMENTS lines 264-313
+# INV-M-6 probes (7) — PLAN_AMENDMENTS lines 264-313
 # ──────────────────────────────────────────────────────────────────────────
 
 
 def test_extend_subset_rejects_type1() -> None:
-    """Probe 6 (M.6): Type1 dispatcher branch raises FontNotFoundError.
+    """INV-M-6.1: Type1 dispatcher branch raises FontNotFoundError.
 
     Synthesises a /Type1 font dict (with /FontDescriptor + /FontFile so
     the dispatcher gets past `_get_font_objects` and reaches the subtype
@@ -329,7 +169,7 @@ def test_extend_subset_rejects_type1() -> None:
 
 
 def test_extend_subset_rejects_truetype_with_fontfile3() -> None:
-    """Probe 7 (M.6): /TrueType + /FontFile3 dispatcher branch raises FontNotFoundError.
+    """INV-M-6.2: /TrueType + /FontFile3 dispatcher branch raises FontNotFoundError.
 
     Mirrors the dispatcher's defensive rejection — a /Subtype=/TrueType
     font dict that carries /FontFile3 (CFF/OpenType outlines) cannot be
@@ -365,7 +205,7 @@ def test_extend_subset_rejects_truetype_with_fontfile3() -> None:
 
 
 def test_simple_tier_15_raises_on_missing_fontfile2() -> None:
-    """Probe 8 (M.6): _extend_simple_tier_one_five raises when /FontFile2 absent."""
+    """INV-M-6.3: _extend_simple_tier_one_five raises when /FontFile2 absent."""
     pdf = pikepdf.Pdf.new()
     font_dict = _make_simple_font_dict(pdf, with_fontfile2=False)
     fd = font_dict["/FontDescriptor"]
@@ -376,7 +216,7 @@ def test_simple_tier_15_raises_on_missing_fontfile2() -> None:
 
 @_no_ttf_simple
 def test_simple_tier_15_raises_on_missing_system_font_no_fallback(tmp_path: Path) -> None:
-    """Probe 9 (M.6): no system font + no full_font_path → FontNotFoundError.
+    """INV-M-6.4: no system font + no full_font_path → FontNotFoundError.
 
     Strategy: load the real synthetic fixture (so /FontFile2 parses), then
     rename ``/BaseFont`` in-memory to a clearly-fake name that is not
@@ -393,6 +233,8 @@ def test_simple_tier_15_raises_on_missing_system_font_no_fallback(tmp_path: Path
     src = _ensure_simple_winansi_pdf()
     work = tmp_path / "no_system_font.pdf"
     shutil.copy(src, work)
+    from pdf_edit_engine._pathutil import open_pdf
+
     pdf = open_pdf(str(work))
     page = pdf.pages[0]
     font_dict = page["/Resources"]["/Font"]["/F1"]
@@ -407,7 +249,7 @@ def test_simple_tier_15_raises_on_missing_system_font_no_fallback(tmp_path: Path
 
 
 def test_extend_simple_widths_gap_fills_skipped_byte() -> None:
-    """Probe 10 (M.6): _extend_simple_widths gap-fills 127-skip slot with 0.
+    """INV-M-6.5: _extend_simple_widths gap-fills 127-skip slot with 0.
 
     Per PLAN_AMENDMENTS line 301 verbatim.
     """
@@ -429,7 +271,7 @@ def test_extend_simple_widths_gap_fills_skipped_byte() -> None:
 
 
 def test_glyph_name_for_codepoint_agl_and_fallback() -> None:
-    """Probe 11 (M.6): AGL hits + uniXXXX fallback for non-AGL codepoints."""
+    """INV-M-6.6: AGL hits + uniXXXX fallback for non-AGL codepoints."""
     assert _glyph_name_for_codepoint(ord("A")) == "A"
     assert _glyph_name_for_codepoint(ord("ø")) == "oslash"
     assert _glyph_name_for_codepoint(ord("é")) == "eacute"
@@ -443,7 +285,7 @@ def test_glyph_name_for_codepoint_agl_and_fallback() -> None:
 
 @_no_ttf
 def test_corrupt_fontfile2_surfaces_font_extension_failed(tmp_path: Path) -> None:
-    """Probe 12 (M.6): corrupt /FontFile2 → EditResult.success=False + degradation.
+    """INV-M-6.7: corrupt /FontFile2 → EditResult.success=False + degradation.
 
     PLAN_AMENDMENTS line 305: TTLibError flows through _FONT_EXTEND_FAIL_EXCS
     and surfaces as a `font_extension_failed` Degradation, NOT as a raised
