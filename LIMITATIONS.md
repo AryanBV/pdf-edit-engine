@@ -77,3 +77,21 @@ Identity-H CIDFont PDFs (Chrome, Google Docs, Word) may be slower due to CMap pa
   worker per request) rather than by thread. The library's per-call
   cost (single-document edits in tens of milliseconds; see Performance
   table above) makes process-level concurrency cheap.
+- **Concurrency depth is not formally probed (F-B-07).** v0.1.3 does
+  not exercise `replace_block` / `batch_replace_block` under concurrent
+  multi-process load. Single-process behavior is well-tested; multi-
+  process callers writing the same file should serialize via OS-level
+  file locks or a queue. Tracked for v0.1.4 hardening.
+
+## Denial-of-service and timeouts
+
+- **No engine-side timeout on edit operations (F-D-DD).** A pathological
+  PDF (corrupt CMap, deep composite glyph graph, very large embedded
+  subset) can stall an edit for minutes inside `replace_block` reflow
+  or `extend_subset`. Callers running the engine in a request-response
+  context should impose their own timeout (e.g.
+  `concurrent.futures.ProcessPoolExecutor` with a per-task deadline,
+  or a watchdog process). The composite-depth cap closed in v0.1.3
+  (`MAX_COMPOSITE_DEPTH=64`) addresses the deepest single class of
+  pathology; broader denial-of-service hardening is tracked for
+  v0.1.4.

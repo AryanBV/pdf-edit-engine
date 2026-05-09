@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,80 @@ import pikepdf
 from pdf_edit_engine.errors import PDFEditError
 
 logger = logging.getLogger(__name__)
+
+
+# F-W21-MERGED: Windows reserved device names. Case-insensitive match
+# against any path component, with or without an extension. Per the
+# Win32 file-naming rules, a write to ``CON.pdf`` opens the console
+# device rather than the file; ``LPT1`` opens the parallel port; etc.
+# A caller-controlled output path that lands on one of these silently
+# redirects engine writes off-disk, which is a covert-channel /
+# write-redirection vector.
+_WIN_RESERVED_NAMES = re.compile(
+    r"^(CON|AUX|NUL|PRN|COM[1-9]|LPT[1-9])(\.[^.]*)?$",
+    re.IGNORECASE,
+)
+
+
+def _validate_windows_path(path: str, *, allow_unc: bool) -> None:
+    """Windows-only: refuse reserved names, ADS, extended-path prefix, UNC.
+
+    No-op on non-Windows platforms. Called as a final gate from
+    ``validate_output_path`` and ``validate_output_dir`` after the
+    realpath/abspath link-traversal check has already passed.
+
+    The four classes refused (F-W21-MERGED):
+
+    1. **Extended-path prefix** ``\\\\?\\...``. Bypasses Win32 path
+       normalization and can target raw NT object paths
+       (``\\\\?\\GLOBALROOT\\...``). Refused unconditionally.
+    2. **UNC paths** ``\\\\server\\share\\...``. Traverse the SMB
+       stack; may bypass local filesystem ACLs and reach attacker-
+       controlled hosts. Refused unless ``allow_unc=True``.
+    3. **Alternate Data Streams** — any ``:`` after the drive-letter
+       colon (e.g. ``C:\\out.pdf:hidden``). NTFS silently writes the
+       payload to a side-stream invisible to most tools.
+    4. **Reserved device names** (``CON``, ``AUX``, ``NUL``, ``PRN``,
+       ``COM1``-``COM9``, ``LPT1``-``LPT9``) in any path component,
+       case-insensitive, with or without extension.
+
+    Args:
+        path: The output path string (already non-empty, link-safe).
+        allow_unc: When True, permits UNC paths (``\\\\server\\share\\...``).
+            Default False; explicit opt-in required because UNC writes
+            traverse the SMB stack and may bypass local filesystem ACLs.
+
+    Raises:
+        PDFEditError: On any Windows-specific validation failure.
+    """
+    if sys.platform != "win32":
+        return
+    # 1. Extended-path prefix — refuse before UNC because ``\\?\UNC\...``
+    #    matches both prefixes and the extended-path semantics dominate.
+    if path.startswith("\\\\?\\") or path.startswith("//?/"):
+        raise PDFEditError(f"Output path uses Windows extended-path prefix (refused): {path}")
+    # 2. UNC paths. Refuse unless allow_unc=True. Both ``\\\\`` and ``//``
+    #    forms must be checked because ``Path.resolve()`` may have
+    #    normalized one to the other depending on cwd at call time.
+    if (path.startswith("\\\\") or path.startswith("//")) and not allow_unc:
+        raise PDFEditError(f"Output path is UNC; pass allow_unc=True to permit: {path}")
+    # 3. Alt Data Streams: any ``:`` AFTER the drive-letter colon.
+    #    e.g. ``C:\\foo\\bar.pdf``    → drive-letter colon at index 1, OK
+    #    e.g. ``C:foo:bar.pdf``       → second colon at index 5, REFUSE
+    #    e.g. ``out.pdf:hidden``      → no drive letter, colon present, REFUSE
+    rest = path
+    if len(path) >= 2 and path[1] == ":":
+        rest = path[2:]
+    if ":" in rest:
+        raise PDFEditError(f"Output path contains Alt Data Stream marker (refused): {path}")
+    # 4. Reserved device names. Check every path component (split on
+    #    both ``\\`` and ``/`` to catch mixed-separator inputs).
+    parts = re.split(r"[\\/]+", path)
+    for part in parts:
+        if _WIN_RESERVED_NAMES.match(part):
+            raise PDFEditError(
+                f"Output path contains Windows reserved device name (refused): {part!r} in {path}"
+            )
 
 
 def _path_traverses_link(path: str) -> bool:
@@ -53,7 +129,7 @@ def _path_traverses_link(path: str) -> bool:
     return os.path.normcase(real) != os.path.normcase(absolute)
 
 
-def validate_output_path(path: str) -> None:
+def validate_output_path(path: str, *, allow_unc: bool = False) -> None:
     """Validate that an output file path is safe to write to.
 
     Refuses empty paths, paths whose resolved target is an existing
@@ -64,49 +140,92 @@ def validate_output_path(path: str) -> None:
     cannot redirect engine writes to a location the caller did not
     intend.
 
+    On Windows, additionally refuses (F-W21-MERGED): reserved device
+    names (``CON``, ``AUX``, ``NUL``, ``PRN``, ``COM1``-``COM9``,
+    ``LPT1``-``LPT9``); paths containing Alternate Data Stream
+    markers (``:`` after the drive-letter colon); and the extended-
+    path prefix ``\\\\?\\``. UNC paths (``\\\\server\\share\\...``)
+    are refused unless the caller passes ``allow_unc=True``. These
+    checks are no-ops on POSIX.
+
     Args:
         path: Output file path string.
+        allow_unc: When True, permits UNC paths on Windows. Default
+            False; explicit opt-in is required because UNC writes
+            traverse the SMB stack and may bypass local filesystem
+            ACLs. No effect on non-Windows platforms.
 
     Raises:
         PDFEditError: If any check fails.
     """
     if not path:
         raise PDFEditError("Output path must not be empty")
+    # Windows-specific checks first: reserved device names (``CON``,
+    # ``NUL``, ``LPT1``, ...) are string-level rejections that must
+    # fire before ``_path_traverses_link``. ``os.path.realpath`` on a
+    # bare reserved name resolves it to the device (``\\.\NUL``), which
+    # then differs from ``abspath`` and triggers the link-traversal
+    # branch with a misleading message. The Win helper short-circuits
+    # that path with the correct diagnostic.
+    _validate_windows_path(path, allow_unc=allow_unc)
     if _path_traverses_link(path):
         raise PDFEditError(
             f"Output path traverses a symlink or junction (refused for safety): {path}"
         )
     try:
         p = Path(path).resolve()
+        # Bundle the existence checks under the same translator: on
+        # UNC / network-mount paths, ``is_dir`` and ``parent.exists``
+        # can raise ``OSError`` (WinError 64 "network name no longer
+        # available", ENETDOWN, ETIMEDOUT). INV-L-1 requires those be
+        # surfaced as ``PDFEditError`` rather than leaking the raw
+        # platform exception to callers.
+        is_dir = p.is_dir()
+        parent_exists = p.parent.exists()
     except (OSError, ValueError) as exc:
         raise PDFEditError(f"Invalid output path: {type(exc).__name__}") from exc
-    if p.is_dir():
+    if is_dir:
         raise PDFEditError(f"Output path is an existing directory: {path}")
-    if not p.parent.exists():
+    if not parent_exists:
         raise PDFEditError(f"Parent directory does not exist: {p.parent}")
 
 
-def validate_output_dir(path: str) -> None:
+def validate_output_dir(path: str, *, allow_unc: bool = False) -> None:
     """Validate that an output directory path is safe to write to.
+
+    On Windows, additionally refuses reserved device names, ADS
+    markers, the extended-path prefix, and UNC paths (unless
+    ``allow_unc=True``). See :func:`validate_output_path` for the
+    full rationale.
 
     Args:
         path: Output directory path string.
+        allow_unc: When True, permits UNC paths on Windows. Default
+            False. No effect on non-Windows platforms.
 
     Raises:
         PDFEditError: If path is empty, points to an existing regular
-            file, or traverses a symlink/junction.
+            file, traverses a symlink/junction, or fails any of the
+            Windows-specific checks.
     """
     if not path:
         raise PDFEditError("Output directory must not be empty")
+    # See ``validate_output_path`` for ordering rationale: Windows
+    # reserved-name / ADS / extended-prefix / UNC checks must precede
+    # the realpath-vs-abspath comparison.
+    _validate_windows_path(path, allow_unc=allow_unc)
     if _path_traverses_link(path):
         raise PDFEditError(
             f"Output directory traverses a symlink or junction (refused for safety): {path}"
         )
     try:
         p = Path(path).resolve()
+        # Same INV-L-1 translation as ``validate_output_path``: UNC /
+        # network-mount paths can raise ``OSError`` from ``is_file``.
+        is_file = p.is_file()
     except (OSError, ValueError) as exc:
         raise PDFEditError(f"Invalid output directory: {type(exc).__name__}") from exc
-    if p.is_file():
+    if is_file:
         raise PDFEditError(f"Output directory path is an existing file: {path}")
 
 

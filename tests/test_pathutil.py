@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
@@ -54,3 +55,82 @@ class TestValidateOutputDir:
     def test_nonexistent_dir_passes(self, tmp_path: Path) -> None:
         new_dir = str(tmp_path / "new_subdir")
         validate_output_dir(new_dir)  # Should not raise — will be created
+
+
+# ---------------------------------------------------------------------------
+# F-W21-MERGED: Windows path validation probes.
+#
+# Skipped on non-Windows because the validator no-ops on POSIX. On
+# Windows, every probe asserts a refusal (or, for ``allow_unc=True``,
+# that the UNC class is bypassed without altering the other checks).
+# ---------------------------------------------------------------------------
+
+
+_WIN_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="Windows-only path validation")
+
+
+@_WIN_ONLY
+class TestWindowsReservedNames:
+    def test_reject_reserved_name_con(self, tmp_path: Path) -> None:
+        with pytest.raises(PDFEditError, match="reserved device name"):
+            validate_output_path(str(tmp_path / "CON.pdf"))
+
+    def test_reject_reserved_name_case_insensitive(self, tmp_path: Path) -> None:
+        for name in ("con.pdf", "Con.pdf", "AUX.pdf", "Lpt1.txt", "nul", "PRN.out"):
+            with pytest.raises(PDFEditError, match="reserved device name"):
+                validate_output_path(str(tmp_path / name))
+
+    def test_reject_reserved_name_in_intermediate_component(self, tmp_path: Path) -> None:
+        # ``CON`` as a directory component, not just leaf — also refused.
+        with pytest.raises(PDFEditError, match="reserved device name"):
+            validate_output_path(str(tmp_path / "CON" / "ok.pdf"))
+
+    def test_non_reserved_lookalike_passes(self, tmp_path: Path) -> None:
+        # ``CONFIG.pdf`` is not reserved (regex anchors to whole component).
+        validate_output_path(str(tmp_path / "CONFIG.pdf"))
+
+
+@_WIN_ONLY
+class TestWindowsAlternateDataStreams:
+    def test_reject_alt_data_stream_after_drive(self, tmp_path: Path) -> None:
+        # Drive-letter colon at index 1, second colon embedded in leaf.
+        bad = str(tmp_path / "out.pdf") + ":hidden"
+        with pytest.raises(PDFEditError, match="Alt Data Stream"):
+            validate_output_path(bad)
+
+    def test_reject_alt_data_stream_relative(self) -> None:
+        # No drive letter; bare ``:`` in leaf is still an ADS marker.
+        with pytest.raises(PDFEditError, match="Alt Data Stream"):
+            validate_output_path("out.pdf:hidden")
+
+
+@_WIN_ONLY
+class TestWindowsExtendedPathPrefix:
+    def test_reject_extended_path_prefix_backslash(self) -> None:
+        with pytest.raises(PDFEditError, match="extended-path"):
+            validate_output_path(r"\\?\C:\foo.pdf")
+
+    def test_reject_extended_path_prefix_forward_slash(self) -> None:
+        with pytest.raises(PDFEditError, match="extended-path"):
+            validate_output_path("//?/C:/foo.pdf")
+
+
+@_WIN_ONLY
+class TestWindowsUNC:
+    def test_reject_unc_by_default(self) -> None:
+        with pytest.raises(PDFEditError, match="UNC"):
+            validate_output_path(r"\\server\share\out.pdf")
+
+    def test_allow_unc_opt_in_passes_unc_check(self) -> None:
+        # The UNC check itself must be bypassed when allow_unc=True.
+        # The path may still fail later checks (resolve / parent.exists)
+        # because the UNC share doesn't exist — we only assert that the
+        # UNC-refusal message is NOT what fires.
+        try:
+            validate_output_path(r"\\server\share\out.pdf", allow_unc=True)
+        except PDFEditError as e:
+            assert "UNC" not in str(e), f"UNC check should be bypassed: {e}"
+
+    def test_validate_output_dir_unc_default_refused(self) -> None:
+        with pytest.raises(PDFEditError, match="UNC"):
+            validate_output_dir(r"\\server\share\subdir")

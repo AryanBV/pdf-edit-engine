@@ -4,8 +4,7 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://github.com/AryanBV/pdf-edit-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/AryanBV/pdf-edit-engine/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-88%25-yellowgreen)]()
-[![Audit suite](https://img.shields.io/badge/invariants-81%20probes-blueviolet)]()
+[![Audit suite](https://img.shields.io/badge/invariants-144%20probes-blueviolet)]()
 
 Format-preserving PDF text editing. Modify text in existing PDFs at the content stream level — fonts, layout, and spacing stay intact.
 

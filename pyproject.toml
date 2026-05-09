@@ -22,15 +22,25 @@ classifiers = [
 ]
 keywords = ["pdf", "edit", "text", "replace", "format-preserving", "pikepdf", "font"]
 dependencies = [
-    "pikepdf>=9.0.0,<11",
-    "fonttools>=4.50.0,<5",
-    "pdfminer.six>=20231228,<20270000",
+    # F-A-RANGE: pikepdf>=10 closes the v9 CMap-parser allocation bug
+    # that surfaced on adversarial fuzzing; lxml<7 because pikepdf 10
+    # is not yet validated against the lxml 7.x line.
+    "pikepdf>=10,<11",
+    # F-A-RANGE: fontTools>=4.60.2 ships the TTFont composite-graph
+    # bound that prevents the deep-glyph-chain DoS class addressed by
+    # commit 05's MAX_COMPOSITE_DEPTH cap.
+    "fonttools>=4.60.2,<5",
+    # F-A-RANGE: pdfminer.six>=20251230 corrects an incremental-update
+    # parser regression that mis-extracted text from PDFs with linearized
+    # xref tables.
+    "pdfminer.six>=20251230,<20270000",
     # CVE-2026-41066: lxml < 6.1.0 has default-on XXE that lets untrusted
     # XML/XMP input read local files. pikepdf is a transitive consumer
     # of lxml when parsing XMP metadata streams, so a hostile PDF could
     # exploit this against this library. Pin the floor explicitly to
     # document the security requirement; pikepdf itself does not pin it.
-    "lxml>=6.1.0",
+    # Upper cap <7 keeps us on the validated lxml 6.x line for pikepdf 10.
+    "lxml>=6.1.0,<7",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +54,11 @@ dev = [
     "reportlab>=4.0",
     "psutil>=5.9",
     "pip-audit>=2.7",
+    # F-A-PIP: pip <25 has 4 CVEs in the cache-tar-extraction path
+    # (path traversal on malicious source distributions). Dev-only:
+    # the engine itself does not invoke pip at runtime, but contributors
+    # using ``pip install -e ".[dev]"`` should be on >=25.
+    "pip>=25",
 ]
 
 [project.urls]
