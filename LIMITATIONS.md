@@ -22,11 +22,11 @@
 ## Font handling
 
 - Tier 1.5 font extension (in-place glyph injection) requires the matching system font (or a metric-equivalent fallback like Carlito for Calibri) to be installed; the resolved substitute name is surfaced through `FidelityReport.font_substituted` AND a `font_coverage_substituted` Degradation (v0.1.3)
-- CFF / OpenType (Type1C) embedded fonts are not yet supported for Tier 1.5 (`_inject_glyph_in_place` raises `FontNotFoundError`); tracked as ARY-279 for a future release
+- CID-keyed (Type0) CFF / Type1C embedded fonts ARE extended in place as of v0.2.0 (C.3 — `_inject_cff_glyph_in_place`, the Type2-charstring sibling of the TrueType `glyf` injector; collision-free `CID == GID`, pre-existing CIDs preserved). Out-of-scope CFF shapes (simple-font/non-CID CFF, CFF2, name-keyed CFF, multi-FD CID, composite donors, `unitsPerEm` mismatch) refuse honestly via a `font_extension_failed` Degradation (`success=False`)
 - CJK fonts with 30,000+ glyphs have not been tested
 - Type 3 fonts (bitmap/procedural) are not supported for extension
 - Emoji and other multi-codepoint characters cannot be rendered if the font lacks those glyphs (reported via `FidelityReport.degradations` as `font_extension_failed`)
-- Non-CID font extension is supported for **simple TrueType + WinAnsi + `/FontFile2`** fonts (Phase 13). Replacements requiring missing glyphs trigger `_extend_simple_tier_15`, which sources the outline from a system font (or metric-equivalent fallback like Carlito for Calibri) and surfaces via `FidelityReport.font_substituted` AND a `font_coverage_substituted` Degradation. Still NOT supported: `/FontFile3` (CFF/OpenType) outlines (tracked as ARY-279 for v0.1.4); `/Type1` fonts (would require Type1 charstring surgery — out of scope); MacRoman simple fonts (architecturally similar to WinAnsi but untested in v0.1.3); CJK fonts with 30,000+ glyphs (untested). The dispatcher in `extend_subset()` raises `FontNotFoundError` for all these cases.
+- Non-CID font extension is supported for **simple TrueType + WinAnsi + `/FontFile2`** fonts (Phase 13). Replacements requiring missing glyphs trigger `_extend_simple_tier_15`, which sources the outline from a system font (or metric-equivalent fallback like Carlito for Calibri) and surfaces via `FidelityReport.font_substituted` AND a `font_coverage_substituted` Degradation. Still NOT supported on the simple-font path: `/FontFile3` (CFF/OpenType) outlines — note that CID-keyed (Type0) CFF/Type1C IS injected as of v0.2.0 (C.3); this remaining gap is the non-CID simple-font case only; `/Type1` fonts (would require Type1 charstring surgery — out of scope); MacRoman simple fonts (architecturally similar to WinAnsi but untested); CJK fonts with 30,000+ glyphs (untested). The dispatcher in `extend_subset()` raises `FontNotFoundError` for all these cases.
 
   Most public-API entry points surface failure modes as typed
   `Degradation` entries on `EditResult.fidelity_report.degradations`.
@@ -60,10 +60,10 @@ Identity-H CIDFont PDFs (Chrome, Google Docs, Word) may be slower due to CMap pa
 
 ## PDF compatibility
 
-- Encrypted PDFs cannot be edited without providing the password
+- Encrypted PDFs require the password to open, but once it is provided they are edited and re-saved with their encryption preserved as of v0.2.0 (A2.3 — re-encrypted with the same algorithm and permissions; a genuine re-encryption failure falls back to an unencrypted save and surfaces an `encryption_dropped` Degradation)
 - PDF/A compliance is not maintained after editing
 - Digital signatures are invalidated by any edit (inherent to how PDF signatures work)
-- Linearization (fast web view) is removed after editing
+- Linearization (Fast Web View) is preserved on save as of v0.2.0 (A2.2 — a linearized input is re-linearized; on the rare case pikepdf cannot re-linearize, the edit still succeeds via a normal save and surfaces a `linearization_dropped` Degradation). A non-linearized input is unaffected
 - Right-to-left text is not corrupted but reflow does not handle RTL properly
 - XFA forms are not supported
 - Content streams with non-UTF-8 byte sequences in operators are rejected with a clear error
@@ -91,7 +91,7 @@ Identity-H CIDFont PDFs (Chrome, Google Docs, Word) may be slower due to CMap pa
   not exercise `replace_block` / `batch_replace_block` under concurrent
   multi-process load. Single-process behavior is well-tested; multi-
   process callers writing the same file should serialize via OS-level
-  file locks or a queue. Tracked for v0.1.4 hardening.
+  file locks or a queue. Tracked for a future release.
 
 ## Denial-of-service and timeouts
 
@@ -101,7 +101,9 @@ Identity-H CIDFont PDFs (Chrome, Google Docs, Word) may be slower due to CMap pa
   or `extend_subset`. Callers running the engine in a request-response
   context should impose their own timeout (e.g.
   `concurrent.futures.ProcessPoolExecutor` with a per-task deadline,
-  or a watchdog process). The composite-depth cap closed in v0.1.3
-  (`MAX_COMPOSITE_DEPTH=64`) addresses the deepest single class of
-  pathology; broader denial-of-service hardening is tracked for
-  v0.1.4.
+  or a watchdog process). The composite-depth cap (v0.1.3,
+  `MAX_COMPOSITE_DEPTH=64`), the graphics-state `q`/`Q` depth cap
+  (v0.2.0, `MAX_GRAPHICS_STATE_DEPTH=128`), and the font/CMap Flate
+  decompression-bomb guard (v0.2.0, 32 MiB / 8 MiB decoded caps)
+  close the deepest known classes of pathology; an engine-side
+  wall-clock timeout remains tracked for a future release.

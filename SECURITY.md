@@ -85,18 +85,25 @@ Out of scope:
   by pinning a recent floor on pdfminer.six and running pip-audit
   in CI; we cannot eliminate this attack surface without either
   forking the parser or sandboxing.
-- **Memory/CPU DoS via giant fonts or content streams**. The
-  library does not impose explicit size limits — pikepdf and
-  fontTools may allocate large buffers when parsing a maliciously
-  oversized embedded font or content stream. Callers running
-  this library against untrusted PDFs should impose an external
-  resource limit (memory cap, wall-clock timeout, container
-  isolation). Tracked for v0.1.3 hardening.
-- **CFF / OpenType fonts**. Tier 1.5 in-place glyph injection
-  refuses to operate on CFF embedded fonts (raises
-  `FontNotFoundError`). This is a feature gap (ARY-279), not a
-  security issue, but worth noting since the failure mode is a
-  caller-visible exception, not silent corruption.
+- **Memory/CPU DoS via giant fonts or content streams**. As of
+  v0.2.0 the engine bounds the two most exploitable read paths: a
+  Flate decompression-bomb guard on every embedded-font / CMap /
+  ToUnicode read (32 MiB font, 8 MiB ToUnicode *decoded*-size caps;
+  raises `FontStreamTooLargeError` → a `font_stream_too_large`
+  Degradation) and a graphics-state stack (`q`/`Q`) depth cap of 128
+  (raises `OperatorError`). These close the decompression-bomb and
+  unbounded-nesting classes. pikepdf and fontTools may still allocate
+  large buffers for other oversized structures, and there is no
+  engine-side wall-clock timeout, so callers running this library
+  against untrusted PDFs should still impose an external resource
+  limit (memory cap, wall-clock timeout, container isolation).
+- **CFF / OpenType fonts**. As of v0.2.0, CID-keyed (Type0)
+  CFF / Type1C fonts ARE extended in place (C.3). The remaining CFF
+  shapes the injector does not cover — simple-font (non-CID) CFF,
+  CFF2, name-keyed CFF, multi-FD CID, and composite donors — refuse
+  honestly (`FontNotFoundError` → a `font_extension_failed`
+  Degradation, `success=False`). Either way the failure mode is a
+  caller-visible signal, never silent corruption.
 
 ## Reporting a vulnerability
 
