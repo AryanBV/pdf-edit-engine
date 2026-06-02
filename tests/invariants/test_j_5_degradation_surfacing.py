@@ -157,11 +157,11 @@ CONSTRUCTION_LEVEL_CASES = [
     SiteCase("surgeon_1193_reflow_aborted_to_simple", "reflow_aborted_to_simple", "warning"),
     SiteCase("encoding_236_font_coverage_extended", "font_coverage_extended", "info"),
     SiteCase("encoding_236_font_coverage_substituted", "font_coverage_substituted", "warning"),
-    # line_height_compressed is in the Literal but not yet emitted by any
-    # source site (deferred to v0.1.4 — see Phase 6 commit). Probe still
-    # asserts the contract: a FidelityReport carrying the kind preserves
-    # it through construction. This guards against regression if the
-    # emission lands later but the kind got dropped from the Literal.
+    # line_height_compressed is emitted by structural (_replace_block_on_page
+    # and batch_replace_block) as of v0.2.0 (E.6, INV-F-7). This
+    # construction-level probe asserts the orthogonal contract: a
+    # FidelityReport carrying the kind preserves it through construction,
+    # guarding against the kind being dropped from the Literal.
     SiteCase(
         "structural_compute_uniform_layout_line_height_compressed", "line_height_compressed", "info"
     ),

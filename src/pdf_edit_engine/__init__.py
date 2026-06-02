@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.1.3"
+__version__ = "0.2.0"
 
 from pdf_edit_engine.annotations import (
     Annotation,
@@ -28,7 +28,11 @@ from pdf_edit_engine.locator import (
     get_text_layout,
 )
 from pdf_edit_engine.models import (
+    DEGRADATION_KINDS,
+    FONT_AFFECTING_KINDS,
     ContentElement,
+    Degradation,
+    DegradationKind,
     Edit,
     EditResult,
     FidelityReport,
@@ -126,6 +130,11 @@ __all__ = [
     "Edit",
     "ContentElement",
     "GraphicsStateSnapshot",
+    # honesty taxonomy (B1)
+    "Degradation",
+    "DegradationKind",
+    "FONT_AFFECTING_KINDS",
+    "DEGRADATION_KINDS",
     # errors
     "PDFEditError",
     "FontNotFoundError",

@@ -2,21 +2,22 @@
 
 from __future__ import annotations
 
-import io as _io
 import logging
 import re
+import unicodedata
 from pathlib import Path
 from typing import Literal
 
 import pikepdf
 
-from pdf_edit_engine._pathutil import open_pdf
+from pdf_edit_engine._pathutil import _parse_content_stream, open_pdf
 from pdf_edit_engine.encoding import FontResolver, FontResolverCache
 from pdf_edit_engine.errors import OperatorError
-from pdf_edit_engine.fonts import _with_fonttools_translation
+from pdf_edit_engine.fonts import classify_embedded_outline, embedded_glyph_count
 from pdf_edit_engine.fragments import TJReconstructor
 from pdf_edit_engine.models import (
     ContentElement,
+    Degradation,
     FontInfo,
     TextBlock,
     TextCharacter,
@@ -115,7 +116,7 @@ class ContentStreamInterpreter:
         Returns:
             List of ContentElement records covering all content.
         """
-        ops = pikepdf.parse_content_stream(self._page)
+        ops = _parse_content_stream(self._page, context="locator.interpret")
         for idx, instruction in enumerate(ops):
             operands = instruction.operands
             operator = instruction.operator
@@ -594,11 +595,11 @@ def _resolve_pages(
         List of (page_number, page_object) pairs.
 
     Raises:
-        IndexError: If the page number is out of range.
+        OperatorError: If the page number is out of range.
     """
     if page is not None:
         if page < 0 or page >= len(pdf.pages):
-            raise IndexError(f"Page {page} out of range (PDF has {len(pdf.pages)} pages)")
+            raise OperatorError(f"Page {page} out of range (PDF has {len(pdf.pages)} pages)")
         return [(page, pdf.pages[page])]
     return list(enumerate(pdf.pages))
 
@@ -728,36 +729,40 @@ def _build_font_info(
         else:
             encoding_type = "WinAnsi"
 
-    # Glyph count
+    # Glyph count (INV-C-10): when an embedded font stream is present, route
+    # the count through fonts.embedded_glyph_count — the dependency-boundary-
+    # safe helper that introspects the REAL count per outline type
+    # (glyf/CFF/CFF2/Type1) WITHOUT importing fontTools/cffLib/t1Lib into
+    # locator. A sparse /W dict is NOT a glyph count, so the prior /W-length
+    # fabrication is gone for embedded fonts. When the helper returns 0 AND a
+    # stream IS present (the font claims to be embedded but is unparseable),
+    # surface a typed font_subset_introspection_failed Degradation so the
+    # caller knows the count is unknown rather than zero-by-truth. A
+    # non-embedded simple font (standard-14, no /FontFile*) keeps the
+    # /Widths-length proxy and emits nothing (no over-surfacing).
+    fd = _get_font_descriptor(font_dict, subtype)
+    embedded_present = fd is not None and (
+        "/FontFile2" in fd or "/FontFile3" in fd or "/FontFile" in fd
+    )
+    degradations: list[Degradation] = []
     glyph_count = 0
-    if subtype == "/Type0" and "/DescendantFonts" in font_dict:
+    if embedded_present:
+        assert fd is not None  # narrowed by embedded_present
+        glyph_count = embedded_glyph_count(fd)
+        if glyph_count == 0:
+            embedded_type_for_detail = _detect_embedded_type(font_dict, subtype)
+            degradations.append(
+                Degradation(
+                    kind="font_subset_introspection_failed",
+                    detail=f"{embedded_type_for_detail}:{font_name}",
+                    severity="warning",
+                )
+            )
+    elif subtype == "/Type0" and "/DescendantFonts" in font_dict:
         try:
             cid_font = font_dict["/DescendantFonts"][0]
             cid_dict = pikepdf.Dictionary(cid_font)  # type: ignore[arg-type]
-            fd = cid_dict.get("/FontDescriptor")
-            if fd is not None and "/FontFile2" in fd:
-                try:
-                    from fontTools.ttLib import TTFont  # type: ignore[import-untyped]
-
-                    font_stream = fd["/FontFile2"]
-                    font_bytes = font_stream.read_bytes()
-                    # INV-C-7: wrap the TTFont construction AND the
-                    # downstream lazy getGlyphOrder() (per Skeptic-A,
-                    # parsing is deferred). Translator narrows fontTools
-                    # exceptions to FontNotFoundError; the outer
-                    # `except Exception` then triggers the /W fallback.
-                    with _with_fonttools_translation("get_fonts:glyph_count"):
-                        tt = TTFont(_io.BytesIO(font_bytes))
-                        try:
-                            glyph_count = len(tt.getGlyphOrder())
-                        finally:
-                            tt.close()
-                except Exception:  # noqa: BLE001 — fonttools can raise many types
-                    # Fallback: count /W entries
-                    if "/W" in cid_dict:
-                        widths = parse_cid_widths(cid_dict)
-                        glyph_count = len(widths)
-            elif "/W" in cid_dict:
+            if "/W" in cid_dict:
                 widths = parse_cid_widths(cid_dict)
                 glyph_count = len(widths)
         except (KeyError, IndexError):
@@ -776,27 +781,32 @@ def _build_font_info(
         is_subset=is_subset,
         glyph_count=glyph_count,
         embedded_type=embedded_type,
+        degradations=degradations,
     )
 
 
 def _detect_embedded_type(
     font_dict: pikepdf.Dictionary,
     subtype: str,
-) -> Literal["TrueType", "CFF", "Type1"]:
+) -> Literal["TrueType", "CFF", "Type1", "cff2", "opentype-glyf", "type3", "unknown"]:
     """Detect the embedded font type from FontDescriptor.
 
+    Routes through ``fonts.classify_embedded_outline`` so the label is
+    derived from the outline table the binary ACTUALLY carries, not the
+    ``/FontFile2`` vs ``/FontFile3`` slot (INV-C-9). This shares one truth
+    source with ``fonts._extract_font_bytes`` — the two producers of
+    ``FontInfo.embedded_type`` can never disagree. The fontTools dependency
+    stays inside ``fonts``; ``locator`` only calls the helper (CLAUDE.md
+    dependency-boundary table).
+
     Returns:
-        'TrueType', 'CFF', or 'Type1'.
+        'TrueType', 'CFF', 'Type1', 'cff2', 'opentype-glyf', 'type3', or
+        'unknown'.
     """
     fd = _get_font_descriptor(font_dict, subtype)
-    if fd is not None:
-        if "/FontFile2" in fd:
-            return "TrueType"
-        if "/FontFile3" in fd:
-            return "CFF"
-        if "/FontFile" in fd:
-            return "Type1"
-    # Infer from subtype
+    if fd is not None and ("/FontFile2" in fd or "/FontFile3" in fd or "/FontFile" in fd):
+        return classify_embedded_outline(fd)  # type: ignore[return-value]
+    # No embedded stream — infer from subtype.
     if subtype in {"/TrueType", "/Type0"}:
         return "TrueType"
     if subtype == "/Type1":
@@ -891,6 +901,104 @@ def _build_flat_string(
     return "".join(parts), char_map
 
 
+# ── Unicode-normalization-aware search view (INV-D-5) ──────────────────
+
+
+def _cluster_spans(flat: str) -> list[tuple[int, int]]:
+    """Split *flat* into base+combining-mark cluster spans.
+
+    A cluster is a base character (Unicode combining class 0) followed by
+    any number of combining marks (non-zero combining class). This is the
+    granularity at which NFC composition (base + mark → precomposed) is
+    well-defined, so normalizing per cluster lets us recombine a split
+    ``base`` + ``mark`` sequence while still mapping the result back to a
+    contiguous range of original positions.
+
+    Args:
+        flat: The flat string produced by :func:`_build_flat_string`.
+
+    Returns:
+        List of ``(start, stop)`` half-open index ranges into *flat*; the
+        ranges partition ``range(len(flat))`` in order. A leading combining
+        mark with no base (rare/degenerate) forms its own single-char span.
+    """
+    spans: list[tuple[int, int]] = []
+    n = len(flat)
+    i = 0
+    while i < n:
+        start = i
+        i += 1  # consume the base (or a leading orphan combining mark)
+        while i < n and unicodedata.combining(flat[i]) != 0:
+            i += 1
+        spans.append((start, i))
+    return spans
+
+
+def _normalized_search_view(
+    flat: str,
+    *,
+    case_sensitive: bool,
+) -> tuple[str, list[int], list[int]]:
+    """Build an NFC-normalized search view of *flat* with a position map.
+
+    Canonical equivalence (Unicode NFC/NFD) means a precomposed accent
+    (``"é"`` = U+00E9) and its decomposed form (``"e"`` + U+0301) are the
+    same text but distinct codepoint sequences. ``str.find`` compares
+    codepoints, so a query in one form misses text stored in the other.
+    To match across forms we search an NFC-normalized projection of *flat*.
+
+    Normalization can change length (NFC collapses 2 codepoints → 1; NFD
+    expands 1 → 2), so a naive ``unicodedata.normalize(flat)`` would
+    desynchronise the parallel ``char_map`` that the caller indexes to
+    recover the underlying :class:`TextCharacter` objects (the addressing
+    the subsequent replace splice relies on). Instead we normalize one
+    **base+combining-mark cluster** at a time (see :func:`_cluster_spans`)
+    and record, for every normalized character, both the *first* and *last*
+    original flat index of the cluster it came from. A match whose
+    boundaries land on cluster edges then maps to a range covering each
+    touched cluster in full — never a partial splice.
+
+    Case folding is applied **inside** this projection (per normalized
+    character) rather than by the caller via ``norm.lower()``: ``str.lower``
+    can itself change length (e.g. U+0130 → ``"i"`` + U+0307), which would
+    again desync the position arrays. Folding here keeps the returned
+    string and the two origin arrays exactly the same length.
+
+    Args:
+        flat: The flat string produced by :func:`_build_flat_string`,
+            1:1 with the caller's ``char_map``.
+        case_sensitive: When ``False``, each normalized character is
+            lower-cased; origin entries are duplicated to track any length
+            change so the three returned sequences stay aligned.
+
+    Returns:
+        Tuple ``(norm, origin_first, origin_last)``. ``norm`` is the
+        NFC-normalized (and optionally lower-cased) search string.
+        ``origin_first`` and ``origin_last`` are both the same length as
+        ``norm``; for normalized position ``k``, ``origin_first[k]`` /
+        ``origin_last[k]`` are the first / last original flat (hence
+        ``char_map``) indices of the cluster that produced ``norm[k]``.
+        Every normalized character of one cluster shares the same first/last
+        pair, so the values are constant within a cluster and strictly
+        increase across cluster boundaries.
+    """
+    norm_parts: list[str] = []
+    origin_first: list[int] = []
+    origin_last: list[int] = []
+    for start, stop in _cluster_spans(flat):
+        cluster = flat[start:stop]
+        normalized = unicodedata.normalize("NFC", cluster)
+        first_origin = start
+        last_origin = stop - 1
+        for nch in normalized:
+            emitted = nch if case_sensitive else nch.lower()
+            for ech in emitted:
+                norm_parts.append(ech)
+                origin_first.append(first_origin)
+                origin_last.append(last_origin)
+    return "".join(norm_parts), origin_first, origin_last
+
+
 # ── Public API ─────────────────────────────────────────────────────────
 
 
@@ -900,6 +1008,7 @@ def find(
     *,
     page: int | None = None,
     case_sensitive: bool = True,
+    password: str | bytes | None = None,
 ) -> list[TextMatch]:
     """Locate text in a PDF, returning matches with operator references.
 
@@ -914,6 +1023,7 @@ def find(
         page: Restrict search to a specific page (0-indexed).
               ``None`` searches all pages.
         case_sensitive: Whether the search is case-sensitive.
+        password: Optional password to open an encrypted PDF (A2.3 / INV-W-5).
 
     Returns:
         List of :class:`TextMatch` objects.  Empty list when *search_text*
@@ -932,7 +1042,7 @@ def find(
     resolved = str(path.resolve())
     matches: list[TextMatch] = []
 
-    with open_pdf(path) as pdf:
+    with open_pdf(path, password=password) as pdf:
         pages = _resolve_pages(pdf, page)
 
         for page_num, page_obj in pages:
@@ -942,18 +1052,53 @@ def find(
 
             flat, char_map = _build_flat_string(text_elements)
 
-            # Literal substring search
-            haystack = flat if case_sensitive else flat.lower()
-            needle = search_text if case_sensitive else search_text.lower()
+            # INV-D-5: search an NFC-normalized projection of the flat text
+            # so a query in one Unicode normalization form (NFC "é" =
+            # U+00E9) locates target text stored in the other (NFD "e" +
+            # U+0301), and vice-versa. ``origin[k]`` maps each normalized
+            # position back to the original flat/char_map index, keeping the
+            # operator/byte addressing of the returned characters intact for
+            # the subsequent replace splice. Normalizing per base+mark
+            # cluster (not the whole string at once) preserves a stable
+            # position map across length-changing normalization.
+            haystack, origin_first, origin_last = _normalized_search_view(
+                flat, case_sensitive=case_sensitive
+            )
+            needle_norm = unicodedata.normalize("NFC", search_text)
+            needle = needle_norm if case_sensitive else needle_norm.lower()
             start = 0
             while True:
-                idx = haystack.find(needle, start)
-                if idx == -1:
+                nidx = haystack.find(needle, start)
+                if nidx == -1:
                     break
-                end = idx + len(needle)
-                start = idx + 1  # allow overlapping matches
+                nend = nidx + len(needle)
+                start = nidx + 1  # allow overlapping matches
 
-                matched_chars = [char_map[i] for i in range(idx, end) if char_map[i] is not None]
+                # Cluster-boundary safety (B.7 cluster model): refuse a
+                # match whose normalized boundaries fall *inside* a
+                # base+combining-mark cluster. Splicing a partial cluster
+                # would corrupt the glyph run and break
+                # ``_assert_match_addressable``, so we skip rather than
+                # return an unaddressable match. A boundary is clean when
+                # the cluster identity (its origin range) changes across it.
+                starts_on_boundary = nidx == 0 or origin_first[nidx] != origin_first[nidx - 1]
+                ends_on_boundary = (
+                    nend == len(origin_last) or origin_last[nend - 1] != origin_last[nend]
+                )
+                if not (starts_on_boundary and ends_on_boundary):
+                    continue
+
+                # Map the normalized match span back to the original
+                # char_map index range, covering each touched cluster in
+                # full: start at the FIRST original index of the start
+                # cluster, end after the LAST original index of the end
+                # cluster.
+                orig_start = origin_first[nidx]
+                orig_end = origin_last[nend - 1] + 1
+
+                matched_chars = [
+                    char_map[i] for i in range(orig_start, orig_end) if char_map[i] is not None
+                ]
                 # Narrow type for mypy
                 real_chars: list[TextCharacter] = [c for c in matched_chars if c is not None]
                 if not real_chars:
@@ -986,7 +1131,7 @@ def find(
 
                 matches.append(
                     TextMatch(
-                        matched_text=flat[idx:end],
+                        matched_text=flat[orig_start:orig_end],
                         page_number=page_num,
                         bounding_box=(x0, y0, x1, y1),
                         characters=real_chars,
@@ -998,19 +1143,20 @@ def find(
     return matches
 
 
-def get_text(pdf_path: str, *, page: int | None = None) -> str:
+def get_text(pdf_path: str, *, page: int | None = None, password: str | bytes | None = None) -> str:
     """Extract all text from a PDF or a specific page.
 
     Args:
         pdf_path: Path to the PDF file.
         page: Specific page to extract (0-indexed). None extracts all pages.
+        password: Optional password to open an encrypted PDF (A2.3 / INV-W-5).
 
     Returns:
         Extracted text content.
     """
     path = Path(pdf_path)
     resolved = str(path.resolve())
-    with open_pdf(path) as pdf:
+    with open_pdf(path, password=password) as pdf:
         pages = _resolve_pages(pdf, page)
         all_text: list[str] = []
         for page_num, page_obj in pages:
@@ -1023,18 +1169,21 @@ def get_text(pdf_path: str, *, page: int | None = None) -> str:
         return "\n".join(all_text)
 
 
-def get_fonts(pdf_path: str, *, page: int | None = None) -> list[FontInfo]:
+def get_fonts(
+    pdf_path: str, *, page: int | None = None, password: str | bytes | None = None
+) -> list[FontInfo]:
     """List all fonts used in a PDF or a specific page.
 
     Args:
         pdf_path: Path to the PDF file.
         page: Specific page to analyze (0-indexed). None analyzes all pages.
+        password: Optional password to open an encrypted PDF (A2.3 / INV-W-5).
 
     Returns:
         List of FontInfo objects describing each font.
     """
     path = Path(pdf_path)
-    with open_pdf(path) as pdf:
+    with open_pdf(path, password=password) as pdf:
         pages = _resolve_pages(pdf, page)
         fonts: list[FontInfo] = []
         seen: set[str] = set()
@@ -1053,7 +1202,9 @@ def get_fonts(pdf_path: str, *, page: int | None = None) -> list[FontInfo]:
         return fonts
 
 
-def get_text_layout(pdf_path: str, page: int | None = None) -> list[TextBlock]:
+def get_text_layout(
+    pdf_path: str, page: int | None = None, *, password: str | bytes | None = None
+) -> list[TextBlock]:
     """Return text blocks with their positions, fonts, and sizes.
 
     Each TextBlock represents a contiguous text element (one TJ/Tj
@@ -1062,6 +1213,7 @@ def get_text_layout(pdf_path: str, page: int | None = None) -> list[TextBlock]:
     Args:
         pdf_path: Path to the PDF file.
         page: Optional page number (0-indexed). If None, returns all pages.
+        password: Optional password to open an encrypted PDF (A2.3 / INV-W-5).
 
     Returns:
         List of TextBlock objects sorted by page, then y (top to bottom),
@@ -1069,7 +1221,7 @@ def get_text_layout(pdf_path: str, page: int | None = None) -> list[TextBlock]:
     """
     path = str(Path(pdf_path).resolve())
     blocks: list[TextBlock] = []
-    with open_pdf(path) as pdf:
+    with open_pdf(path, password=password) as pdf:
         pages = _resolve_pages(pdf, page)
         for page_num, page_obj in pages:
             elements = _build_index(page_obj, page_num, pdf_path=path)
@@ -1105,6 +1257,7 @@ def extract_bbox_text(
     bbox: tuple[float, float, float, float],
     page: int,
     tolerance: float = 2.0,
+    password: str | bytes | None = None,
 ) -> str:
     """Extract text from a bounding box region with gap-aware joining.
 
@@ -1117,13 +1270,14 @@ def extract_bbox_text(
         bbox: Target region ``(x0, y0, x1, y1)`` in PDF coordinates.
         page: 0-indexed page number.
         tolerance: Extra margin (in points) for bbox overlap matching.
+        password: Optional password to open an encrypted PDF (A2.3 / INV-W-5).
 
     Returns:
         Extracted text with lines separated by newlines.
     """
     x0, y0, x1, y1 = bbox
     path = str(Path(pdf_path).resolve())
-    with open_pdf(path) as pdf:
+    with open_pdf(path, password=password) as pdf:
         pages = _resolve_pages(pdf, page)
         if not pages:
             return ""

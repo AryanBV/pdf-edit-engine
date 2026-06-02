@@ -5,16 +5,23 @@ from __future__ import annotations
 import contextlib
 import io
 import logging
+import os
 import struct
+import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pikepdf
-from fontTools.ttLib import TTFont, TTLibError  # type: ignore[import-untyped]
+from fontTools.ttLib import TTFont, TTLibError, newTable  # type: ignore[import-untyped]
 from pdfminer.cmapdb import CMapParser, FileUnicodeMap
 
-from pdf_edit_engine._pathutil import open_pdf
-from pdf_edit_engine.errors import EncodingError, FontNotFoundError
+from pdf_edit_engine._pathutil import (
+    MAX_FONT_STREAM_BYTES,
+    MAX_TOUNICODE_BYTES,
+    open_pdf,
+    read_stream_bounded,
+)
+from pdf_edit_engine.errors import EncodingError, FontNotFoundError, FontStreamTooLargeError
 from pdf_edit_engine.models import Degradation, FontInfo
 from pdf_edit_engine.system_fonts import _strip_subset_prefix
 
@@ -43,6 +50,14 @@ _FONT_EXTEND_FAIL_EXCS = (FontNotFoundError, EncodingError, OSError, TTLibError)
 # _FONT_EXTEND_FAIL_EXCS at the caller. Adding RecursionError to the
 # fail-tuple would be a patch; the depth cap is the root fix.
 MAX_COMPOSITE_DEPTH = 64
+
+# sfnt table-directory magic numbers. A font binary beginning with one of
+# these carries an sfnt directory (TrueType / OpenType-CFF / CFF2);
+# anything else under /FontFile3 is a BARE CFF table (raw Type1C program,
+# no directory) that fontTools' TTFont cannot open directly. Shared by
+# _introspect_embedded_font (C.2) and _load_cff_as_ttfont (C.3) so the
+# bare-vs-wrapped decision has one source of truth.
+_SFNT_MAGICS = frozenset({b"OTTO", b"\x00\x01\x00\x00", b"true", b"ttcf"})
 
 
 @contextlib.contextmanager
@@ -149,29 +164,299 @@ def font_has_codepoint(
 
         font_file_obj = font_descriptor.get("/FontFile2")
         if font_file_obj is None:
-            # /FontFile3 (CFF/OpenType) is not yet supported for coverage
-            # checks (ARY-279). Other slots: /FontFile (Type1) — also out
-            # of scope. Best-effort True.
-            return True
+            # C.3: /FontFile3 CFF coverage check so can_encode stops lying
+            # on CFF. A codepoint whose glyph is genuinely ABSENT from the
+            # embedded CFF must return False so the extension path runs and
+            # the C.3 CFF injector can supply it. Other slots: /FontFile
+            # (Type1) — still out of scope, best-effort True.
+            ff3 = font_descriptor.get("/FontFile3")
+            if ff3 is None:
+                return True
+            cff_bytes = read_stream_bounded(ff3, max_decoded=MAX_FONT_STREAM_BYTES, label="font")
+            return _cff_has_codepoint(cff_bytes, font_dict, codepoint)
 
-        font_bytes = font_file_obj.read_bytes()
+        font_bytes = read_stream_bounded(
+            font_file_obj, max_decoded=MAX_FONT_STREAM_BYTES, label="font"
+        )
         with _with_fonttools_translation("font_has_codepoint"):
             tt = TTFont(io.BytesIO(font_bytes))
             try:
                 best_cmap = tt.getBestCmap() or {}
                 glyph_order = set(tt.getGlyphOrder())
                 covered: set[int] = {cp for cp, gname in best_cmap.items() if gname in glyph_order}
+                if codepoint in covered:
+                    return True
+                # INV-C-8: symbol / symbolic fonts often expose glyphs ONLY
+                # through a (3,0) Symbol or (1,0) Macintosh cmap subtable,
+                # which getBestCmap() does not scan. Fall through to those.
+                return _symbol_cmap_has_codepoint(tt, codepoint, glyph_order)
             finally:
                 tt.close()
-    except (TTLibError, OSError):
+    except (TTLibError, OSError, FontNotFoundError):
         # Narrowed catch (m-11): fontTools parse failures and IO errors
-        # only. Best-effort True so can_encode does not regress; downstream
+        # only. A1.3 / INV-W-4: also catch FontNotFoundError so a bombed
+        # /FontFile2 (FontStreamTooLargeError, a FontNotFoundError subclass)
+        # is best-effort True here — can_encode does not regress; the
+        # downstream extension path refuses honestly via _extract_font_bytes.
+        # Best-effort True so can_encode does not regress; downstream
         # extension path will still raise FontNotFoundError if the font
         # turns out to be uninjectable.
-        logger.debug("font_has_codepoint: TTFont parse failed", exc_info=True)
+        logger.debug("font_has_codepoint: stream too large / parse failed", exc_info=True)
         return True
 
-    return codepoint in covered
+
+def _symbol_cmap_has_codepoint(
+    tt: TTFont,
+    codepoint: int,
+    glyph_order: set[str],
+) -> bool:
+    """Return True iff ``codepoint`` resolves via a (3,0) or (1,0) cmap.
+
+    Additive fallback for ``font_has_codepoint`` (INV-C-8): consulted only
+    after the Unicode ``getBestCmap()`` set misses ``codepoint``, so it can
+    never regress a Unicode-cmap lookup.
+
+    Two symbolic-font conventions are handled:
+
+    - **(3, 0) Symbol** — glyphs are stored in the U+F000-F0FF PUA range
+      under the ``0xF000 | byte`` convention. A PDF byte ``c`` (0x00-0xFF) is
+      looked up at ``0xF000 | c``. ``codepoint`` is matched both directly
+      (when ``/ToUnicode`` already reports the PUA value, e.g. U+F041) and
+      via ``0xF000 | (codepoint & 0xFF)`` (raw byte form, e.g. U+0041).
+    - **(1, 0) Macintosh** — glyphs are stored at the raw byte code; matched
+      at ``codepoint & 0xFF``.
+
+    Args:
+        tt: the already-loaded fontTools ``TTFont``.
+        codepoint: Unicode codepoint to resolve.
+        glyph_order: set of glyph names present in the font binary.
+
+    Returns:
+        True if a symbol / Mac subtable maps ``codepoint`` to a present glyph.
+    """
+    low_byte = codepoint & 0xFF
+    cmap_table = tt.get("cmap")
+    if cmap_table is None:
+        return False
+
+    symbol_sub = cmap_table.getcmap(3, 0)
+    if symbol_sub is not None:
+        for key in (codepoint, 0xF000 | low_byte):
+            gname = symbol_sub.cmap.get(key)
+            if gname is not None and gname in glyph_order:
+                return True
+
+    mac_sub = cmap_table.getcmap(1, 0)
+    if mac_sub is not None:
+        gname = mac_sub.cmap.get(low_byte)
+        if gname is not None and gname in glyph_order:
+            return True
+
+    return False
+
+
+def _load_cff_as_ttfont(font_bytes: bytes) -> tuple[TTFont, bool]:
+    """Load a CFF ``/FontFile3`` binary as a ``TTFont``, wrapping bare CFF.
+
+    A ``/FontFile3 /Type1C`` is a BARE CFF table (raw Type1C program, no
+    sfnt directory) that ``TTFont(BytesIO(...))`` cannot open. A ``/FontFile3
+    /OpenType`` is already sfnt-WRAPPED (magic ``b'OTTO'``) and loads
+    directly. This helper unifies both into a ``TTFont`` so the C.3 injector
+    can read ``["head"]`` / ``["hmtx"]`` / ``["maxp"]`` uniformly — the bare
+    case is wrapped into a minimal in-memory sfnt via ``cffLib`` +
+    ``FontBuilder``.
+
+    Args:
+        font_bytes: The raw ``/FontFile3`` payload (bare CFF or full sfnt).
+
+    Returns:
+        A ``(ttfont, was_bare)`` tuple. ``was_bare`` is True when the input
+        was a bare CFF table that this helper wrapped — the caller re-extracts
+        the bare ``CFF `` table on write-back to preserve the ``/Type1C``
+        shape; a wrapped input saves the full sfnt unchanged.
+
+    Raises:
+        TTLibError: If the bytes cannot be parsed as either an sfnt font or a
+            bare CFF table (rebranded to ``FontNotFoundError`` by the caller's
+            ``_with_fonttools_translation`` block).
+    """
+    if font_bytes[:4] in _SFNT_MAGICS:
+        return TTFont(io.BytesIO(font_bytes)), False
+
+    from fontTools.cffLib import CFFFontSet  # type: ignore[import-untyped]
+    from fontTools.fontBuilder import FontBuilder  # type: ignore[import-untyped]
+
+    cff = CFFFontSet()
+    cff.decompile(io.BytesIO(font_bytes), None)
+    top_dict = cff[cff.fontNames[0]]
+    glyph_order = list(top_dict.charset)
+    upem = 1000
+    font_matrix = top_dict.rawDict.get("FontMatrix")
+    if font_matrix and font_matrix[0]:
+        upem = int(round(1.0 / font_matrix[0]))
+
+    # Build a minimal sfnt shell and attach the parsed CFF table, then fill in
+    # the metric/head tables the C.3 injector reads (["head"], ["hmtx"],
+    # ["maxp"]). Widths come from each charstring's own advance.
+    builder = FontBuilder(upem, isTTF=False)
+    builder.setupGlyphOrder(glyph_order)
+    cff_table = newTable("CFF ")
+    cff_table.cff = cff
+    builder.font["CFF "] = cff_table
+    char_strings = top_dict.CharStrings
+    metrics: dict[str, tuple[int, int]] = {}
+    for name in glyph_order:
+        char_string = char_strings[name]
+        if char_string.needsDecompilation():
+            char_string.decompile()
+        width = getattr(char_string, "width", None)
+        if width is None:
+            private = getattr(char_string, "private", None)
+            width = getattr(private, "defaultWidthX", upem) if private is not None else upem
+        metrics[name] = (int(width) if width is not None else upem, 0)
+    builder.setupHorizontalMetrics(metrics)
+    builder.setupHorizontalHeader(ascent=upem, descent=0)
+    builder.setupMaxp()
+    # head carries unitsPerEm, which the injector's UPEM-parity gate reads.
+    # cmap/OS-2/post/name are intentionally OMITTED — the injector never reads
+    # them, and FontBuilder.setupOS2 requires a cmap we do not synthesize.
+    builder.setupHead(unitsPerEm=upem, created=0, modified=0)
+    return builder.font, True
+
+
+def _cff_has_codepoint(
+    cff_bytes: bytes,
+    font_dict: pikepdf.Object,
+    codepoint: int,
+) -> bool:
+    """Return True iff the embedded CFF covers ``codepoint`` (C.3 coverage).
+
+    Stops ``can_encode`` from lying on a CFF font: a codepoint whose glyph is
+    genuinely ABSENT from the embedded CFF returns False so the extension path
+    runs and the C.3 injector can supply it. The conservative goal is "False
+    only when provably absent"; on any parse ambiguity the helper returns
+    best-effort True so it never regresses a font whose coverage cannot be
+    determined (mirrors :func:`font_has_codepoint`'s fallback contract).
+
+    For a CID-keyed Identity-H CFF the content uses CID == GID and
+    ``/ToUnicode`` owns the Unicode mapping, so coverage is resolved as: which
+    CID does the font's ``/ToUnicode`` assign ``codepoint`` to, and is that
+    CID's ``cidNNNNN`` glyph present in the CFF charset? A codepoint absent
+    from ``/ToUnicode`` has no embedded CID → absent → False. For a name-keyed
+    CFF the codepoint is mapped through the CFF's own encoding; an unresolvable
+    lookup is best-effort True.
+
+    Args:
+        cff_bytes: The raw ``/FontFile3`` CFF payload (bare or sfnt-wrapped).
+        font_dict: The top-level Type0 font dictionary (owns ``/ToUnicode``).
+        codepoint: Unicode codepoint to check.
+
+    Returns:
+        True if the codepoint's glyph is present in the embedded CFF (or
+        coverage cannot be determined); False only when provably absent.
+    """
+    try:
+        from fontTools.cffLib import CFFFontSet
+
+        if cff_bytes[:4] in _SFNT_MAGICS:
+            tt = TTFont(io.BytesIO(cff_bytes))
+            try:
+                cff = tt["CFF "].cff
+                top_dict = cff[cff.fontNames[0]]
+                charset = list(top_dict.charset)
+            finally:
+                tt.close()
+        else:
+            cff = CFFFontSet()
+            cff.decompile(io.BytesIO(cff_bytes), None)
+            top_dict = cff[cff.fontNames[0]]
+            charset = list(top_dict.charset)
+
+        if hasattr(top_dict, "ROS"):
+            # CID-keyed: resolve codepoint → CID via /ToUnicode, then check
+            # the cidNNNNN name is in the charset.
+            reverse = {ord(u): cid for cid, u in _parse_existing_tounicode(font_dict).items()}
+            cid = reverse.get(codepoint)
+            if cid is None:
+                return False  # no embedded CID assigned this codepoint
+            return f"cid{cid:05d}" in charset
+        # Name-keyed CFF: best-effort True (coverage via private encoding is
+        # not modelled in slice-1; never regress).
+        return True
+    except (TTLibError, AssertionError, struct.error, OSError, ValueError, KeyError):
+        logger.debug("_cff_has_codepoint: CFF parse failed; best-effort True", exc_info=True)
+        return True
+
+
+def reverse_embedded_cmap(ttfont: TTFont) -> dict[int, str]:
+    """Recover a CID→Unicode map by inverting the embedded font's cmap.
+
+    Used by ``encoding._init_identity_h`` (via a function-local lazy import,
+    mirroring ``font_has_codepoint``) to recover text-extraction mappings for
+    Type0/Identity-H CIDFonts that ship **no** ``/ToUnicode`` CMap. Keeps the
+    fontTools dependency in this module — ``encoding.py`` must not import
+    fontTools (CLAUDE.md dependency-boundary table).
+
+    Under Identity-H the descendant CIDFont's ``/CIDToGIDMap`` defaults to
+    ``/Identity``, so the content-stream CID equals the glyph GID.
+    ``getBestCmap()`` maps a Unicode codepoint → glyph *name*;
+    ``getGlyphID(name)`` maps that name → GID. Composing the two and
+    inverting yields ``CID(==GID) → Unicode char``. When two codepoints map
+    to the same GID the lower codepoint wins (deterministic — real fonts
+    rarely alias except for space variants).
+
+    The CALLER is responsible for the recovery gates (Identity ``/CIDToGIDMap``
+    + ``Identity-H`` encoding) and for PUA rejection / majority-PUA
+    classification; this helper performs only the raw inversion so it stays a
+    pure fontTools utility with no PDF-dictionary or policy knowledge.
+
+    Args:
+        ttfont: The embedded font, already loaded from ``/FontFile2``.
+
+    Returns:
+        A dict mapping CID (int) to a single-character Unicode string. Empty
+        when the font exposes no usable best cmap.
+    """
+    best = ttfont.getBestCmap() or {}
+    cid_to_unicode: dict[int, str] = {}
+    for codepoint, glyph_name in best.items():
+        try:
+            gid = ttfont.getGlyphID(glyph_name)
+        except KeyError:
+            continue
+        existing = cid_to_unicode.get(gid)
+        if existing is None or codepoint < ord(existing):
+            cid_to_unicode[gid] = chr(codepoint)
+    return cid_to_unicode
+
+
+def recover_cid_to_unicode_from_fontfile2(font_bytes: bytes) -> dict[int, str]:
+    """Load a TrueType ``/FontFile2`` and recover its CID→Unicode map.
+
+    Thin bytes→map adapter around :func:`reverse_embedded_cmap` so that
+    ``encoding._init_identity_h`` can recover ToUnicode-absent Identity-H
+    fonts via a single function-local lazy import without itself importing
+    fontTools (CLAUDE.md dependency-boundary table — encoding.py keeps NO
+    fontTools import). All fontTools parse/IO failures are swallowed to an
+    empty dict so the caller treats the font as untextable rather than
+    crashing.
+
+    Args:
+        font_bytes: Raw bytes of the embedded ``/FontFile2`` TrueType binary.
+
+    Returns:
+        The recovered ``CID(==GID) → single-char Unicode`` map, or ``{}`` on
+        any parse failure or when the font exposes no usable cmap.
+    """
+    try:
+        with _with_fonttools_translation("recover_cid_to_unicode_from_fontfile2"):
+            tt = TTFont(io.BytesIO(font_bytes))
+            try:
+                return reverse_embedded_cmap(tt)
+            finally:
+                tt.close()
+    except _FONT_EXTEND_FAIL_EXCS:
+        return {}
 
 
 # ── Private helpers ──────────────────────────────────────────────────────
@@ -230,27 +515,329 @@ def _get_font_objects(
     return font_obj, None, fd_obj
 
 
+def _classify_outline_table(
+    ttfont: TTFont,
+) -> Literal["glyf", "cff", "cff2", "unknown"]:
+    """Classify a loaded font by the outline table it ACTUALLY carries.
+
+    Pure function of the loaded ``TTFont`` — no PDF/pikepdf objects, no
+    I/O. Sniffs the sfnt tables present rather than trusting the
+    ``/FontFile2`` vs ``/FontFile3`` slot the binary was embedded under.
+    This is the root of the C.1 dispatch split (INV-C-9): a ``/FontFile3``
+    may carry CFF (Type1C), CFF2, OR ``glyf`` (OpenType-with-TrueType-
+    outlines), and only the real table decides whether Tier 1.5 glyph
+    injection (which requires ``glyf``) is applicable.
+
+    Glyf is checked FIRST so an OpenType binary that carries ``glyf``
+    classifies as ``glyf`` regardless of slot. ``CFF2`` precedes ``CFF``
+    because a font carrying both is CFF2-primary. Note the trailing space
+    in the sfnt tag ``"CFF "``.
+
+    Args:
+        ttfont: A loaded ``fontTools.ttLib.TTFont``.
+
+    Returns:
+        ``"glyf"``, ``"cff"``, ``"cff2"``, or ``"unknown"``.
+    """
+    if "glyf" in ttfont:
+        return "glyf"
+    if "CFF2" in ttfont:
+        return "cff2"
+    if "CFF " in ttfont:
+        return "cff"
+    return "unknown"
+
+
+def classify_embedded_outline(fd: pikepdf.Object) -> str:
+    """Return the truthful ``embedded_type`` label for a font descriptor.
+
+    Single truth source for ``FontInfo.embedded_type`` (INV-C-9): loads
+    the embedded binary via :func:`_extract_font_bytes`, loads a
+    ``TTFont`` INSIDE this module under
+    :func:`_with_fonttools_translation`, classifies via the pure
+    :func:`_classify_outline_table`, and maps the table kind to the
+    ``embedded_type`` string. Both producers — this helper (used by
+    ``locator._detect_embedded_type``) and :func:`_extract_font_bytes`
+    (used on the extension path) — route through the SAME classifier so
+    they can never disagree.
+
+    The fontTools dependency lives here, NOT in ``locator`` (CLAUDE.md
+    dependency-boundary table): ``locator`` calls this helper rather than
+    importing fontTools for outline-table logic.
+
+    Mapping: ``glyf`` →``"TrueType"`` (slot-agnostic; covers
+    OpenType-with-glyf, which gets the honest ``"opentype-glyf"`` label
+    only when sourced from ``/FontFile3``), ``cff`` →``"CFF"``, ``cff2``
+    →``"cff2"``. ``/FontFile`` (Type1) short-circuits to ``"Type1"``
+    without a ``TTFont`` load. On a load/classification failure the SLOT
+    label is returned as a best-effort fallback so callers never crash on
+    a malformed binary.
+
+    Args:
+        fd: The /FontDescriptor dictionary.
+
+    Returns:
+        The truthful ``embedded_type`` string.
+
+    Raises:
+        FontNotFoundError: If no embedded font stream is present.
+    """
+    # Type1 (/FontFile) has no sfnt table directory; do not attempt a
+    # TTFont load. Match the historical slot label.
+    if "/FontFile2" not in fd and "/FontFile3" not in fd:
+        if "/FontFile" in fd:
+            return "Type1"
+        msg = "No embedded font stream (FontFile/FontFile2/FontFile3) found"
+        raise FontNotFoundError(msg)
+
+    slot_is_fontfile3 = "/FontFile2" not in fd
+    slot_label = "CFF" if slot_is_fontfile3 else "TrueType"
+    try:
+        if "/FontFile2" in fd:
+            font_bytes = read_stream_bounded(
+                fd["/FontFile2"], max_decoded=MAX_FONT_STREAM_BYTES, label="font"
+            )
+        else:
+            font_bytes = read_stream_bounded(
+                fd["/FontFile3"], max_decoded=MAX_FONT_STREAM_BYTES, label="font"
+            )
+    except FontStreamTooLargeError:
+        # A1.3 / INV-W-4: a bombed embedded stream cannot be classified;
+        # mirror the best-effort slot-label fallback used below on a
+        # fontTools load failure.
+        return slot_label
+
+    try:
+        with _with_fonttools_translation("classify_embedded_outline"):
+            tt = TTFont(io.BytesIO(font_bytes))
+            try:
+                kind = _classify_outline_table(tt)
+            finally:
+                tt.close()
+    except FontNotFoundError:
+        # _with_fonttools_translation rebrands fontTools load failures to
+        # FontNotFoundError. Honour the best-effort contract: fall back to
+        # the slot label rather than escalating a metadata read.
+        return slot_label
+
+    if kind == "glyf":
+        # glyf-in-/FontFile3 is OpenType-with-TrueType-outlines — surface
+        # the honest distinct label; glyf-in-/FontFile2 is plain TrueType.
+        return "opentype-glyf" if slot_is_fontfile3 else "TrueType"
+    if kind == "cff":
+        return "CFF"
+    if kind == "cff2":
+        return "cff2"
+    return slot_label
+
+
 def _extract_font_bytes(fd: pikepdf.Object) -> tuple[bytes, str]:
     """Extract embedded font binary and determine embedded type.
+
+    The ``embedded_type`` is derived from the outline table the binary
+    ACTUALLY carries (via :func:`classify_embedded_outline`), NOT from the
+    ``/FontFile2`` vs ``/FontFile3`` slot — so a ``/FontFile3`` that is
+    truly CFF reports ``"CFF"`` while one carrying ``glyf`` reports
+    ``"opentype-glyf"`` (INV-C-9).
 
     Args:
         fd: Font descriptor dictionary.
 
     Returns:
-        Tuple of (font_bytes, embedded_type) where embedded_type is
-        'TrueType', 'CFF', or 'Type1'.
+        Tuple of (font_bytes, embedded_type).
 
     Raises:
         FontNotFoundError: If no embedded font stream is found.
     """
     if "/FontFile2" in fd:
-        return bytes(fd["/FontFile2"].read_bytes()), "TrueType"
+        return (
+            read_stream_bounded(fd["/FontFile2"], max_decoded=MAX_FONT_STREAM_BYTES, label="font"),
+            classify_embedded_outline(fd),
+        )
     if "/FontFile3" in fd:
-        return bytes(fd["/FontFile3"].read_bytes()), "CFF"
+        return (
+            read_stream_bounded(fd["/FontFile3"], max_decoded=MAX_FONT_STREAM_BYTES, label="font"),
+            classify_embedded_outline(fd),
+        )
     if "/FontFile" in fd:
-        return bytes(fd["/FontFile"].read_bytes()), "Type1"
+        return (
+            read_stream_bounded(fd["/FontFile"], max_decoded=MAX_FONT_STREAM_BYTES, label="font"),
+            "Type1",
+        )
     msg = "No embedded font stream (FontFile/FontFile2/FontFile3) found"
     raise FontNotFoundError(msg)
+
+
+def _introspect_embedded_font(font_bytes: bytes, outline_kind: str) -> int:
+    """Return the truthful glyph count of an embedded font binary.
+
+    Best-effort, dispatch-on-outline-kind introspection (INV-C-10). Parses
+    the embedded binary per outline type and returns the real glyph count:
+
+    - ``glyf`` / ``TrueType`` / ``opentype-glyf`` →
+      ``len(TTFont.getGlyphOrder())`` (a bare ``glyf`` always carries an
+      sfnt directory).
+    - ``cff`` / ``CFF`` / ``cff2`` → the embedded CFF can arrive in EITHER of
+      two shapes: an sfnt-WRAPPED OpenType-CFF/CFF2 (``/FontFile3 /OpenType``,
+      magic ``b'OTTO'`` — the DOMINANT real-world shape) OR a BARE CFF table
+      (``/FontFile3 /Type1C``, raw Type1C program, no sfnt directory). The
+      sfnt-wrapped case is read via ``len(TTFont.getGlyphOrder())`` (``TTFont``
+      reads OpenType-CFF/CFF2 fine); only the bare-table case falls back to
+      ``len(cffLib.CFFFontSet[...].CharStrings)`` (``CharStrings``, not
+      ``.charset``, because CFF2 has no named charset). Calling
+      ``CFFFontSet.decompile`` on a raw sfnt stream raises ``AssertionError``,
+      so the ``TTFont``-first order is load-bearing.
+    - ``Type1`` (``/FontFile``) → ``len(t1Lib.T1Font.font['CharStrings'])``.
+      ``t1Lib.T1Font`` only reads from a PATH (its ``__init__`` requires a
+      positional ``path`` and has no in-memory byte entry point), so the bytes
+      are written to a temp file, parsed, and the temp file is removed.
+    - anything else (``unknown``) → 0.
+
+    CRITICAL (INV-C-10 dep-boundary firewall): this helper does NOT route its
+    parse through :func:`_with_fonttools_translation` (that manager RAISES
+    ``FontNotFoundError`` on a parse failure). Each branch wraps its parser in
+    a local broad-but-bounded ``try``/``except`` and returns 0 on ANY failure,
+    so a present-but-unparseable binary yields 0 (unknown) rather than raising.
+    The public :func:`embedded_glyph_count` is the dependency-boundary
+    firewall ``locator`` imports — never cffLib/t1Lib/TTFont directly.
+
+    No caching (mirrors :func:`font_has_codepoint`'s no-cache decision).
+
+    Args:
+        font_bytes: The raw embedded font binary.
+        outline_kind: The outline-table label from
+            :func:`classify_embedded_outline` (or :func:`_extract_font_bytes`).
+
+    Returns:
+        The truthful glyph count, or 0 when the binary is absent/unparseable
+        or the outline kind is unknown. Never raises on a read.
+    """
+    # Bounded-but-broad failure tuple. Mirrors the `except Exception` pattern
+    # already used in locator._build_font_info's TTFont load — a present-but-
+    # corrupt binary must yield 0, not propagate.
+    _read_fail = (
+        TTLibError,
+        AssertionError,
+        struct.error,
+        OSError,
+        ValueError,
+        KeyError,
+        IndexError,
+        MemoryError,
+        OverflowError,
+        Exception,
+    )
+
+    if outline_kind in {"glyf", "TrueType", "opentype-glyf"}:
+        try:
+            tt = TTFont(io.BytesIO(font_bytes))
+            try:
+                return len(tt.getGlyphOrder())
+            finally:
+                tt.close()
+        except _read_fail:
+            logger.debug("_introspect_embedded_font: glyf parse failed", exc_info=True)
+            return 0
+
+    if outline_kind in {"cff", "CFF", "cff2"}:
+        # The CFF can be sfnt-WRAPPED (OpenType-CFF/CFF2 — magic OTTO/0001/true/
+        # ttcf, the dominant real-world shape) OR a BARE CFF table (raw Type1C
+        # program, no sfnt directory). TTFont reads the sfnt-wrapped case fine;
+        # CFFFontSet.decompile only reads the bare table (it raises
+        # AssertionError on a raw sfnt stream). Try TTFont FIRST, fall back to
+        # the bare-table reader.
+        if font_bytes[:4] in _SFNT_MAGICS:
+            try:
+                tt = TTFont(io.BytesIO(font_bytes))
+                try:
+                    return len(tt.getGlyphOrder())
+                finally:
+                    tt.close()
+            except _read_fail:
+                logger.debug("_introspect_embedded_font: sfnt-CFF parse failed", exc_info=True)
+                return 0
+        try:
+            from fontTools.cffLib import CFFFontSet
+
+            cff = CFFFontSet()
+            cff.decompile(io.BytesIO(font_bytes), None)
+            top_dict = cff[cff.fontNames[0]]
+            return len(top_dict.CharStrings)
+        except _read_fail:
+            logger.debug("_introspect_embedded_font: bare-CFF parse failed", exc_info=True)
+            return 0
+
+    if outline_kind == "Type1":
+        # t1Lib.T1Font reads ONLY from a path (its __init__ requires a
+        # positional `path` and offers no in-memory byte entry point). The
+        # prior no-arg `t1Lib.T1Font()` raised TypeError before any parse, so
+        # this branch was dead code that always returned 0. Write the embedded
+        # bytes to a temp file, parse, and remove the file.
+        tmp_path: str | None = None
+        try:
+            from fontTools import t1Lib  # type: ignore[import-untyped]
+
+            fd, tmp_path = tempfile.mkstemp(suffix=".pfa")
+            os.close(fd)
+            with open(tmp_path, "wb") as handle:
+                handle.write(font_bytes)
+            t1 = t1Lib.T1Font(tmp_path)
+            t1.parse()
+            return len(t1.font["CharStrings"])
+        except _read_fail:
+            logger.debug("_introspect_embedded_font: Type1 parse failed", exc_info=True)
+            return 0
+        finally:
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+
+    return 0
+
+
+def embedded_glyph_count(fd: pikepdf.Object) -> int:
+    """Return the truthful embedded glyph count for a font descriptor.
+
+    Dependency-boundary-safe route ``locator.get_fonts`` uses to introspect
+    the real glyph count WITHOUT importing fontTools/cffLib/t1Lib (CLAUDE.md
+    dependency-boundary table). Best-effort: NEVER raises on a present stream
+    — returns 0 when the binary is absent, the classifier fails, or the
+    parser cannot read it.
+
+    Reuses the C.1 classifier (:func:`classify_embedded_outline`, already
+    best-effort) for the outline-kind dispatch, reads the raw bytes from
+    whichever of ``/FontFile2`` / ``/FontFile3`` / ``/FontFile`` is present,
+    and delegates the per-kind parse to :func:`_introspect_embedded_font`.
+
+    Args:
+        fd: The /FontDescriptor dictionary.
+
+    Returns:
+        The truthful glyph count, or 0 when no embedded stream is present or
+        the binary cannot be parsed.
+    """
+    try:
+        if "/FontFile2" in fd:
+            font_bytes = read_stream_bounded(
+                fd["/FontFile2"], max_decoded=MAX_FONT_STREAM_BYTES, label="font"
+            )
+        elif "/FontFile3" in fd:
+            font_bytes = read_stream_bounded(
+                fd["/FontFile3"], max_decoded=MAX_FONT_STREAM_BYTES, label="font"
+            )
+        elif "/FontFile" in fd:
+            font_bytes = read_stream_bounded(
+                fd["/FontFile"], max_decoded=MAX_FONT_STREAM_BYTES, label="font"
+            )
+        else:
+            return 0
+        outline_kind = classify_embedded_outline(fd)
+    except (FontNotFoundError, TTLibError, OSError, ValueError, KeyError):
+        # A1.3 / INV-W-4: FontStreamTooLargeError is a FontNotFoundError
+        # subclass, so a bombed stream is caught here -> glyph_count 0
+        # (unknown) and locator surfaces font_subset_introspection_failed.
+        return 0
+    return _introspect_embedded_font(font_bytes, outline_kind)
 
 
 def _parse_existing_tounicode(
@@ -266,7 +853,9 @@ def _parse_existing_tounicode(
     """
     if "/ToUnicode" not in font_dict:
         return {}
-    tu_bytes: bytes = font_dict["/ToUnicode"].read_bytes()
+    tu_bytes: bytes = read_stream_bounded(
+        font_dict["/ToUnicode"], max_decoded=MAX_TOUNICODE_BYTES, label="ToUnicode"
+    )
     cmap = FileUnicodeMap()
     CMapParser(cmap, io.BytesIO(tu_bytes)).run()
     return dict(cmap.cid2unichr)
@@ -303,7 +892,9 @@ def _append_to_unicode_cmap(
     if not deduped:
         return
 
-    raw = font_dict["/ToUnicode"].read_bytes().decode("latin-1")
+    raw = read_stream_bounded(
+        font_dict["/ToUnicode"], max_decoded=MAX_TOUNICODE_BYTES, label="ToUnicode"
+    ).decode("latin-1")
     endcmap_pos = raw.rfind("endcmap")
     if endcmap_pos < 0:
         logger.warning("ToUnicode CMap has no 'endcmap' marker; cannot append")
@@ -384,7 +975,9 @@ def _update_cid_to_gid_map(
         return  # /Identity or absent — implicit identity mapping
 
     # Explicit stream — update the binary CID→GID table
-    data = bytearray(cidtogidmap.read_bytes())
+    data = bytearray(
+        read_stream_bounded(cidtogidmap, max_decoded=MAX_TOUNICODE_BYTES, label="CIDToGIDMap")
+    )
 
     for cid, gid in new_mappings.items():
         offset = cid * 2
@@ -629,6 +1222,258 @@ def _inject_glyph_in_place(
     return new_gid
 
 
+def _cff_charstring_is_composite(charstring: object) -> bool:
+    """Return True iff a Type2 charstring is a seac/composite glyph.
+
+    Pure predicate. The slice-1 CFF injector (:func:`_inject_cff_glyph_in_place`)
+    supports only single, non-composite outlines. The legacy Type2 ``seac``
+    accent-composition form encodes a composite as ``adx ady bchar achar
+    endchar`` — an ``endchar`` operator preceded by exactly four numeric
+    operands. A simple glyph's ``endchar`` has zero (or, with a trailing
+    width, one) preceding numeric operand. This decompiles the charstring and
+    scans its program for that 4-arg ``endchar`` form.
+
+    Args:
+        charstring: A ``fontTools.misc.psCharStrings.T2CharString``.
+
+    Returns:
+        True if the charstring is a seac composite (must be refused).
+    """
+    if charstring.needsDecompilation():  # type: ignore[attr-defined]
+        charstring.decompile()  # type: ignore[attr-defined]
+    program = charstring.program  # type: ignore[attr-defined]
+    pending_args = 0
+    for token in program:
+        if isinstance(token, (int, float)):
+            pending_args += 1
+            continue
+        if token == "endchar":
+            return pending_args >= 4
+        pending_args = 0
+    return False
+
+
+def _cff_cid_from_charset_name(name: str) -> int | None:
+    """Parse the integer CID encoded by a CID-keyed CFF charset glyph name.
+
+    Pure helper for the collision-free CID selection in
+    :func:`_inject_cff_glyph_in_place`. A CID-keyed CFF charset entry is the
+    string ``cid{N:05d}`` (fontTools' ``getCIDfromName`` does ``int(name[3:])``
+    when serializing), so the integer CID a pre-existing glyph occupies can be
+    recovered from its name. The ``.notdef`` sentinel (CID 0, GID 0) and any
+    other non-``cid`` name carry no parseable CID.
+
+    Args:
+        name: A charset glyph name (e.g. ``"cid00003"`` or ``".notdef"``).
+
+    Returns:
+        The integer CID, or ``None`` for ``.notdef`` / any non-``cidNNNNN`` name.
+    """
+    if not name.startswith("cid"):
+        return None
+    try:
+        return int(name[3:])
+    except ValueError:
+        return None
+
+
+def _inject_cff_glyph_in_place(
+    embedded: TTFont,
+    system: TTFont,
+    ch: str,
+    *,
+    min_cid: int = 0,
+) -> int:
+    """Append a donor CFF glyph into an embedded CID-keyed CFF at a new GID.
+
+    The CFF (Type2 charstring) sibling of :func:`_inject_glyph_in_place`
+    (which handles ``glyf`` outlines). Adapts the proven spike idiom
+    ``experiments/v020_c3_cff_spike/probe_verify.py``: the donor outline is
+    DRAWN into the embedded font's CFF context via a ``T2CharStringPen`` bound
+    to the embedded private + global subrs (so donor subroutine indices are
+    flattened, never carried as dangling references), appended at a fresh
+    COLLISION-FREE ``CID == GID`` at the additive tail (INV-C-11; pre-existing
+    CIDs untouched, the ARY-278 no-renumber discipline for CFF — INV-C-12), and
+    the CID-keyed ``charset`` / ``FDSelect`` / ``CIDCount`` / glyph order /
+    ``maxp`` / hmtx are maintained. Does NOT modify the PDF font dictionary or
+    ToUnicode/W — that is the caller's responsibility (:func:`_extend_cff_tier`).
+
+    **Collision-free CID selection (INV-C-12).** This mirrors the ``glyf`` Tier
+    1.5 body (``_extend_tier2`` → :func:`_pad_glyph_order`): a real subsetted
+    CID-keyed CFF keeps its ORIGINAL non-contiguous CIDs in the charset while
+    packing GIDs densely, so a pre-existing CID can be ``>= len(glyphOrder)``
+    (e.g. ``B`` at CID 3 / GID 2 in a 3-glyph font). Picking
+    ``new_cid = len(glyphOrder)`` blindly would COLLIDE with that pre-existing
+    CID and silently corrupt unrelated text (the ARY-278 "1ova,ndustries"
+    failure ported to CFF). Instead ``new_cid`` is taken above BOTH the largest
+    integer CID the embedded ``charset`` encodes AND the caller-supplied
+    ``min_cid`` floor (the largest ``/ToUnicode`` CID, threaded by
+    :func:`_extend_cff_tier`): ``new_cid = max(len(glyphOrder),
+    max_existing_cid + 1, min_cid)``. Under Identity-H (``/CIDToGIDMap
+    /Identity``) ``CID == GID`` is REQUIRED, so the real glyph is placed at
+    ``GID == new_cid`` by padding GIDs ``[len(glyphOrder), new_cid)`` with empty
+    placeholder glyphs (``.notdef``-equivalent, ``cidNNNNN`` names at FREE CIDs,
+    ``(0, 0)`` hmtx, FDSelect → FD 0) — the CFF analogue of
+    :func:`_pad_glyph_order`. Pre-existing charstrings / charset entries stay
+    byte-identical (the injection is append-only beyond the pad).
+
+    Slice-1 scope is enforced by hard refusals (each a ``FontNotFoundError``,
+    in ``_FONT_EXTEND_FAIL_EXCS``): non-CFF embedded/donor, non-CID-keyed
+    (no ``ROS``) embedded, multi-FD embedded, ``unitsPerEm`` mismatch, donor
+    char absent from the donor cmap, and seac/composite donor glyph. Every
+    out-of-scope shape REFUSES rather than producing a wrong glyph (INV-C-13).
+
+    Args:
+        embedded: Destination ``TTFont`` (the embedded CID-keyed CFF).
+        system: Source/donor ``TTFont`` (a non-composite CFF of matching upem).
+        ch: Single Unicode character to inject.
+        min_cid: Lower bound (exclusive of collisions) the new CID must clear,
+            in addition to the embedded charset's own CIDs. The caller
+            (:func:`_extend_cff_tier`) passes ``max(/ToUnicode CIDs) + 1`` so a
+            CID referenced only by the PDF-level CMap (not yet by the embedded
+            charset) cannot be re-used either. Defaults to 0 (charset-only).
+
+    Returns:
+        The new GID (== new collision-free CID) assigned to the injected glyph.
+
+    Raises:
+        FontNotFoundError: On any out-of-scope shape (see slice-1 scope above).
+    """
+    from fontTools.misc.psCharStrings import T2CharString  # type: ignore[import-untyped]
+    from fontTools.pens.t2CharStringPen import T2CharStringPen  # type: ignore[import-untyped]
+
+    # 1. Outline-table gate: both embedded and donor must be CFF.
+    if "CFF " not in embedded:
+        raise FontNotFoundError(
+            "embedded font is not CFF; CFF injection requires a CFF embedded font"
+        )
+    if "CFF " not in system:
+        raise FontNotFoundError(
+            "CFF injection requires a CFF donor; got a non-CFF (TrueType/glyf) donor"
+        )
+
+    # 2. Bind TopDicts.
+    e_cff = embedded["CFF "].cff
+    e_td = e_cff[e_cff.fontNames[0]]
+    s_cff = system["CFF "].cff
+    s_td = s_cff[s_cff.fontNames[0]]
+
+    # 3. CID-keyed gate + single-FD gate.
+    # "slice-1" = the v0.2.0 C.3 CFF-injection scope; kept out of user-facing
+    # strings (B10) — internal scope jargon belongs in comments, not messages.
+    if not hasattr(e_td, "ROS"):
+        raise FontNotFoundError("CFF injection requires a CID-keyed (ROS) embedded font")
+    if len(e_td.FDArray) != 1:
+        raise FontNotFoundError("multi-FD CID CFF is unsupported")
+
+    # 4. unitsPerEm parity (no outline rescaling in slice-1).
+    embedded_upem = embedded["head"].unitsPerEm
+    system_upem = system["head"].unitsPerEm
+    if embedded_upem != system_upem:
+        raise FontNotFoundError(
+            f"unitsPerEm mismatch: embedded={embedded_upem}, "
+            f"system={system_upem}. CFF injection does not rescale outlines."
+        )
+
+    # 5. Resolve donor glyph + reject composite/seac.
+    cp = ord(ch)
+    s_cmap = system.getBestCmap() or {}
+    if cp not in s_cmap:
+        raise FontNotFoundError(f"character {ch!r} (U+{cp:04X}) not in donor cmap")
+    donor_name = s_cmap[cp]
+    if _cff_charstring_is_composite(s_td.CharStrings[donor_name]):
+        raise FontNotFoundError("CFF composite/seac glyph injection is unsupported")
+
+    # 6. Collision-free placement: CID == GID at the additive tail, above BOTH
+    #    the embedded charset's own CIDs and the caller's /ToUnicode floor
+    #    (min_cid). A sparse subsetted CID CFF keeps non-contiguous CIDs (e.g.
+    #    B at CID 3 / GID 2 in a 3-glyph font), so new_cid == len(glyphOrder)
+    #    would collide. Mirror the glyf _pad_glyph_order discipline.
+    glyph_order = list(embedded.getGlyphOrder())
+    used_cids: set[int] = {0}  # CID 0 is reserved for .notdef (GID 0).
+    for name in e_td.charset:
+        cid = _cff_cid_from_charset_name(name)
+        if cid is not None:
+            used_cids.add(cid)
+    max_existing_cid = max(used_cids)
+    new_cid = max(len(glyph_order), max_existing_cid + 1, min_cid)
+    new_gid = new_cid
+    new_name = f"cid{new_cid:05d}"
+    used_cids.add(new_cid)
+
+    # 6b. Force the embedded hmtx table to decompile NOW, while maxp.numGlyphs
+    #     still reflects the OLD glyph count. hmtx decompilation is lazy and
+    #     sizes itself against maxp.numGlyphs; bumping numGlyphs first (step 10)
+    #     would make a later first access read against the new (larger) count
+    #     and raise "not enough hmtx table data". Reading the table here binds
+    #     it to the current glyph order before the count changes.
+    embedded_hmtx = embedded["hmtx"]
+
+    cs = e_td.CharStrings
+    fd_private = e_td.FDArray[0].Private
+
+    def _append_cff_glyph(name: str, charstring: object, advance: int, lsb: int) -> None:
+        """Append one glyph (charstring + charset + FDSelect + order + hmtx).
+
+        Shared by the empty pad placeholders and the real donor glyph. Uses the
+        manual indexed idiom (direct ``cs[name] =`` raises on a new name in the
+        indexed case) and the ``embedded_hmtx[name] = (adv, lsb)`` form that
+        bumps ``numberOfHMetrics`` (the ``hmtx.metrics[name] =`` form does not
+        and fails re-serialization with "not enough hmtx data").
+        """
+        if cs.charStringsAreIndexed:
+            idx = len(cs.charStringsIndex)
+            cs.charStringsIndex.append(charstring)
+            cs.charStrings[name] = idx
+        else:
+            cs.charStrings[name] = charstring
+        e_td.charset.append(name)
+        e_td.FDSelect.gidArray.append(0)
+        glyph_order.append(name)
+        embedded_hmtx[name] = (advance, lsb)
+
+    # 7. Pad GIDs [len(glyphOrder), new_cid) with empty placeholder glyphs at
+    #    FREE CIDs (the CFF analogue of _pad_glyph_order). Each placeholder is a
+    #    .notdef-equivalent empty Type2 charstring routed to FD 0 with (0, 0)
+    #    hmtx; its charset CID must be a unique, unused integer (a CID-keyed
+    #    charset name MUST parse as cidNNNNN — fontTools does int(name[3:])).
+    def _next_free_cid() -> int:
+        cid = 1
+        while cid in used_cids:
+            cid += 1
+        used_cids.add(cid)
+        return cid
+
+    for _ in range(len(glyph_order), new_cid):
+        pad_cid = _next_free_cid()
+        pad_name = f"cid{pad_cid:05d}"
+        empty_cs = T2CharString(
+            program=["endchar"], private=fd_private, globalSubrs=e_td.GlobalSubrs
+        )
+        _append_cff_glyph(pad_name, empty_cs, 0, 0)
+
+    # 8. Draw the donor outline into the embedded CFF context (flattens subrs)
+    #    and append the real glyph at GID == new_cid.
+    donor_glyph_set = system.getGlyphSet()
+    donor_advance, donor_lsb = system["hmtx"][donor_name]
+    pen = T2CharStringPen(donor_advance, donor_glyph_set)
+    donor_glyph_set[donor_name].draw(pen)
+    drawn = pen.getCharString(private=fd_private, globalSubrs=e_td.GlobalSubrs)
+    new_cs = T2CharString(
+        program=list(drawn.program), private=fd_private, globalSubrs=e_td.GlobalSubrs
+    )
+    _append_cff_glyph(new_name, new_cs, donor_advance, donor_lsb)
+
+    # 9. Finalize CID-keyed dicts + glyph order + maxp now that every slot has
+    #    been appended (FDSelect.numGlyphs, CIDCount, glyphOrder, maxp).
+    e_td.FDSelect.numGlyphs = len(e_td.FDSelect.gidArray)
+    e_td.CIDCount = max(e_td.CIDCount, new_cid + 1)
+    embedded.setGlyphOrder(glyph_order)
+    embedded["maxp"].numGlyphs = len(glyph_order)
+
+    return new_gid
+
+
 def _detect_postscript_name(fd: pikepdf.Object) -> str:
     """Extract PostScript name from a font descriptor."""
     name_obj = fd.get("/FontName")
@@ -705,15 +1550,26 @@ def _analyze_from_page(
     )
     postscript_name = _strip_subset_prefix(raw_ps_name)
 
-    # Extract font binary and load with fonttools
+    # Extract font binary and introspect the truthful glyph count per outline
+    # type (INV-C-10). _extract_font_bytes still raises FontNotFoundError when
+    # NO embedded stream is present (its documented contract is unchanged);
+    # _introspect_embedded_font is best-effort and returns 0 — never raises —
+    # on a PRESENT-but-non-glyf or unparseable binary, so analyze_subset stops
+    # raising on a bare CFF / Type1.
     font_bytes, embedded_type = _extract_font_bytes(fd)
-    with _with_fonttools_translation(f"analyze_subset:{font_name}"):
-        font = TTFont(io.BytesIO(font_bytes))
-        try:
-            glyph_count = len(font.getGlyphOrder())
-            font_cmap = font.getBestCmap()
-        finally:
-            font.close()
+    glyph_count = _introspect_embedded_font(font_bytes, embedded_type)
+
+    # font_cmap (getBestCmap) is only meaningful for glyf outlines — a bare
+    # CFF / Type1 cannot supply a Unicode cmap via TTFont. Guard the load
+    # behind the glyf branch; best-effort None otherwise.
+    font_cmap: dict[int, str] | None = None
+    if embedded_type in {"glyf", "TrueType", "opentype-glyf"}:
+        with _with_fonttools_translation(f"analyze_subset:{font_name}"):
+            font = TTFont(io.BytesIO(font_bytes))
+            try:
+                font_cmap = font.getBestCmap()
+            finally:
+                font.close()
 
     return FontInfo(
         name=font_name,
@@ -769,8 +1625,13 @@ def extend_subset(
     The caller (surgeon.py) is responsible for saving the PDF afterward.
 
     Uses two-tier approach:
-    1. CMap-only extension if glyphs exist in embedded font data.
-    2. Full re-embed from system font if glyphs are missing.
+    1. Tier 1 — CMap-only extension if the glyph already exists in the
+       embedded font data.
+    2. Tier 1.5 — in-place glyph injection: append the missing glyph
+       outline from the matching system font at a fresh GID and
+       re-serialize /FontFile2; pre-existing CIDs are preserved. This
+       replaced the removed v0.1.0 Tier 2 full re-embed (ARY-278), which
+       renumbered CIDs and corrupted unrelated content-stream text.
 
     Args:
         pdf: The open pikepdf.Pdf object (modified in-place).
@@ -813,6 +1674,23 @@ def extend_subset(
         if cid_font is None:
             msg = f"No CIDFont descendant for {font_name}"
             raise FontNotFoundError(msg)
+        # B.3 backstop (M0 Rank-2.5, WRITE = refuse-on-gap): a Type0 font
+        # with no /ToUnicode reached the extension path. Tier 1/1.5 both call
+        # _append_to_unicode_cmap, which read_bytes() the (absent) /ToUnicode
+        # and raise a raw KeyError that escapes _FONT_EXTEND_FAIL_EXCS. Refuse
+        # here with FontNotFoundError (in the fail tuple) so EVERY write
+        # caller — surgeon, reflow, structural — degrades to a typed
+        # font_extension_failed Degradation instead of crashing. surgeon's
+        # resolver-level gate (is_tounicode_recovered) refuses earlier with
+        # the more specific tounicode_recovered kind; this is the shared
+        # backstop for the other paths. Writing a fresh /ToUnicode to enable
+        # extension on a recovered font is deferred (out of B.3 scope).
+        if "/ToUnicode" not in font_dict:
+            msg = (
+                f"font {font_name} has no /ToUnicode; new-glyph extension would "
+                f"require synthesising a ToUnicode CMap (out of scope). Refusing."
+            )
+            raise FontNotFoundError(msg)
         # CID Identity-H path follows below verbatim.
     elif subtype == "/TrueType":
         # Reject CFF/OpenType outlines and Type1 explicitly inside the
@@ -845,6 +1723,25 @@ def extend_subset(
             f"simple /TrueType fonts; got {subtype} for {font_name}"
         )
         raise FontNotFoundError(msg)
+
+    # C.3 CFF route. A Type0/CID font whose outline is CFF (Type1C, bare or
+    # sfnt-wrapped) cannot be loaded by the glyf path's TTFont(BytesIO(...))
+    # below — a BARE CFF has no sfnt directory and raises TTLibError. Classify
+    # via the bare-CFF-safe classify_embedded_outline (which falls back to the
+    # slot label rather than crashing) and route CFF straight to _extend_tier2,
+    # which branches to the CFF injector. Non-CFF outlines fall through to the
+    # existing glyf Tier 1/1.5 split unchanged.
+    if classify_embedded_outline(fd) == "CFF" and "/FontFile3" in fd:
+        return _extend_tier2(
+            pdf,
+            font_dict,
+            cid_font,
+            fd,
+            additional_chars,
+            full_font_path,
+            substitution_log,
+            degradations,
+        )
 
     # Extract and load the embedded font
     font_bytes, _embedded_type = _extract_font_bytes(fd)
@@ -1015,7 +1912,10 @@ def _extend_tier2(
         else:
             system_path, origin, substituted_name = found
     if system_path is None or not Path(system_path).is_file():
-        msg = f"System font not found for '{ps_name}'. Install the font or provide full_font_path."
+        msg = (
+            f"System font not found for '{ps_name}' — install the font or "
+            f"pass full_font_path=<path>."
+        )
         raise FontNotFoundError(msg)
     # INV-C-4: surface metric-equivalent substitution to caller.
     if substituted_name is not None and substitution_log is not None:
@@ -1033,8 +1933,40 @@ def _extend_tier2(
             )
         )
 
-    # Load the embedded font (so we can extend it in place)
-    embedded_bytes = bytes(fd["/FontFile2"].read_bytes())
+    # INV-C-9/C-11 outline-table dispatch. Tier 1.5 in-place glyph injection
+    # re-serialises and only understands glyf (TrueType, /FontFile2) and, as
+    # of C.3, CID-keyed CFF (Type1C, /FontFile3). A Type0/CID font whose
+    # /FontFile3 carries CFF/CFF2/OpenType-glyf has NO /FontFile2 key, so the
+    # historical `fd["/FontFile2"]` read raised a raw KeyError that escaped
+    # _FONT_EXTEND_FAIL_EXCS and leaked out of the edit verb. Classify the
+    # ACTUAL embedded table via classify_embedded_outline (bare-CFF safe — a
+    # raw Type1C table has no sfnt directory and would crash a direct
+    # TTFont(BytesIO) probe; the classifier falls back to the slot label).
+    # glyf → existing glyf body below; CFF → _extend_cff_tier (INV-C-11); any
+    # OTHER shape (CFF2, OpenType-glyf via /FontFile3, name-keyed simple OTF
+    # reached here, etc.) still HARD-FAILS with FontNotFoundError — which IS
+    # in the fail tuple, so surgeon/reflow/structural surface an honest
+    # font_extension_failed Degradation with success=False (INV-C-13).
+    outline_kind = classify_embedded_outline(fd)
+    if outline_kind == "CFF" and "/FontFile3" in fd:
+        return _extend_cff_tier(
+            pdf,
+            font_dict,
+            cid_font,
+            fd,
+            additional_chars,
+            system_path,
+            substitution_log=substitution_log,
+            degradations=degradations,
+        )
+    if outline_kind not in {"glyf", "TrueType"} or "/FontFile2" not in fd:
+        msg = (
+            f"in-place glyph injection requires glyf (TrueType) outlines in "
+            f"/FontFile2 or a CID-keyed CFF in /FontFile3; embedded outline "
+            f"for {ps_name} is {outline_kind!r}. Refusing."
+        )
+        raise FontNotFoundError(msg)
+    embedded_bytes, _ = _extract_font_bytes(fd)
     with _with_fonttools_translation(f"_extend_tier2:{ps_name}"):
         embedded = TTFont(io.BytesIO(embedded_bytes))
         system = TTFont(system_path)
@@ -1110,6 +2042,131 @@ def _extend_tier2(
             system.close()
 
 
+def _extend_cff_tier(
+    pdf: pikepdf.Pdf,
+    font_dict: pikepdf.Object,
+    cid_font: pikepdf.Object,
+    fd: pikepdf.Object,
+    additional_chars: str,
+    system_path: str,
+    *,
+    substitution_log: list[str] | None,
+    degradations: list[Degradation] | None,
+) -> str:
+    """CID-keyed CFF in-place glyph injection (INV-C-11; the CFF sibling).
+
+    The CFF analogue of the ``glyf`` Tier 1.5 body in :func:`_extend_tier2`.
+    Loads BOTH the embedded ``/FontFile3`` CFF and the donor (resolved by
+    :func:`_extend_tier2` into ``system_path``) as ``TTFont`` via
+    :func:`_load_cff_as_ttfont` (wrapping a bare ``/Type1C`` table into an
+    in-memory sfnt), injects each missing glyph at CID == GID via
+    :func:`_inject_cff_glyph_in_place`, re-serializes the CFF back into
+    ``/FontFile3`` (re-extracting the bare ``CFF `` table when the embedded
+    binary was bare, to preserve the ``/Type1C`` shape), and applies the
+    format-agnostic PDF-level metadata helpers VERBATIM. Returns
+    ``"full_extension"`` so the surgeon/reflow/structural funnel maps CFF
+    success identically to ``glyf`` success.
+
+    Every fontTools/cffLib call runs inside :func:`_with_fonttools_translation`
+    so any serialization failure rebrands to ``FontNotFoundError`` (in
+    ``_FONT_EXTEND_FAIL_EXCS``); out-of-scope donor shapes refuse inside
+    :func:`_inject_cff_glyph_in_place` with the same typed error (INV-C-13).
+
+    Args:
+        pdf: Open ``pikepdf.Pdf`` (mutated in place).
+        font_dict: The top-level Type0 font dictionary.
+        cid_font: The CIDFontType0 descendant font dictionary.
+        fd: The FontDescriptor dictionary (owns ``/FontFile3``).
+        additional_chars: Unicode characters to inject.
+        system_path: Resolved donor CFF font path.
+        substitution_log: Unused for the donor name here (the donor is the
+            resolved ``system_path``); present for signature symmetry with the
+            glyf body. The metric-equivalent name was already appended by
+            :func:`_extend_tier2`.
+        degradations: Unused here; the user-fonts-origin Degradation was
+            already appended by :func:`_extend_tier2`.
+
+    Returns:
+        ``"full_extension"`` on a successful injection.
+
+    Raises:
+        FontNotFoundError: On any out-of-scope shape or serialization failure.
+    """
+    del substitution_log, degradations  # surfaced by _extend_tier2's sourcing
+
+    ff3_obj = fd["/FontFile3"]
+    embedded_bytes = read_stream_bounded(ff3_obj, max_decoded=MAX_FONT_STREAM_BYTES, label="font")
+    old_subtype = ff3_obj.get("/Subtype")
+    donor_bytes = Path(system_path).read_bytes()
+
+    with _with_fonttools_translation("_extend_cff_tier"):
+        embedded, was_bare = _load_cff_as_ttfont(embedded_bytes)
+        donor, _donor_bare = _load_cff_as_ttfont(donor_bytes)
+        try:
+            units_per_em = embedded["head"].unitsPerEm
+            new_cmap_entries: dict[int, str] = {}
+            new_w_entries: dict[int, float] = {}
+
+            # Parse the existing /ToUnicode ONCE: it yields both the codepoint→
+            # CID reverse map (charset-skip check) and the /ToUnicode CID floor.
+            # A CID referenced ONLY by /ToUnicode (absent from the embedded CFF
+            # charset) must NOT be re-used as a new CID — that is the ARY-278
+            # no-renumber discipline ported to CFF. The injector folds the
+            # embedded charset's own CIDs; min_cid threads the /ToUnicode floor
+            # so a new glyph clears BOTH (mirrors the glyf path, INV-C-12).
+            existing_tounicode = _parse_existing_tounicode(font_dict)
+            reverse = {ord(u): cid for cid, u in existing_tounicode.items()}
+            min_cid = max(existing_tounicode.keys(), default=-1) + 1
+
+            for ch in additional_chars:
+                cp = ord(ch)
+                # Skip chars already covered by the embedded CFF charset (a
+                # codepoint whose CID's cidNNNNN name is already present).
+                existing_cid = reverse.get(cp)
+                e_cff = embedded["CFF "].cff
+                e_charset = list(e_cff[e_cff.fontNames[0]].charset)
+                if existing_cid is not None and f"cid{existing_cid:05d}" in e_charset:
+                    continue
+                new_gid = _inject_cff_glyph_in_place(embedded, donor, ch, min_cid=min_cid)
+                new_cmap_entries[new_gid] = ch
+                donor_cmap = donor.getBestCmap() or {}
+                donor_name = donor_cmap[cp]
+                raw_w = float(donor["hmtx"][donor_name][0])
+                new_w_entries[new_gid] = raw_w * 1000.0 / units_per_em
+
+            if not new_cmap_entries:
+                return "full_extension"
+
+            # Re-serialize. A bare /Type1C embedded font must round-trip as a
+            # bare CFF table so its /Subtype shape is preserved; a wrapped
+            # OpenType-CFF saves the full sfnt.
+            buf = io.BytesIO()
+            embedded.save(buf)
+            new_stream_bytes = embedded.getTableData("CFF ") if was_bare else buf.getvalue()
+            new_stream = pdf.make_stream(new_stream_bytes)
+            if old_subtype is not None:
+                new_stream["/Subtype"] = old_subtype
+            fd["/FontFile3"] = new_stream
+
+            _append_to_unicode_cmap(font_dict, new_cmap_entries, pdf)
+            _append_w_entries(cid_font, new_w_entries)
+            _update_cid_to_gid_map(
+                cid_font,
+                {cid: cid for cid in new_cmap_entries},
+                pdf,
+            )
+
+            logger.info(
+                "CFF in-place glyph injection from %s: %d new glyph(s) appended",
+                system_path,
+                len(new_cmap_entries),
+            )
+            return "full_extension"
+        finally:
+            embedded.close()
+            donor.close()
+
+
 # ── Simple-font (non-CID) Tier 1.5 path ──────────────────────────────────
 
 
@@ -1169,7 +2226,8 @@ def _extend_simple_tier_one_five(
     if found is None:
         if full_font_path is None:
             raise FontNotFoundError(
-                f"system font for {ps_name!r} not found and no full_font_path provided"
+                f"system font for {ps_name!r} not found — install the font or "
+                f"pass full_font_path=<path>."
             )
         system_path = str(full_font_path)
         origin = "system"  # explicit override — caller-supplied path
@@ -1290,7 +2348,9 @@ def _extend_simple_tier_one_five(
     # getGlyphOrder / glyf-table accesses fire downstream. Wrap the entire
     # fontTools-using block, including embedded.save(buf).
     with _with_fonttools_translation(f"_extend_simple_tier_one_five:{ps_name}"):
-        embedded = TTFont(io.BytesIO(ff2.read_bytes()))
+        embedded = TTFont(
+            io.BytesIO(read_stream_bounded(ff2, max_decoded=MAX_FONT_STREAM_BYTES, label="font"))
+        )
         system = TTFont(system_path)
         try:
             # 6. Inject glyphs for both groups; collect (byte, glyph_name, width).
@@ -1648,9 +2708,7 @@ def _heal_simple_widths(
         return
     fc_obj = font_dict.get("/FirstChar")
     if fc_obj is None:
-        raise FontNotFoundError(
-            f"simple-font heal requires /FirstChar; got {fc_obj!r}"
-        )
+        raise FontNotFoundError(f"simple-font heal requires /FirstChar; got {fc_obj!r}")
     try:
         fc = int(fc_obj)
     except (TypeError, ValueError) as exc:

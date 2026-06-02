@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from pdf_edit_engine.errors import OperatorError
 from pdf_edit_engine.locator import find, get_text
 from pdf_edit_engine.models import TextCharacter, TextMatch
 
@@ -57,7 +58,7 @@ class TestFind:
         assert len(matches) >= 1
 
     def test_find_invalid_page(self) -> None:
-        with pytest.raises(IndexError):
+        with pytest.raises(OperatorError):
             find(RESUME_PDF, "Aryan", page=99)
 
 

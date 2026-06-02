@@ -15,9 +15,15 @@ from typing import Any, Literal
 
 import pikepdf
 
-from pdf_edit_engine._pathutil import _save_pdf, open_pdf, validate_output_path
+from pdf_edit_engine._pathutil import (
+    _parse_content_stream,
+    _save_pdf,
+    _unparse_content_stream,
+    open_pdf,
+    validate_output_path,
+)
 from pdf_edit_engine.encoding import FontResolverCache
-from pdf_edit_engine.errors import OperatorError
+from pdf_edit_engine.errors import FontStreamTooLargeError, OperatorError
 from pdf_edit_engine.fonts import _FONT_EXTEND_FAIL_EXCS
 from pdf_edit_engine.locator import _build_index, _resolve_pages
 from pdf_edit_engine.models import ContentElement, Degradation, EditResult, FidelityReport
@@ -35,6 +41,77 @@ _Ops = list[Any]
 # Cache ownership (ARY-283): each public entrypoint constructs its own
 # FontResolverCache at entry and threads it through helpers. No module-
 # level cache here — surgeon.py follows the same policy.
+
+
+def _surface_linearization_dropped(
+    results: list[EditResult] | EditResult, linearization_log: list[str]
+) -> None:
+    """Append a ``linearization_dropped`` Degradation when re-linearization failed.
+
+    A2.2 / INV-W-3: ``_pathutil._save_pdf`` appends a marker to
+    ``linearization_log`` only on the fallback path (a linearized input could
+    not be re-linearized and was saved non-linearized). When that happened,
+    surface the loss as a typed, info-severity, non-font-affecting
+    ``Degradation`` on the edit result(s) so the caller sees the dropped Fast
+    Web View layout instead of a silent down-conversion. A no-op when the log
+    is empty (preservation succeeded, or the input was not linearized).
+
+    Args:
+        results: A single ``EditResult`` or a list of them. For multi-result
+            verbs the file-level drop is surfaced on every successful result.
+        linearization_log: The list threaded into ``_save_pdf``; non-empty iff
+            the fallback fired.
+    """
+    if not linearization_log:
+        return
+    detail = linearization_log[0]
+    targets = results if isinstance(results, list) else [results]
+    for res in targets:
+        if res.success:
+            res.fidelity_report.degradations.append(
+                Degradation(
+                    kind="linearization_dropped",
+                    detail=detail,
+                    severity="info",
+                )
+            )
+
+
+def _surface_encryption_dropped(
+    results: list[EditResult] | EditResult, encryption_log: list[str]
+) -> None:
+    """Append an ``encryption_dropped`` Degradation when re-encryption failed.
+
+    A2.3 / INV-W-5: ``_pathutil._save_pdf`` appends a marker to
+    ``encryption_log`` only on the fallback path (an encrypted input could not
+    be re-encrypted and was saved unencrypted). When that happened, surface the
+    loss as a typed, warning-severity, non-font-affecting ``Degradation`` on
+    the edit result(s) so the caller sees the dropped encryption instead of a
+    silent down-conversion to plaintext. A no-op when the log is empty
+    (preservation succeeded, or the input was not encrypted). Severity
+    ``"warning"`` (a dropped encryption is a more serious fidelity/security
+    loss than a dropped Fast-Web-View layout).
+
+    Args:
+        results: A single ``EditResult`` or a list of them. For multi-result
+            verbs the file-level drop is surfaced on every successful result.
+        encryption_log: The list threaded into ``_save_pdf``; non-empty iff
+            the fallback fired.
+    """
+    if not encryption_log:
+        return
+    detail = encryption_log[0]
+    targets = results if isinstance(results, list) else [results]
+    for res in targets:
+        if res.success:
+            res.fidelity_report.degradations.append(
+                Degradation(
+                    kind="encryption_dropped",
+                    detail=detail,
+                    severity="warning",
+                )
+            )
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -69,6 +146,178 @@ def _collect_elements_in_bbox(
             for i in range(start, end):
                 op_indices.add(i)
     return matched, op_indices
+
+
+_SHOW_TEXT_OPS: frozenset[str] = frozenset({"Tj", "TJ", "'", '"'})
+_INLINE_IMAGE_OPS: frozenset[str] = frozenset({"INLINE IMAGE", "BI", "ID", "EI"})
+
+
+def _bbox_region_text(
+    elements: list[ContentElement],
+    bbox: tuple[float, float, float, float],
+    tolerance: float = 2.0,
+) -> str:
+    """Extract the text rendered in a bbox region (extract_bbox_text semantics).
+
+    B.11 / INV-B-10. Pure helper that mirrors
+    :func:`locator.extract_bbox_text`'s tolerance-overlap filter + gap-aware
+    line grouping, but operates on an in-memory element list (so the deletion
+    residue predicate can run on the POST-emptying index without a disk
+    round-trip). Used to compare the bbox-region text before vs after the
+    keep-slot emptying.
+
+    Args:
+        elements: Content element index (e.g. from ``_build_index``).
+        bbox: Target region ``(x0, y0, x1, y1)``.
+        tolerance: Extra margin (points) for overlap matching.
+
+    Returns:
+        The text rendered within the bbox region, lines joined by newlines.
+    """
+    from pdf_edit_engine.locator import _group_into_lines
+
+    x0, y0, x1, y1 = bbox
+    hits: list[ContentElement] = []
+    for elem in elements:
+        if elem.type != "text" or not elem.text_content:
+            continue
+        ex0, ey0, ex1, ey1 = elem.bbox
+        if (
+            ex0 < x1 + tolerance
+            and ex1 > x0 - tolerance
+            and ey0 < y1 + tolerance
+            and ey1 > y0 - tolerance
+        ):
+            hits.append(elem)
+    hits.sort(key=lambda e: (-e.bbox[3], e.bbox[0]))
+    return "\n".join(_group_into_lines(hits))
+
+
+def _missed_co_rendered_residue(
+    post_elements: list[ContentElement],
+    bbox: tuple[float, float, float, float],
+    matched_elems: list[ContentElement],
+    removal_set: set[int],
+    tolerance: float = 2.0,
+) -> bool:
+    """Detect a co-rendered show-text op the bbox collection MISSED.
+
+    B.11 / INV-B-10, over-fire root-fix. Residue means a show-text op that
+    co-renders the SAME deleted target into the bbox region but was NOT in the
+    keep-slot ``removal_set`` (the strict-AABB collection missed it), so it
+    still renders after the emptying. This is a TARGETED-op check: it looks for
+    an un-emptied op whose rendered ``text_content`` MATCHES a COLLECTED target
+    element's ``text_content`` (a co-rendered duplicate of what was deleted) and
+    that overlaps the bbox within tolerance.
+
+    This replaces the prior ``any(target_token in region_text_after)`` substring
+    check, which mis-fired on an ADJACENT untouched line that merely SHARED a
+    >=2-char token with the deleted heading: the ~2pt tolerance pulled the
+    neighbour into the re-extracted region, and the shared token re-appearing
+    there falsely flipped ``success=False`` even though the heading deletion was
+    correct. Matching on the FULL collected-target text (a missed co-rendered
+    duplicate), not a shared sub-token, keeps an adjacent DIFFERENT line that
+    happens to share a word from triggering residue, while still catching a
+    genuinely missed duplicate of the target (the strict-AABB ``< vs <=``
+    boundary case the INV-B-10 missed-bbox fixture pins).
+
+    Pure function of the post-emptying element index, the bbox, the collected
+    targets, and the removal set — computed before any close_gap shift, so the
+    verdict is stable.
+
+    Args:
+        post_elements: Content element index re-built AFTER the keep-slot
+            emptying (so emptied ops carry no text).
+        bbox: Target region ``(x0, y0, x1, y1)``.
+        matched_elems: The elements the bbox collection captured as targets.
+        removal_set: Operator indices the collection emptied.
+        tolerance: Overlap margin (points) — matches ``_bbox_region_text``.
+
+    Returns:
+        True iff an un-emptied, overlapping op still renders a collected
+        target's exact text.
+    """
+    target_texts = {
+        elem.text_content
+        for elem in matched_elems
+        if elem.text_content and elem.text_content.strip()
+    }
+    if not target_texts:
+        return False
+    x0, y0, x1, y1 = bbox
+    for elem in post_elements:
+        if elem.type != "text" or not elem.text_content:
+            continue
+        start, _end = elem.operator_range
+        if start in removal_set:
+            continue  # this op WAS emptied (its post-emptying text is gone anyway)
+        ex0, ey0, ex1, ey1 = elem.bbox
+        overlaps = (
+            ex0 < x1 + tolerance
+            and ex1 > x0 - tolerance
+            and ey0 < y1 + tolerance
+            and ey1 > y0 - tolerance
+        )
+        if overlaps and elem.text_content in target_texts:
+            return True
+    return False
+
+
+def _empty_show_text_in_place(ops: _Ops, removal_set: set[int]) -> None:
+    """Empty the operand of each show-text op in ``removal_set``; KEEP every slot.
+
+    B.11 / INV-B-10. Replaces the pre-B.11 tuple-removal
+    (``[op for i, op in enumerate(ops) if i not in removal_set]``), which
+    renumbered every downstream operator and invalidated sibling
+    ``operator_refs`` in a batch (the index-shift root cause). Here the ops
+    list length and every index are held stable: a ``Tj``/``'``/``"`` gets an
+    empty string literal ``()`` and a ``TJ`` gets an empty array ``[]`` (both
+    advance the text position by 0 and render no glyph); non-show-text ops
+    (``BT``/``ET``/``Tf``/``Tm``/``Td``/positioning) are left untouched.
+
+    Args:
+        ops: Parsed content-stream instruction list (mutated in place).
+        removal_set: Operator indices the bbox collection marked for deletion.
+    """
+    for i in removal_set:
+        if not (0 <= i < len(ops)):
+            continue
+        inst = ops[i]
+        op_str = str(inst.operator) if hasattr(inst, "operator") else str(inst[1])
+        if op_str not in _SHOW_TEXT_OPS:
+            continue
+        operator = inst.operator if hasattr(inst, "operator") else inst[1]
+        if op_str == "TJ":
+            ops[i] = ([pikepdf.Array([])], operator)
+        else:
+            ops[i] = ([pikepdf.String(b"")], operator)
+
+
+def _inline_image_in_indices(ops: _Ops, removal_set: set[int]) -> bool:
+    """Detect a ``BI``/``ID``/``EI`` inline image within a deletion's op-index span.
+
+    B.11 / INV-B-10. Advisory only — A1.4 collapses ``BI``/``ID``/``EI`` to one
+    stable ``INLINE IMAGE`` slot, so the deletion proceeds; the caller surfaces
+    an ``inline_image_present`` (info) Degradation. The span is the contiguous
+    operator range ``[min(removal_set), max(removal_set)]`` (the
+    ``_expand_to_bt_et``-expanded block range), so an inline image inside the
+    deleted block is caught.
+
+    Args:
+        ops: Parsed content-stream instruction list.
+        removal_set: Operator indices marked for deletion.
+
+    Returns:
+        True iff an inline-image operator lies in the span.
+    """
+    if not removal_set:
+        return False
+    lo, hi = min(removal_set), max(removal_set)
+    for i in range(lo, min(hi, len(ops) - 1) + 1):
+        op_str = str(ops[i].operator) if hasattr(ops[i], "operator") else str(ops[i][1])
+        if op_str in _INLINE_IMAGE_OPS:
+            return True
+    return False
 
 
 def _get_op_str(inst: Any) -> str:
@@ -470,7 +719,7 @@ def _shift_content_below_inplace(
     if delta_y == 0.0:
         return []
 
-    ops: _Ops = list(pikepdf.parse_content_stream(page_obj))
+    ops: _Ops = _parse_content_stream(page_obj, context="structural._shift_content_below_inplace")
 
     # ── Text: walk ops tracking BT/ET context ────────────────────────
     #
@@ -590,7 +839,7 @@ def _shift_content_below_inplace(
                     ops[i] = (new_operands, operator)
 
     # Write back content stream
-    new_stream = pikepdf.unparse_content_stream(ops)
+    new_stream = _unparse_content_stream(ops, context="structural._shift_content_below_inplace")
     page_obj.Contents = pdf.make_stream(new_stream)
 
     # ── Annotations: shift rects below threshold ─────────────────────
@@ -640,6 +889,8 @@ def shift_content_below(
     y_threshold: float,
     delta_y: float,
     output_path: str,
+    *,
+    password: str | bytes | None = None,
 ) -> EditResult:
     """Shift all content below a y-threshold on a page.
 
@@ -657,12 +908,14 @@ def shift_content_below(
         y_threshold: Only elements with y < y_threshold are shifted.
         delta_y: Shift amount.  Positive = down, negative = up.
         output_path: Path for the output PDF.
+        password: Optional password to open an encrypted input; the output is
+            RE-ENCRYPTED with the same password (A2.3 / INV-W-5).
 
     Returns:
         EditResult with fidelity information.
     """
     validate_output_path(output_path)
-    pdf = open_pdf(pdf_path)
+    pdf = open_pdf(pdf_path, password=password)
     try:
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
@@ -676,10 +929,18 @@ def shift_content_below(
         )
 
         overflow = any("below page boundary" in w for w in warnings)
-        _save_pdf(pdf, output_path)
+        lin_log: list[str] = []
+        enc_log: list[str] = []
+        _save_pdf(
+            pdf,
+            output_path,
+            linearization_log=lin_log,
+            reencrypt_password=password,
+            encryption_log=enc_log,
+        )
         _invalidate_locator_cache()
 
-        return EditResult(
+        result = EditResult(
             success=True,
             original_text="",
             new_text="",
@@ -692,6 +953,9 @@ def shift_content_below(
                 glyphs_missing=[],
             ),
         )
+        _surface_linearization_dropped(result, lin_log)
+        _surface_encryption_dropped(result, enc_log)
+        return result
     finally:
         pdf.close()
 
@@ -742,18 +1006,57 @@ def compute_uniform_layout(
     return (max(round(line_height, 2), font_size), 0.0)
 
 
+def compute_uniform_layout_detailed(
+    region_height: float,
+    line_counts: list[int],
+    font_size: float = 10.0,
+    original_gap: float = 27.0,
+) -> tuple[float, float, float]:
+    """Pure sibling of :func:`compute_uniform_layout` that also reports the
+    natural single-line ratio.
+
+    Additive, net-new symbol — does NOT touch :func:`compute_uniform_layout`'s
+    2-tuple return (INV-F-5 pins that). Delegates the line-height/section-gap
+    computation to it verbatim, then appends ``natural_line_height`` (the
+    documented natural single-line ratio ``font_size * 1.2``) so the batch
+    caller (:func:`_auto_compute_layout` → :func:`batch_replace_block`) can
+    surface a ``line_height_compressed`` Degradation (E.6) when the computed
+    applied line height falls below the natural ratio.
+
+    Args:
+        region_height: Total vertical space available for all sections.
+        line_counts: Number of text lines in each section.
+        font_size: Base font size.
+        original_gap: Desired inter-section gap.
+
+    Returns:
+        ``(line_height, section_gap, natural_line_height)`` — all in PDF points.
+    """
+    line_height, section_gap = compute_uniform_layout(
+        region_height,
+        line_counts,
+        font_size=font_size,
+        original_gap=original_gap,
+    )
+    natural_line_height = font_size * 1.2
+    return (line_height, section_gap, natural_line_height)
+
+
 def _auto_compute_layout(
     page_obj: pikepdf.Page,
     page_number: int,
     replacements: list[tuple[tuple[float, float, float, float], str]],
     resolver_cache: FontResolverCache,
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
     """Auto-detect layout params from original content and replacement text.
 
     Analyzes the original sections to measure font size and section gaps,
-    then computes optimal ``(line_height, section_gap)`` via
-    :func:`compute_uniform_layout`.  Called internally by
+    then computes optimal ``(line_height, section_gap, natural_line_height)``
+    via :func:`compute_uniform_layout_detailed`.  Called internally by
     :func:`batch_replace_block` when the caller omits layout parameters.
+    The third element (``natural_line_height``) lets the batch caller surface
+    a ``line_height_compressed`` Degradation (E.6) when the computed applied
+    line height fell below the natural single-line ratio.
     """
     # Collect all text elements across all bboxes for font detection
     elements = _build_index(page_obj, page_number)
@@ -763,7 +1066,7 @@ def _auto_compute_layout(
         all_matched.extend(matched)
 
     if not all_matched:
-        return (12.0, 27.0)  # safe fallback
+        return (12.0, 27.0, 12.0)  # safe fallback (natural == applied)
 
     det_name, font_size, _ = _detect_font_from_elements(all_matched)
     clean = det_name.lstrip("/")
@@ -785,7 +1088,7 @@ def _auto_compute_layout(
         resolver = resolver_cache.get_resolver(page_obj, clean)
         font_ref = page_obj["/Resources"]["/Font"]["/" + clean]
     except (KeyError, TypeError):
-        return (font_size * 1.2, original_gap)
+        return (font_size * 1.2, original_gap, font_size * 1.2)
 
     bbox_width = sorted_bboxes[0][2] - sorted_bboxes[0][0]
     line_counts: list[int] = []
@@ -823,7 +1126,7 @@ def _auto_compute_layout(
 
     region_top = max(bb[3] for bb, _ in replacements)
     region_bottom = min(bb[1] for bb, _ in replacements)
-    return compute_uniform_layout(
+    return compute_uniform_layout_detailed(
         region_top - region_bottom,
         line_counts,
         font_size=font_size,
@@ -840,6 +1143,7 @@ def _extend_font(
     *,
     substitution_log: list[str] | None = None,
     coverage_tier_log: list[tuple[str, list[str]]] | None = None,
+    stream_too_large: list[bool] | None = None,
 ) -> bool:
     """Extend a font's subset to encode *text*.  Returns True on success.
 
@@ -853,6 +1157,14 @@ def _extend_font(
     ``font_coverage_extended`` (Tier 1) or ``font_coverage_substituted``
     (Tier 1.5) Degradations. Unlike substitution_log this carries the
     tier even when no metric-equivalent fallback fires.
+
+    A1.3 / INV-W-4: the optional *stream_too_large* out-param (mirrors
+    *substitution_log*) records — by appending ``True`` — when the extension
+    failed specifically because an embedded font / CMap stream exceeded the
+    decoded-size bound (``FontStreamTooLargeError``). The helper still returns
+    ``False`` on that failure (graceful degrade); the caller inspects the
+    out-param to surface the specific-cause ``font_stream_too_large``
+    Degradation alongside ``font_extension_failed``.
     """
     from pdf_edit_engine.fonts import extend_subset
 
@@ -880,8 +1192,10 @@ def _extend_font(
         if ok and coverage_tier_log is not None:
             coverage_tier_log.append((tier, list(missing)))
         return ok
-    except _FONT_EXTEND_FAIL_EXCS:
+    except _FONT_EXTEND_FAIL_EXCS as exc:
         logger.warning("Font extension failed for %s", font_name, exc_info=True)
+        if isinstance(exc, FontStreamTooLargeError) and stream_too_large is not None:
+            stream_too_large.append(True)
         return False
 
 
@@ -897,6 +1211,8 @@ def _replace_block_on_page(
     line_height: float | None = None,
     first_line_y_override: float | None = None,
     skip_vertical_shift: bool = False,
+    *,
+    fit: Literal["none", "shrink"] = "none",
 ) -> tuple[EditResult, float, float]:
     """Core replace_block logic operating on an open PDF page.
 
@@ -927,6 +1243,10 @@ def _replace_block_on_page(
     substitution_log: list[str] = []
     # v0.1.3 (Phase 5) coverage tier captures from extend_subset.
     coverage_tier_log: list[tuple[str, list[str]]] = []
+    # A1.3 / INV-W-4: records a bombed-stream extension failure on the body
+    # font so the _extend_font_returned_false branch can surface the
+    # specific-cause font_stream_too_large Degradation.
+    stl: list[bool] = []
 
     # ── Phase 1: Analyze ──────────────────────────────────────────────
     elements = _build_index(page_obj, page_number)
@@ -964,7 +1284,7 @@ def _replace_block_on_page(
     palette = _build_style_palette(matched_elems, clean_name, font_size, fill_color)
 
     # Compute removal set
-    ops: _Ops = list(pikepdf.parse_content_stream(page_obj))
+    ops: _Ops = _parse_content_stream(page_obj, context="structural._replace_block_on_page")
     blocks = _find_bt_et_blocks(ops)
     removal_indices = _expand_to_bt_et(sorted(op_indices), blocks)
     removal_set = set(removal_indices)
@@ -1036,9 +1356,27 @@ def _replace_block_on_page(
             resolver_cache,
             substitution_log=substitution_log,
             coverage_tier_log=coverage_tier_log,
+            stream_too_large=stl,
         ):
             # F-C-05 / INV-J-9: must carry a font-affecting Degradation
             # so font_preserved correctly resolves to False.
+            degradations = [
+                Degradation(
+                    kind="font_extension_failed",
+                    detail="_extend_font_returned_false",
+                    severity="error",
+                ),
+            ]
+            # A1.3 / INV-W-4: surface the specific-cause sibling when the
+            # extension failed because an embedded stream was a Flate bomb.
+            if stl:
+                degradations.append(
+                    Degradation(
+                        kind="font_stream_too_large",
+                        detail="font_stream_too_large",
+                        severity="warning",
+                    )
+                )
             return (
                 EditResult(
                     success=False,
@@ -1053,13 +1391,7 @@ def _replace_block_on_page(
                         overflow_detected=False,
                         reflow_applied=False,
                         glyphs_missing=list(missing),
-                        degradations=[
-                            Degradation(
-                                kind="font_extension_failed",
-                                detail="_extend_font_returned_false",
-                                severity="error",
-                            ),
-                        ],
+                        degradations=degradations,
                     ),
                 ),
                 0.0,
@@ -1121,51 +1453,123 @@ def _replace_block_on_page(
     # ── Phase 3: Break text into lines (indent-aware) ────────────────
     bbox_width = bbox[2] - bbox[0]
 
-    if palette.body_after_marker_x > 0:
-        # Indent-aware breaking: bullet lines have less width.
-        marker_indent = palette.body_after_marker_x - bbox[0]
-        indented_width = bbox_width - marker_indent
+    def wrap_at(size: float) -> list[str]:
+        """Break ``new_text`` into wrapped lines at the given font size.
 
-        # Join continuation segments back into their bullet paragraph.
-        # Extracted text preserves original visual line breaks as \n,
-        # splitting "• retailer —\ncovering 500+" into two segments.
-        # Merging non-marker segments after a marker into the marker's
-        # paragraph produces optimal reflow and correct indented width.
-        raw_segments = new_text.split("\n")
-        segments: list[str] = []
-        for seg in raw_segments:
-            stripped = seg.lstrip()
-            if stripped[:1] in palette.marker_fonts:
-                segments.append(seg)
-            elif segments and segments[-1].lstrip()[:1] in palette.marker_fonts:
-                # Continuation of previous bullet — join with space
-                segments[-1] = segments[-1].rstrip() + " " + seg.lstrip()
-            else:
-                segments.append(seg)
+        Indent-aware: bullet lines wrap against the post-marker width, body
+        lines against the full bbox width. Factored out of Phase 3 so the
+        E.8 shrink-to-fit binary search (Phase 2.5) and the final Phase 3
+        line build share ONE wrap implementation — the search predicate and
+        the rendered output can never diverge. ``size``-independent inputs
+        (``bbox_width``, ``palette``, ``resolver``, ``font_ref``) are closed
+        over; only the font size varies.
+        """
+        if palette.body_after_marker_x > 0:
+            # Indent-aware breaking: bullet lines have less width.
+            marker_indent = palette.body_after_marker_x - bbox[0]
+            indented_width = bbox_width - marker_indent
 
-        all_lines: list[str] = []
-        for seg in segments:
-            stripped = seg.lstrip()
-            if stripped[:1] in palette.marker_fonts:
-                seg_lines = break_into_lines(
-                    seg,
-                    indented_width,
-                    resolver,
-                    font_ref,
-                    font_size,
-                )
+            # Join continuation segments back into their bullet paragraph.
+            # Extracted text preserves original visual line breaks as \n,
+            # splitting "• retailer —\ncovering 500+" into two segments.
+            # Merging non-marker segments after a marker into the marker's
+            # paragraph produces optimal reflow and correct indented width.
+            raw_segments = new_text.split("\n")
+            segments: list[str] = []
+            for seg in raw_segments:
+                stripped = seg.lstrip()
+                if stripped[:1] in palette.marker_fonts:
+                    segments.append(seg)
+                elif segments and segments[-1].lstrip()[:1] in palette.marker_fonts:
+                    # Continuation of previous bullet — join with space
+                    segments[-1] = segments[-1].rstrip() + " " + seg.lstrip()
+                else:
+                    segments.append(seg)
+
+            all_lines: list[str] = []
+            for seg in segments:
+                stripped = seg.lstrip()
+                if stripped[:1] in palette.marker_fonts:
+                    seg_lines = break_into_lines(
+                        seg,
+                        indented_width,
+                        resolver,
+                        font_ref,
+                        size,
+                    )
+                else:
+                    seg_lines = break_into_lines(
+                        seg,
+                        bbox_width,
+                        resolver,
+                        font_ref,
+                        size,
+                    )
+                all_lines.extend(seg_lines)
+            return all_lines if all_lines else [""]
+        return break_into_lines(new_text, bbox_width, resolver, font_ref, size)
+
+    # ── Phase 2.5: Opt-in shrink-to-fit font-size search (E.8) ────────
+    # When fit="shrink", binary-search the body font size DOWN until the
+    # wrapped text height fits the FIXED-height bbox region, with a
+    # min_pt = max(4.0, original * 0.5) floor. Guarded so fit="none" (the
+    # default) skips this block entirely — font_size is never reassigned,
+    # every downstream value matches the pre-E.8 code, and the saved bytes
+    # are byte-identical. font_size_reduced is emitted iff the applied size
+    # ends strictly below the original (including the floor-clamp case).
+    bbox_height_for_fit = bbox[3] - bbox[1]
+    original_font_size = font_size
+    fit_shrink_degradations: list[Degradation] = []
+    if fit == "shrink":
+        floor_pt = max(4.0, original_font_size * 0.5)
+
+        def _line_height_for(size: float) -> float:
+            # Hold a caller-passed line_height FIXED (the search trades only
+            # font size); otherwise use the natural size * 1.2 leading that
+            # _detect_line_height falls back to for a single-line region.
+            return line_height if line_height is not None else size * 1.2
+
+        def _fits(size: float) -> bool:
+            return len(wrap_at(size)) * _line_height_for(size) <= bbox_height_for_fit
+
+        if not _fits(original_font_size):
+            # Overflows at the original size → search for the largest size in
+            # [floor, original] that fits. Predicate is a monotone down-set
+            # (smaller size → fewer/equal lines AND smaller leading → smaller
+            # text height), so bisection for the largest fitting size is valid.
+            if not _fits(floor_pt):
+                # Even the floor cannot fit → clamp AT the floor. Overflow is
+                # surfaced honestly + separately by the existing machinery
+                # below (it runs on the floor-sized wrap).
+                font_size = floor_pt
             else:
-                seg_lines = break_into_lines(
-                    seg,
-                    bbox_width,
-                    resolver,
-                    font_ref,
-                    font_size,
+                lo, hi = floor_pt, original_font_size
+                best_fit = floor_pt
+                for _ in range(24):
+                    if hi - lo <= 0.05:
+                        break
+                    mid = (lo + hi) / 2.0
+                    if _fits(mid):
+                        best_fit = mid
+                        lo = mid
+                    else:
+                        hi = mid
+                font_size = round(best_fit, 2)
+        # else: already fits at original → no shrink, font_size unchanged.
+
+        if font_size < original_font_size - 1e-6:
+            fit_shrink_degradations.append(
+                Degradation(
+                    kind="font_size_reduced",
+                    detail=(
+                        f"original={original_font_size:.2f},applied={font_size:.2f},"
+                        f"floor={floor_pt:.2f},fit={bool(_fits(font_size))}"
+                    ),
+                    severity="info",
                 )
-            all_lines.extend(seg_lines)
-        lines = all_lines if all_lines else [""]
-    else:
-        lines = break_into_lines(new_text, bbox_width, resolver, font_ref, font_size)
+            )
+
+    lines = wrap_at(font_size)
 
     # ── Phase 4: Layout ──────────────────────────────────────────────
     caller_line_height = line_height is not None
@@ -1232,7 +1636,7 @@ def _replace_block_on_page(
                 overflow_delta,
             )
         )
-        ops = list(pikepdf.parse_content_stream(page_obj))
+        ops = _parse_content_stream(page_obj, context="structural._replace_block_on_page")
         blocks = _find_bt_et_blocks(ops)
         removal_indices = _expand_to_bt_et(sorted(op_indices), blocks)
         removal_set = set(removal_indices)
@@ -1241,11 +1645,33 @@ def _replace_block_on_page(
     # compress line_height so all lines fit without overlapping
     # content below.  Skip when the caller provided an explicit
     # line_height (they already computed uniform spacing).
+    #
+    # E.6 (v0.2.0): line_height_compressed honesty surfacing. When the
+    # applied line height is pushed below the natural single-line ratio
+    # (the value _detect_line_height produced), surface a typed
+    # line_height_compressed Degradation from this caller. This does NOT
+    # touch compute_uniform_layout's purity (INV-F-5) — natural and applied
+    # are both locals here. Computed pre-save so dry_run parity holds.
+    compression_degradations: list[Degradation] = []
     if not caller_line_height:
+        natural_line_height = line_height  # from _detect_line_height (line 1179)
         available_height = bbox_height + max(0.0, overflow_delta)
         if text_height > available_height and len(lines) > 1:
             line_height = available_height / len(lines)
         text_height = available_height  # recalculate for underflow check
+        # 0.95 == the same 5% deadzone the kerning Algo-A decision uses.
+        if line_height < natural_line_height * 0.95:
+            ratio = line_height / natural_line_height if natural_line_height else 0.0
+            compression_degradations.append(
+                Degradation(
+                    kind="line_height_compressed",
+                    detail=(
+                        f"applied={line_height:.2f},natural={natural_line_height:.2f},"
+                        f"ratio={ratio:.2f}"
+                    ),
+                    severity="info",
+                )
+            )
 
     # ── Phase 5: Render ──────────────────────────────────────────────
     actual_first_y = (
@@ -1276,7 +1702,7 @@ def _replace_block_on_page(
         if i not in removal_set:
             new_ops.append(op)
 
-    new_stream = pikepdf.unparse_content_stream(new_ops)
+    new_stream = _unparse_content_stream(new_ops, context="structural._replace_block_on_page")
     page_obj.Contents = pdf.make_stream(new_stream)
 
     # Sync annotations: shift link rects to match new text position.
@@ -1360,7 +1786,12 @@ def _replace_block_on_page(
             overflow_detected=original_overflow > 0,
             reflow_applied=True,
             glyphs_missing=pre_extension_missing,
-            degradations=[*coverage_degradations, *shift_degradations],
+            degradations=[
+                *coverage_degradations,
+                *shift_degradations,
+                *compression_degradations,
+                *fit_shrink_degradations,
+            ],
         ),
     )
     return result, effective_delta, last_line_y
@@ -1375,6 +1806,9 @@ def replace_block(
     font_name: str | None = None,
     font_size: float | None = None,
     line_height: float | None = None,
+    *,
+    fit: Literal["none", "shrink"] = "none",
+    password: str | bytes | None = None,
 ) -> EditResult:
     """Replace all content within a bounding box with new reflowed text.
 
@@ -1391,13 +1825,22 @@ def replace_block(
         output_path: Path for the output PDF.
         font_name: Font resource name (e.g. 'F1').  Auto-detected if None.
         font_size: Font size in points.  Auto-detected if None.
+        fit: Opt-in shrink-to-fit policy (E.8). ``"none"`` (the default)
+            reproduces the legacy behaviour byte-for-byte — the font size is
+            never reduced. ``"shrink"`` binary-searches the body font size
+            DOWN until the replacement fits the FIXED-height bbox region,
+            with a ``min_pt = max(4.0, original * 0.5)`` floor; emits a typed
+            ``font_size_reduced`` (severity ``info``) Degradation whenever it
+            shrinks. The clamp at the floor still surfaces overflow honestly.
+        password: Optional password to open an encrypted input; the output is
+            RE-ENCRYPTED with the same password (A2.3 / INV-W-5).
 
     Returns:
         EditResult with fidelity information.
     """
     validate_output_path(output_path)
 
-    pdf = open_pdf(pdf_path)
+    pdf = open_pdf(pdf_path, password=password)
     try:
         # Per-call cache (ARY-283); pdf threaded for ARY-349 cache key.
         resolver_cache = FontResolverCache()
@@ -1414,6 +1857,7 @@ def replace_block(
             font_name,
             font_size,
             line_height=line_height,
+            fit=fit,
         )
         # INV-W0-7: orphan-annotation cleanup must run regardless of
         # whether _replace_block_on_page found text to surgery. A bbox
@@ -1421,7 +1865,17 @@ def replace_block(
         # those still go orphan when the user asks us to replace the
         # region with unrelated text.
         _remove_orphaned_annotations(page_obj, bbox, new_text)
-        _save_pdf(pdf, output_path)
+        lin_log: list[str] = []
+        enc_log: list[str] = []
+        _save_pdf(
+            pdf,
+            output_path,
+            linearization_log=lin_log,
+            reencrypt_password=password,
+            encryption_log=enc_log,
+        )
+        _surface_linearization_dropped(result, lin_log)
+        _surface_encryption_dropped(result, enc_log)
         _invalidate_locator_cache()
         return result
     finally:
@@ -1436,6 +1890,8 @@ def batch_replace_block(
     *,
     line_height: float | None = None,
     section_gap: float | None = None,
+    fit: Literal["none", "shrink"] = "none",
+    password: str | bytes | None = None,
 ) -> list[EditResult]:
     """Apply multiple bbox-based text replacements on a single page.
 
@@ -1462,6 +1918,16 @@ def batch_replace_block(
         line_height: Uniform line spacing (optional).
         section_gap: Gap between sections in sequential mode (optional).
             Only effective when ``line_height`` is also provided.
+        fit: Opt-in shrink-to-fit policy (E.8). ``"none"`` (the default)
+            reproduces the legacy behaviour byte-for-byte. ``"shrink"``
+            applies the per-section font-size shrink-to-fit ONLY in the
+            DEFAULT (bbox-anchored) mode. In SEQUENTIAL mode
+            (``section_gap`` + ``line_height``) it is advisory/no-op:
+            ``compute_uniform_layout`` already owns vertical fit and a
+            per-section shrink would fight its uniform line-height + cursor
+            math.
+        password: Optional password to open an encrypted input; the output is
+            RE-ENCRYPTED with the same password (A2.3 / INV-W-5).
 
     Returns:
         List of EditResult, one per replacement (same order as input).
@@ -1470,7 +1936,7 @@ def batch_replace_block(
     if not replacements:
         return []
 
-    pdf = open_pdf(pdf_path)
+    pdf = open_pdf(pdf_path, password=password)
     try:
         # Per-call cache (ARY-283); pdf threaded for ARY-349 cache key.
         resolver_cache = FontResolverCache()
@@ -1482,8 +1948,16 @@ def batch_replace_block(
         # layout params, analyze the original content and compute optimal
         # spacing automatically.  This is the "brain" — the caller provides
         # only bboxes and text, the engine figures out the rest.
+        #
+        # E.6 (v0.2.0): the auto-layout caller is the only site that knows
+        # both the computed (applied) line height and the natural single-line
+        # ratio for the batch path (per-section _replace_block_on_page runs
+        # with caller_line_height=True and so skips its own compression
+        # branch). When the auto-computed line height fell below the natural
+        # ratio, surface a line_height_compressed Degradation on every result.
+        batch_natural_line_height: float | None = None
         if line_height is None and len(replacements) > 1:
-            line_height, section_gap = _auto_compute_layout(
+            line_height, section_gap, batch_natural_line_height = _auto_compute_layout(
                 page_obj,
                 page_number,
                 replacements,
@@ -1583,6 +2057,7 @@ def batch_replace_block(
                     new_text,
                     resolver_cache,
                     line_height=line_height,
+                    fit=fit,
                 )
                 _invalidate_locator_cache()
                 cumulative_shift += overflow
@@ -1591,12 +2066,44 @@ def batch_replace_block(
                 # whether the per-bbox surgery hit content.
                 _remove_orphaned_annotations(page_obj, adjusted_bbox, new_text)
 
-        _save_pdf(pdf, output_path)
+        # E.6: surface the batch-path line-height compression on each result.
+        # 0.95 == the same 5% deadzone the kerning Algo-A decision uses.
+        if (
+            batch_natural_line_height is not None
+            and line_height is not None
+            and line_height < batch_natural_line_height * 0.95
+        ):
+            ratio = line_height / batch_natural_line_height if batch_natural_line_height else 0.0
+            for _, res in results:
+                if res.success:
+                    res.fidelity_report.degradations.append(
+                        Degradation(
+                            kind="line_height_compressed",
+                            detail=(
+                                f"applied={line_height:.2f},"
+                                f"natural={batch_natural_line_height:.2f},ratio={ratio:.2f}"
+                            ),
+                            severity="info",
+                        )
+                    )
+
+        lin_log: list[str] = []
+        enc_log: list[str] = []
+        _save_pdf(
+            pdf,
+            output_path,
+            linearization_log=lin_log,
+            reencrypt_password=password,
+            encryption_log=enc_log,
+        )
         _invalidate_locator_cache()
 
         # Return results in original input order
         results.sort(key=lambda t: t[0])
-        return [r for _, r in results]
+        ordered = [r for _, r in results]
+        _surface_linearization_dropped(ordered, lin_log)
+        _surface_encryption_dropped(ordered, enc_log)
+        return ordered
     finally:
         pdf.close()
 
@@ -1612,6 +2119,7 @@ def insert_text_block(
     font_name: str | None = None,
     font_size: float = 12.0,
     max_width: float | None = None,
+    password: str | bytes | None = None,
 ) -> EditResult:
     """Insert a new text block at a position, shifting existing content down.
 
@@ -1630,6 +2138,8 @@ def insert_text_block(
         font_size: Font size in points (default 12.0).
         max_width: Maximum line width.  Defaults to page width minus x
             minus a 36pt right margin.
+        password: Optional password to open an encrypted input; the output is
+            RE-ENCRYPTED with the same password (A2.3 / INV-W-5).
 
     Returns:
         EditResult with fidelity information.
@@ -1645,7 +2155,7 @@ def insert_text_block(
     pre_extension_missing: list[str] = []
     font_action: Literal["kept", "extended", "substituted", "failed"] = "kept"
 
-    pdf = open_pdf(pdf_path)
+    pdf = open_pdf(pdf_path, password=password)
     try:
         # Per-call cache (ARY-283); pdf threaded for ARY-349 cache key.
         resolver_cache = FontResolverCache()
@@ -1734,6 +2244,24 @@ def insert_text_block(
                 # without fidelity_report, so the default-factory
                 # FidelityReport reported font_preserved=True even on
                 # extension failure (the same lying-success-path shape).
+                # A1.3 / INV-W-4: a Flate decompression bomb surfaces a
+                # SECOND, specific-cause font_stream_too_large Degradation
+                # (warning) alongside the font_extension_failed (error).
+                degs = [
+                    Degradation(
+                        kind="font_extension_failed",
+                        detail=type(exc).__name__,
+                        severity="error",
+                    )
+                ]
+                if isinstance(exc, FontStreamTooLargeError):
+                    degs.append(
+                        Degradation(
+                            kind="font_stream_too_large",
+                            detail=type(exc).__name__,
+                            severity="warning",
+                        )
+                    )
                 return EditResult(
                     success=False,
                     original_text="",
@@ -1748,13 +2276,7 @@ def insert_text_block(
                         overflow_detected=False,
                         reflow_applied=False,
                         glyphs_missing=list(missing),
-                        degradations=[
-                            Degradation(
-                                kind="font_extension_failed",
-                                detail=type(exc).__name__,
-                                severity="error",
-                            )
-                        ],
+                        degradations=degs,
                     ),
                 )
 
@@ -1783,7 +2305,7 @@ def insert_text_block(
         )
 
         # Re-parse content stream after shift
-        ops: _Ops = list(pikepdf.parse_content_stream(page_obj))
+        ops: _Ops = _parse_content_stream(page_obj, context="structural.insert_text_block")
 
         # Build new BT/ET block
         new_block = _build_replacement_ops(
@@ -1802,13 +2324,21 @@ def insert_text_block(
         ops.extend(new_block)
 
         # Write back
-        new_stream = pikepdf.unparse_content_stream(ops)
+        new_stream = _unparse_content_stream(ops, context="structural.insert_text_block")
         page_obj.Contents = pdf.make_stream(new_stream)
-        _save_pdf(pdf, output_path)
+        lin_log: list[str] = []
+        enc_log: list[str] = []
+        _save_pdf(
+            pdf,
+            output_path,
+            linearization_log=lin_log,
+            reencrypt_password=password,
+            encryption_log=enc_log,
+        )
         _invalidate_locator_cache()
 
         overflow = any("below page boundary" in w for w in shift_warnings)
-        return EditResult(
+        result = EditResult(
             success=True,
             original_text="",
             new_text=text,
@@ -1822,6 +2352,9 @@ def insert_text_block(
                 degradations=list(coverage_degradations),
             ),
         )
+        _surface_linearization_dropped(result, lin_log)
+        _surface_encryption_dropped(result, enc_log)
+        return result
     finally:
         pdf.close()
 
@@ -1833,6 +2366,7 @@ def delete_block(
     output_path: str,
     *,
     close_gap: bool = True,
+    password: str | bytes | None = None,
 ) -> EditResult:
     """Delete all content within a bounding box.
 
@@ -1845,12 +2379,14 @@ def delete_block(
         output_path: Path for the output PDF.
         close_gap: If True, shift content below the deleted region up
             to close the gap (default True).
+        password: Optional password to open an encrypted input; the output is
+            RE-ENCRYPTED with the same password (A2.3 / INV-W-5).
 
     Returns:
         EditResult with fidelity information.
     """
     validate_output_path(output_path)
-    pdf = open_pdf(pdf_path)
+    pdf = open_pdf(pdf_path, password=password)
     try:
         pages = _resolve_pages(pdf, page_number)
         _, page_obj = pages[0]
@@ -1860,14 +2396,31 @@ def delete_block(
         matched_elems, op_indices = _collect_elements_in_bbox(elements, bbox)
 
         if not matched_elems:
-            _save_pdf(pdf, output_path)
-            return EditResult(
+            # Genuinely empty region (the strict-AABB collection captured no op
+            # AND there is nothing to delete): keep the pre-B.11 success
+            # contract byte-for-byte. (Residue is proven on the matched-elems
+            # path below by comparing the COLLECTED targets against the
+            # post-emptying bbox region — a target-specific check that does not
+            # over-fire on unrelated text merely touching the bbox boundary.)
+            lin_log: list[str] = []
+            enc_log: list[str] = []
+            _save_pdf(
+                pdf,
+                output_path,
+                linearization_log=lin_log,
+                reencrypt_password=password,
+                encryption_log=enc_log,
+            )
+            empty_result = EditResult(
                 success=True,
                 original_text="",
                 new_text="",
                 font_action="kept",
                 warnings=["No content found in specified bounding box"],
             )
+            _surface_linearization_dropped(empty_result, lin_log)
+            _surface_encryption_dropped(empty_result, enc_log)
+            return empty_result
 
         # Collect original text
         original_parts: list[str] = []
@@ -1877,17 +2430,49 @@ def delete_block(
         original_text = " ".join(original_parts)
 
         # Parse content stream and compute removal set
-        ops: _Ops = list(pikepdf.parse_content_stream(page_obj))
+        ops: _Ops = _parse_content_stream(page_obj, context="structural.delete_block")
         blocks = _find_bt_et_blocks(ops)
         removal_indices = _expand_to_bt_et(sorted(op_indices), blocks)
         removal_set = set(removal_indices)
 
-        # Remove operators
-        new_ops = [op for i, op in enumerate(ops) if i not in removal_set]
+        # B.11 / INV-B-10: advisory inline-image signal (computed pre-mutation
+        # over the deletion's op-index span). A1.4: the BI/ID/EI slot is stable,
+        # so the deletion still proceeds.
+        inline_image_present = _inline_image_in_indices(ops, removal_set)
+
+        # B.11 / INV-B-10: KEEP-SLOT EMPTYING instead of tuple removal. Emptying
+        # the show-text operands in place (and leaving every other op untouched)
+        # holds the ops-list length and all downstream operator_index values
+        # stable — the pre-B.11 list-comp filter renumbered every later op and
+        # corrupted sibling operator_refs in a batch. Non-show-text ops in the
+        # removal_set (BT/ET/Tf/Tm/Td) stay in place; they render nothing on
+        # their own once the show-text operands are empty.
+        _empty_show_text_in_place(ops, removal_set)
 
         # Write back content stream
-        new_stream = pikepdf.unparse_content_stream(new_ops)
+        new_stream = _unparse_content_stream(ops, context="structural.delete_block")
         page_obj.Contents = pdf.make_stream(new_stream)
+
+        # B.11 / INV-B-10: prove residue as a MISSED CO-RENDERED OP, not a
+        # token re-appearing in the re-extracted region. Re-index the
+        # just-written page and look for an un-emptied show-text op that (a)
+        # overlaps the target bbox within tolerance AND (b) renders the EXACT
+        # text of a COLLECTED target element — i.e. a co-rendered duplicate of
+        # the deletion target that the strict-AABB collection missed (the
+        # ``< vs <=`` boundary case). The prior check fired on any >=2-char
+        # COLLECTED-target TOKEN re-appearing anywhere in the ~2pt-tolerant
+        # region, which over-fired when an ADJACENT untouched line merely SHARED
+        # a word (e.g. a body line sharing the heading's leading token): the
+        # tolerance pulled the neighbour in and the shared token falsely flipped
+        # success=False even though the deletion was correct. Matching the FULL
+        # collected-target text (a missed duplicate), not a shared sub-token,
+        # ignores an adjacent DIFFERENT line. Computed BEFORE the close_gap
+        # shift so pulled-up content cannot masquerade as residue.
+        _invalidate_locator_cache()
+        post_elements = _build_index(page_obj, page_number)
+        residue_proven = _missed_co_rendered_residue(
+            post_elements, bbox, matched_elems, removal_set
+        )
 
         # Delete annotations overlapping the bbox
         annots_key = pikepdf.Name("/Annots")
@@ -1929,7 +2514,15 @@ def delete_block(
                 -deleted_height,
             )
 
-        _save_pdf(pdf, output_path)
+        main_lin_log: list[str] = []
+        main_enc_log: list[str] = []
+        _save_pdf(
+            pdf,
+            output_path,
+            linearization_log=main_lin_log,
+            reencrypt_password=password,
+            encryption_log=main_enc_log,
+        )
         _invalidate_locator_cache()
 
         overflow = any("below page boundary" in w for w in warnings)
@@ -1954,19 +2547,52 @@ def delete_block(
                     severity="warning",
                 )
             )
-        return EditResult(
-            success=True,
+        # B.11 / INV-B-10: deletion-cleanup surfacing. Provable residue flips
+        # success=False with a deletion_residual_text (warning); an inline image
+        # in the deletion span is an advisory inline_image_present (info) that
+        # does NOT fail the edit (A1.4 stable slot). Both kinds are NOT in
+        # FONT_AFFECTING_KINDS, so font_preserved stays True.
+        deletion_degradations: list[Degradation] = []
+        delete_warnings = list(warnings)
+        success = True
+        if residue_proven:
+            success = False
+            delete_warnings.append("Deletion left residual text in the bounding box region")
+            deletion_degradations.append(
+                Degradation(
+                    kind="deletion_residual_text",
+                    detail=(
+                        "a co-rendered show-text op overlapping the bbox was missed; "
+                        f"target {original_text!r} still renders in the region"
+                    ),
+                    severity="warning",
+                )
+            )
+        if inline_image_present:
+            deletion_degradations.append(
+                Degradation(
+                    kind="inline_image_present",
+                    detail=f"inline image in deletion span {sorted(removal_set)[:1]}",
+                    severity="info",
+                )
+            )
+
+        delete_result = EditResult(
+            success=success,
             original_text=original_text,
             new_text="",
             font_action="kept",
-            warnings=warnings,
+            warnings=delete_warnings,
             fidelity_report=FidelityReport(
                 font_substituted=None,
                 overflow_detected=overflow,
                 reflow_applied=False,
                 glyphs_missing=[],
-                degradations=list(overflow_degradations),
+                degradations=[*overflow_degradations, *deletion_degradations],
             ),
         )
+        _surface_linearization_dropped(delete_result, main_lin_log)
+        _surface_encryption_dropped(delete_result, main_enc_log)
+        return delete_result
     finally:
         pdf.close()

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pdf-edit-engine"
-version = "0.1.3"
+version = "0.2.0"
 description = "Format-preserving PDF text editing — edit text in existing PDFs while preserving fonts, layout, and visual fidelity"
 readme = "README.md"
 license = "MIT"
@@ -54,6 +54,12 @@ dev = [
     "reportlab>=4.0",
     "psutil>=5.9",
     "pip-audit>=2.7",
+    # Differential-render proving harness (tests/harness/diff_render.py).
+    # pypdfium2 (Apache/BSD) rasterizes pages; numpy vectorizes the pixel
+    # diff. Both are optional: the harness guards on import availability and
+    # the ``render`` marker so ``pytest --collect-only`` succeeds without them.
+    "pypdfium2>=4",
+    "numpy>=1.26",
     # F-A-PIP: pip <25 has 4 CVEs in the cache-tar-extraction path
     # (path traversal on malicious source distributions). Dev-only:
     # the engine itself does not invoke pip at runtime, but contributors
@@ -76,6 +82,9 @@ exclude = [
     "CLAUDE.md",
     "experiments/",
     "marketing/",
+    "plans/",
+    ".diagnostic-venv/",
+    ".venv/",
 ]
 
 [tool.ruff]
@@ -146,4 +155,5 @@ markers = [
     "benchmark: performance benchmark tests",
     "slow: slow tests (clean install, etc.)",
     "stress: ultimate stress tests",
+    "render: differential-render visual-fidelity probes (needs pypdfium2 + numpy)",
 ]

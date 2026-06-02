@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import pikepdf
 import pytest
 
+from pdf_edit_engine.errors import OperatorError
 from pdf_edit_engine.locator import (
     ContentStreamInterpreter,
     extract_bbox_text,
@@ -56,7 +57,7 @@ class TestGetText:
         assert "Aryan" in text
 
     def test_invalid_page_raises(self) -> None:
-        with pytest.raises(IndexError):
+        with pytest.raises(OperatorError):
             get_text(RESUME_PDF, page=99)
 
     def test_text_is_unicode_not_cid_bytes(self) -> None:

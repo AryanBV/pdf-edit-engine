@@ -265,7 +265,12 @@ def decrypt_pdf(pdf_path: str, password: str, output_path: str) -> str:
     """
     validate_output_path(output_path)
     with _open_pdf(pdf_path, password=password) as pdf:
-        _save_pdf(pdf, output_path)
+        # A2.3 / INV-W-5: explicit ``encryption=False`` OPTS OUT of _save_pdf's
+        # auto-encryption-preservation. decrypt_pdf opens an encrypted input
+        # (so the in-memory object reports ``is_encrypted is True``) and MUST
+        # strip encryption by design; without this opt-out the canonical save
+        # helper would silently RE-ENCRYPT the file the caller asked to decrypt.
+        _save_pdf(pdf, output_path, encryption=False)
     return output_path
 
 

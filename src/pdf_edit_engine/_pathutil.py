@@ -11,18 +11,271 @@ violation of architectural intent.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
 import sys
+import zlib
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import pikepdf
+from pikepdf.models import PdfParsingError
 
-from pdf_edit_engine.errors import PDFEditError
+from pdf_edit_engine.errors import (
+    EncodingError,
+    FontStreamTooLargeError,
+    OperatorError,
+    PDFEditError,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
+
+
+# A1.3 / INV-W-4: decoded-size bounds for embedded font / CMap streams (Flate
+# decompression-bomb guard). These cap the DECOMPRESSED size of a SINGLE
+# embedded stream, not the whole document — a 30 MiB CJK ``/FontFile2`` passes,
+# but a few-KiB payload that inflates to tens of MiB is refused before the full
+# decode. The constants live here (beside the primitive that enforces them)
+# rather than in ``fonts.py`` so ``encoding.py`` can import them without a
+# ``encoding -> fonts`` cycle; ``fonts.py`` re-exports them.
+MAX_FONT_STREAM_BYTES = 32 * 1024 * 1024
+MAX_TOUNICODE_BYTES = 8 * 1024 * 1024
+
+_FLATE = pikepdf.Name("/FlateDecode")
+
+
+def _normalize_to_list(value: Any) -> list[Any]:
+    """Normalise a PDF scalar-or-array into a Python list.
+
+    A ``/Filter`` (or ``/DecodeParms``) entry may be either a single object
+    (one filter / one parms dict) or an array of them. This collapses both
+    shapes to a list so callers iterate uniformly. ``None`` becomes ``[]``.
+
+    Args:
+        value: A pikepdf object that may be a single value or an array.
+
+    Returns:
+        A list of the contained objects (empty if ``value`` is ``None``).
+    """
+    if value is None:
+        return []
+    if isinstance(value, (pikepdf.Array, list)):
+        # Index-based (not ``list(value)`` / a comprehension): pikepdf's
+        # ``Array.__iter__`` is typed as a union that confuses mypy, but
+        # ``len()`` + ``[]`` is well-typed and works for both Array and list.
+        return [value[i] for i in range(len(value))]
+    return [value]
+
+
+def _stream_filters(stream: pikepdf.Object) -> list[Any]:
+    """Return the stream's ``/Filter`` chain as a normalised list.
+
+    Args:
+        stream: The pikepdf stream ``Object``.
+
+    Returns:
+        The list of filter ``Name`` objects (empty for an unfiltered stream).
+    """
+    return _normalize_to_list(stream.get("/Filter"))
+
+
+def _stream_has_predictor(stream: pikepdf.Object) -> bool:
+    """Return True if any ``/DecodeParms`` (or ``/DP``) declares a predictor.
+
+    A ``/Predictor`` greater than 1 means the inflated bytes are PNG/TIFF
+    predictor-filtered and must be run through the inverse predictor before
+    they are the true payload — the chunked ``zlib``-only path cannot do that,
+    so such a stream goes through pikepdf's complete decode instead.
+
+    Args:
+        stream: The pikepdf stream ``Object``.
+
+    Returns:
+        True when a predictor (> 1) is declared on any parms dict.
+    """
+    parms = stream.get("/DecodeParms")
+    if parms is None:
+        parms = stream.get("/DP")
+    for p in _normalize_to_list(parms):
+        if isinstance(p, (pikepdf.Dictionary, dict)):
+            predictor = p.get("/Predictor")
+            if predictor is None:
+                continue
+            try:
+                if int(predictor) > 1:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
+def read_stream_bounded(
+    stream: pikepdf.Object,
+    *,
+    max_decoded: int,
+    label: str,
+) -> bytes:
+    """Read a pikepdf stream's decoded bytes with a hard decoded-size bound.
+
+    Drop-in replacement for ``stream.read_bytes()`` that refuses a Flate
+    *decompression bomb* — a small compressed payload that inflates to an
+    enormous decoded size — before the full decode materialises in memory.
+    On a benign stream the returned bytes are byte-identical to
+    ``stream.read_bytes()``; the bound is invisible on legitimate input.
+
+    DUAL-PATH design — correctness is never traded for the memory bound:
+
+    * **Single ``/FlateDecode``, no predictor** (the documented Flate-bomb
+      vector — the encoding of ~all real font / CMap streams): a CHUNKED
+      incremental ``zlib`` decode runs that aborts the instant the running
+      output crosses the cap, so the peak resident output stays far below the
+      cap on a bomb (the single-shot ``d.decompress(raw, cap+1)`` alternative
+      peaks ~2x the cap and is rejected by the memory-proof probe).
+    * **Unfiltered** (no ``/Filter``): the raw bytes ARE the decoded bytes, so
+      the raw length is bounded directly (no zlib).
+    * **Everything else** — a non-Flate single filter (``/ASCIIHexDecode`` /
+      ``/ASCII85Decode`` / ``/LZWDecode`` / ...), a multi-filter chain
+      (``[/ASCIIHexDecode /FlateDecode]``), or ``/FlateDecode`` + a
+      ``/Predictor`` — goes CORRECTNESS-FIRST through pikepdf's complete,
+      filter-and-predictor-correct ``stream.read_bytes()`` decode, and then
+      bounds the decoded length. These exotic encodings are NOT used by real
+      font / CMap streams; an oversize one is still refused. RESIDUAL: for a
+      bomb-capable exotic chain, ``read_bytes()`` may transiently expand the
+      payload BEFORE the post-decode size check (re-implementing every PDF
+      codec — and the inverse predictors — incrementally is out of scope and
+      deferred hardening). The chunked path above is the hard memory bound for
+      the one vector real fonts actually use.
+
+    A ``/Length1`` declared-decompressed-size PRE-GATE runs first on every
+    path: an oversize declared size refuses cheaply before any decode.
+
+    The bound predicate is strict ``>``: a decoded size of exactly
+    ``max_decoded`` PASSES; one byte over RAISES.
+
+    The detail string is generic (F-C-03 / INV-W0-9: never echo attacker-
+    controlled stream bytes into user-visible text) — a fixed caller label
+    plus the cap value.
+
+    Args:
+        stream: The pikepdf stream ``Object`` to read.
+        max_decoded: The inclusive decoded-size cap, in bytes.
+        label: A fixed caller tag (e.g. ``"font"`` / ``"ToUnicode"`` /
+            ``"CIDToGIDMap"``) used only in the generic refusal message.
+
+    Returns:
+        The decoded stream bytes (byte-identical to ``stream.read_bytes()`` on
+        a benign stream).
+
+    Raises:
+        FontStreamTooLargeError: If the decoded size exceeds ``max_decoded``
+            (or a cheap pre-gate proves it must). A ``FontNotFoundError``
+            subclass, so it is automatically inside
+            ``fonts._FONT_EXTEND_FAIL_EXCS``.
+        EncodingError: If the stream is CORRUPT (not oversized) and the decode
+            fails — a raw ``zlib.error`` on the chunked Flate arm, or a raw
+            pikepdf decode error (``pikepdf.DataDecodingError`` /
+            ``pikepdf.PdfError``) on the ``read_bytes()`` arm. A1.3 / INV-L-1:
+            the decode failure is translated AT this single font/CMap read
+            chokepoint into a typed ``PDFEditError`` (``EncodingError`` is also
+            inside ``fonts._FONT_EXTEND_FAIL_EXCS``), with a generic message
+            (no stream bytes / no raw exception text — F-C-03 / INV-W0-9).
+    """
+    refusal = f"{label} stream exceeds the {max_decoded}-byte decoded-size bound (refused)"
+
+    # 1. /Length1 declared-decompressed-size PRE-GATE (FontFile2 carries it).
+    #    Runs on every path: an oversize declared size refuses before any
+    #    decode. A malformed (non-int) /Length1 falls through silently.
+    length1 = stream.get("/Length1")
+    if length1 is not None:
+        try:
+            if int(length1) > max_decoded:
+                raise FontStreamTooLargeError(refusal)
+        except (TypeError, ValueError):
+            pass
+
+    # 2. Normalise the filter chain and detect a predictor.
+    filters = _stream_filters(stream)
+    has_predictor = _stream_has_predictor(stream)
+
+    # 3. RAW bytes (still-compressed for a filtered stream; the payload for an
+    #    unfiltered one). Cheap — no expansion.
+    raw = stream.read_raw_bytes()
+
+    # 4. SINGLE /FlateDecode, NO predictor — the documented Flate-bomb vector,
+    #    the encoding of ~all real font/CMap streams. CHUNKED incremental decode
+    #    (the load-bearing memory guarantee): never materialise more than
+    #    ~``max_decoded + 1 chunk``.
+    if filters == [_FLATE] and not has_predictor:
+        chunk = 1024 * 1024
+        decompressor = zlib.decompressobj()
+        out = bytearray()
+        # A1.3 / INV-L-1: a CORRUPT (not oversized) zlib payload makes
+        # ``decompress`` / ``flush`` raise a raw ``zlib.error``. This is the
+        # single chokepoint for every font/CMap read and ``_pathutil`` is the
+        # engine's exception-translation home, so translate the decode failure
+        # HERE into a typed ``EncodingError`` (a ``PDFEditError`` in
+        # ``fonts._FONT_EXTEND_FAIL_EXCS``). The ``FontStreamTooLargeError``
+        # size-cap raises below are NOT ``zlib.error`` subclasses, so the
+        # ``except zlib.error`` cannot swallow them. The generic message carries
+        # no stream bytes / no raw exception text (F-C-03 / INV-W0-9); the
+        # original goes to the traceback via ``from exc``.
+        try:
+            out += decompressor.decompress(raw, chunk)
+            while True:
+                if len(out) > max_decoded:
+                    raise FontStreamTooLargeError(refusal)
+                if decompressor.unconsumed_tail:
+                    out += decompressor.decompress(decompressor.unconsumed_tail, chunk)
+                else:
+                    out += decompressor.flush()
+                    break
+        except zlib.error as exc:
+            raise EncodingError(f"{label} stream decode failed (corrupt stream)") from exc
+        if len(out) > max_decoded:
+            raise FontStreamTooLargeError(refusal)
+        return bytes(out)
+
+    # 5. UNFILTERED: raw IS the decoded payload; bound directly, no zlib.
+    if not filters:
+        if len(raw) > max_decoded:
+            raise FontStreamTooLargeError(refusal)
+        return raw
+
+    # 6. EVERYTHING ELSE (non-Flate single filter, multi-filter chain, or
+    #    /FlateDecode + /Predictor) — CORRECTNESS FIRST. pikepdf's complete
+    #    decode applies the full filter chain and the inverse predictor; we
+    #    then bound the decoded length.
+    #
+    #    Residual (deferred hardening): an exotic BOMB-capable chain (e.g.
+    #    [/ASCIIHexDecode /FlateDecode], /LZWDecode, /RunLengthDecode) is still
+    #    REFUSED here on oversize, but ``read_bytes()`` may TRANSIENTLY expand
+    #    it before this size check — real font / CMap streams do not use these
+    #    encodings, and reimplementing every PDF codec (and its inverse
+    #    predictors) incrementally is out of scope. The chunked Flate path
+    #    above is the hard memory bound for the one vector real fonts use.
+    #
+    #    A1.3 / INV-L-1: a CORRUPT (not oversized) non-Flate / multi-filter /
+    #    predictor stream makes ``read_bytes()`` raise a raw pikepdf decode
+    #    error — empirically ``pikepdf.DataDecodingError`` (which, NB, is NOT a
+    #    ``pikepdf.PdfError`` subclass, so it must be named explicitly);
+    #    ``pikepdf.PdfError`` is also caught for the residual case where the
+    #    decode failure surfaces through that base type. Translate at the
+    #    chokepoint into a typed ``EncodingError`` (a ``PDFEditError`` in
+    #    ``fonts._FONT_EXTEND_FAIL_EXCS``) with a generic message (F-C-03 /
+    #    INV-W0-9). The ``FontStreamTooLargeError`` size-cap raise stays OUTSIDE
+    #    this ``try`` so it can never be swallowed.
+    try:
+        decoded = stream.read_bytes()
+    except (pikepdf.DataDecodingError, pikepdf.PdfError) as exc:
+        raise EncodingError(f"{label} stream decode failed (corrupt stream)") from exc
+    if len(decoded) > max_decoded:
+        raise FontStreamTooLargeError(refusal)
+    return decoded
 
 
 # F-W21-MERGED: Windows reserved device names. Case-insensitive match
@@ -295,7 +548,31 @@ def open_pdf(
         raise PDFEditError(f"I/O error opening PDF: {type(exc).__name__}") from None
 
 
-def _save_pdf(pdf: pikepdf.Pdf, output_path: str | Path, **save_kwargs: Any) -> None:
+# A2.2 / INV-W-3: marker appended to a caller-supplied ``linearization_log``
+# (and emitted as a generic detail string) when a linearized input had to be
+# saved non-linearized. Kept generic on purpose — F-C-03 / INV-W0-9 forbid
+# echoing attacker-controlled exception bytes into user-visible text; the
+# pikepdf exception type goes to logs only.
+_LINEARIZATION_DROPPED_DETAIL = "re-linearization failed; saved non-linearized"
+
+
+# A2.3 / INV-W-5: marker appended to a caller-supplied ``encryption_log`` (and
+# emitted as a generic detail string) when an encrypted input could NOT be
+# re-encrypted at all (pikepdf raised on the encryption= save). Generic on
+# purpose — F-C-03 / INV-W0-9 forbid echoing attacker-controlled exception
+# bytes into user-visible text; the pikepdf exception type goes to logs only.
+_ENCRYPTION_DROPPED_DETAIL = "re-encryption failed; saved unencrypted"
+
+
+def _save_pdf(
+    pdf: pikepdf.Pdf,
+    output_path: str | Path,
+    *,
+    linearization_log: list[str] | None = None,
+    reencrypt_password: str | bytes | None = None,
+    encryption_log: list[str] | None = None,
+    **save_kwargs: Any,
+) -> None:
     """Save a Pdf, translating pikepdf and filesystem errors to ``PDFEditError``.
 
     This is the **single canonical save entry point** for this package.
@@ -310,9 +587,68 @@ def _save_pdf(pdf: pikepdf.Pdf, output_path: str | Path, **save_kwargs: Any) -> 
     that genuinely need ``encryption=``, ``linearize=``, etc. retain
     centralized exception translation.
 
+    **A2.2 / INV-W-3 — linearization preservation.** A *linearized*
+    ("Fast Web View") input must not be silently down-converted on save.
+    This helper reads ``pdf.is_linearized`` BEFORE serializing; when True
+    (and the caller did not already pass an explicit ``linearize``), it
+    saves with ``linearize=True`` so the property round-trips. A
+    NON-linearized input never sets the flag, so its save call is
+    byte-identical to the pre-A2.2 behaviour (zero blast radius). If
+    pikepdf raises ``pikepdf.PdfError`` on the ``linearize=True`` attempt,
+    the helper retries ONCE with a normal (non-linearized) save so the
+    edit still succeeds, and records the loss: it appends
+    ``_LINEARIZATION_DROPPED_DETAIL`` to ``linearization_log`` when one was
+    supplied (so an edit verb can surface a typed ``linearization_dropped``
+    Degradation), else logs the drop at INFO. A genuine save failure on the
+    normal-save retry still propagates through the existing PDFEditError
+    translation (INV-L-1 preserved).
+
+    **A2.3 / INV-W-5 — encryption preservation.** An *encrypted* input must
+    not be silently down-converted to a plaintext output on save. This helper
+    reads ``pdf.is_encrypted`` ONCE BEFORE serializing; when True (and the
+    caller did not already pin an explicit ``encryption`` in ``save_kwargs``,
+    so ``wrapper.encrypt_pdf``'s explicit ``encryption=`` still wins and
+    ``wrapper.decrypt_pdf``'s explicit ``encryption=False`` opt-out is
+    honoured), it re-encrypts the output with a ``pikepdf.Encryption`` built
+    from the input's ``R`` and ``allow`` (permission bitmask) and the
+    caller-supplied ``reencrypt_password`` for BOTH owner and user. A
+    NON-encrypted input never sets ``encryption``, so its save call is
+    byte-identical to the pre-A2.3 behaviour (zero blast radius). DOCUMENTED
+    BOUNDARIES (NOT per-edit degradations): the owner password is NOT
+    recoverable from an opened pikepdf document, so a distinct owner!=user pair
+    collapses to the single caller password; ``/P`` is preserved STRUCTURALLY
+    (mirrored via ``allow=``) but is advisory because pikepdf does not enforce
+    permissions. If pikepdf raises ``pikepdf.PdfError`` on the encrypted save,
+    the helper retries ONCE WITHOUT ``encryption`` (so the edit still lands)
+    and appends ``_ENCRYPTION_DROPPED_DETAIL`` to ``encryption_log`` when one
+    was supplied (so an edit verb can surface a typed ``encryption_dropped``
+    Degradation), else logs the drop at INFO. An ``OSError`` from the encrypted
+    save is NOT caught here — it falls through to the outer translator
+    identically to W-3 (INV-L-1 / F-C-03: no raw OSError, no path leak).
+
     Args:
         pdf: An open ``pikepdf.Pdf`` to serialize.
         output_path: Filesystem path where the PDF will be written.
+        linearization_log: Optional out-parameter (mirrors
+            ``fonts.extend_subset``'s ``substitution_log``). When provided
+            and re-linearization fell back to a normal save, a marker is
+            appended so the calling edit verb can surface a
+            ``linearization_dropped`` Degradation. When ``None`` (the
+            default — wrapper/annotation verbs that carry no
+            ``FidelityReport``), the fallback is logged only.
+        reencrypt_password: The password the calling verb used to OPEN the
+            (possibly encrypted) input. This is how the re-encryption password
+            reaches the helper so ALL encryption logic stays inside
+            ``_pathutil`` (INV-L-1 spirit). Bytes are decoded ``latin-1``
+            (lossless for any byte sequence). When ``None``/``""`` on an
+            encrypted input, ``pikepdf.Encryption(owner="", user="")`` is the
+            honest best-effort (still structurally encrypted). Ignored for a
+            non-encrypted input.
+        encryption_log: Optional out-parameter mirroring
+            ``linearization_log``. When provided and re-encryption fell back
+            to an unencrypted save, ``_ENCRYPTION_DROPPED_DETAIL`` is appended
+            so the calling edit verb can surface an ``encryption_dropped``
+            Degradation. When ``None``, the fallback is logged only.
         **save_kwargs: Forwarded verbatim to ``pikepdf.Pdf.save``.
             Reserve for cases (encryption, linearize) where the
             underlying API requires them; the common path passes none.
@@ -322,8 +658,101 @@ def _save_pdf(pdf: pikepdf.Pdf, output_path: str | Path, **save_kwargs: Any) -> 
             target is a directory, target's parent vanished mid-flight,
             disk full, sharing violation, pikepdf serialization failure.
     """
+    # A2.3 / INV-W-5: detect the input's encryption once, before save, and
+    # ask pikepdf to preserve it. Only when the caller has not already pinned
+    # ``encryption`` explicitly — ``wrapper.encrypt_pdf`` pins its own
+    # ``encryption=`` (which wins), and ``wrapper.decrypt_pdf`` pins
+    # ``encryption=False`` to OPT OUT of this auto-preservation.
+    was_encrypted = bool(pdf.is_encrypted)
+    if was_encrypted and "encryption" not in save_kwargs:
+        # The owner password is NOT recoverable from an opened pikepdf
+        # document, and ``user_password`` is recoverable ONLY when the file was
+        # opened with the USER password (it is ``b''`` when opened with the
+        # owner password). The HONEST, deterministic choice is to re-encrypt
+        # with the password the CALLER supplied, for owner AND user.
+        # Consequence (documented boundary, NOT a per-edit degradation): a file
+        # with a distinct owner!=user pair collapses to a single caller
+        # password, and ``/P`` is preserved STRUCTURALLY (mirrored via
+        # ``allow=``) but is advisory only because pikepdf does not enforce
+        # permissions.
+        # Pass the caller's password through WITH ITS ORIGINAL TYPE (str or
+        # bytes). pikepdf.Encryption owner/user are typed ``str`` but accept
+        # ``bytes`` at runtime. We must NOT decode bytes->str: pikepdf's R=6
+        # (AES-256) key derivation hashes a ``bytes`` password from its RAW
+        # bytes but a ``str`` password from its UTF-8 encoding, so decoding a
+        # non-ASCII bytes password to str (even losslessly via latin-1) would
+        # re-encrypt under a DIFFERENT key than the caller used to open the
+        # file — silently locking them out of their own output (success=True,
+        # no degradation). Passing the original type keeps open-time and
+        # re-encrypt-time hashing identical.
+        pw: str | bytes = reencrypt_password if reencrypt_password is not None else ""
+        info = pdf.encryption
+        # Mirror only ``R`` and ``allow``: ``bits``/``V`` are DERIVED from
+        # ``R`` (R=4 -> V=4/128-bit, R=6 -> V=5/256-bit) and have no public
+        # Encryption kwarg, so they round-trip from ``R`` alone.
+        # ``info.R`` is an ``int`` per pikepdf's stub, but ``Encryption(R=...)``
+        # narrows to ``Literal[2,3,4,5,6]``. R read from a real encrypted file is
+        # always in that range, so the cast is honest (not a value override).
+        save_kwargs["encryption"] = pikepdf.Encryption(
+            owner=pw,  # type: ignore[arg-type]  # str|bytes ok at runtime; bytes must pass through (R=6)
+            user=pw,  # type: ignore[arg-type]
+            R=cast("Literal[2, 3, 4, 5, 6]", info.R),
+            allow=pdf.allow,
+        )
+
+    # A2.2 / INV-W-3: detect the input's linearization once, before save, and
+    # ask pikepdf to preserve it. Only when the caller has not already pinned
+    # ``linearize`` explicitly (e.g. a deterministic corpus builder).
+    was_linearized = bool(pdf.is_linearized)
+    # True iff WE injected the ``encryption`` kwarg above (so the genuine-
+    # encryption-failure fallback applies). A caller-pinned ``encryption`` (or
+    # the ``encryption=False`` decrypt opt-out) is NOT a ``pikepdf.Encryption``
+    # we built, so it does NOT enable the fallback.
+    injected_encryption = was_encrypted and isinstance(
+        save_kwargs.get("encryption"), pikepdf.Encryption
+    )
     try:
-        pdf.save(str(output_path), **save_kwargs)
+        if was_linearized and "linearize" not in save_kwargs:
+            try:
+                pdf.save(str(output_path), linearize=True, **save_kwargs)
+                return
+            except pikepdf.PdfError:
+                # Re-linearization failed (a can't-linearize failure, NOT an
+                # IO failure): fall back to a NORMAL save below so the edit
+                # still lands, and surface the loss honestly. Any ``OSError``
+                # from this same attempt is NOT caught here — it falls through
+                # to the outer translator below, identically to the
+                # non-linearized save's IO-error path (INV-L-1 / F-C-03: no raw
+                # OSError, no absolute-path leak), and emits NO
+                # ``linearization_dropped`` (an IO failure is not a dropped
+                # Fast Web View layout). The injected ``encryption`` is still
+                # carried into the normal-save retry below, so a
+                # linearize-failure alone does NOT drop encryption.
+                logger.info(
+                    "pdf.save(linearize=True) failed; retrying non-linearized (INV-W-3 fallback)",
+                    exc_info=True,
+                )
+                if linearization_log is not None:
+                    linearization_log.append(_LINEARIZATION_DROPPED_DETAIL)
+        try:
+            pdf.save(str(output_path), **save_kwargs)
+        except pikepdf.PdfError:
+            if not injected_encryption:
+                raise
+            # A2.3 / INV-W-5 honest fallback: re-encryption could not be
+            # applied at all (a genuine can't-encrypt failure, NOT an IO
+            # failure — an ``OSError`` is not caught here and falls to the
+            # outer translator). Retry WITHOUT encryption so the edit still
+            # succeeds, and record the loss so the verb surfaces a typed
+            # ``encryption_dropped`` Degradation.
+            logger.info(
+                "pdf.save(encryption=...) failed; retrying unencrypted (INV-W-5 fallback)",
+                exc_info=True,
+            )
+            if encryption_log is not None:
+                encryption_log.append(_ENCRYPTION_DROPPED_DETAIL)
+            save_kwargs.pop("encryption", None)
+            pdf.save(str(output_path), **save_kwargs)
     except pikepdf.PdfError as exc:
         # F-C-03 / INV-W0-9: %s of an exception object renders str(exc),
         # which can leak attacker-controlled bytes. Use exc_info=True for
@@ -341,3 +770,96 @@ def _save_pdf(pdf: pikepdf.Pdf, output_path: str | Path, **save_kwargs: Any) -> 
         # F-C-03 / INV-W0-9: same rationale as the PdfError branch.
         logger.error("pdf.save: OSError", exc_info=True)
         raise PDFEditError(f"I/O error saving PDF: {type(exc).__name__}") from None
+
+
+# Exception types that pikepdf's content-stream parse/unparse can raise.
+# ``pikepdf.PdfError`` covers the residual ``raise e from e`` branch in
+# ``parse_content_stream`` (e.g. "ignoring non-stream in an array of
+# streams"). ``PdfParsingError`` — raised by ``unparse_content_stream``
+# on malformed operand/operator items AND by some parse failures — is
+# NOT a subclass of ``PdfError`` (it derives straight from ``Exception``),
+# so it must be named explicitly or it escapes any ``except PdfError``.
+# ``TypeError`` is what ``parse_content_stream`` raises when handed a
+# non-stream/non-page object (its own guard clauses + the
+# "supposed to be a stream or an array" remap). All three are translated
+# to ``OperatorError`` per the documented contract in ``errors.py``.
+_CONTENT_STREAM_PARSE_EXCS = (pikepdf.PdfError, PdfParsingError, TypeError)
+
+
+@contextlib.contextmanager
+def _with_content_stream_translation(context: str) -> Iterator[None]:
+    """Translate pikepdf content-stream parse/unparse failures to ``OperatorError``.
+
+    INV-B-5 / INV-L-1 family: ``pikepdf.parse_content_stream`` and
+    ``pikepdf.unparse_content_stream`` can raise ``pikepdf.PdfError``,
+    ``pikepdf.models.PdfParsingError`` (which is **not** a ``PdfError``
+    subclass), or ``TypeError`` on a malformed or un-parseable content
+    stream. Before this translator, those escaped raw to public callers
+    from ``surgeon`` / ``structural`` / ``reflow`` (only ``open_pdf``
+    translated *open*-time errors, and ``locator._build_index`` caught a
+    narrower set that excluded both pikepdf parse types). This is the
+    parse/unparse analogue of ``open_pdf``'s open-time translation and of
+    ``fonts._with_fonttools_translation``'s fontTools-boundary translation.
+
+    A forensic ``logger.error(..., exc_info=True)`` line preserves the
+    original exception type and traceback even though ``{exc}`` is dropped
+    from the user-visible ``OperatorError`` message (F-C-03 / INV-W0-9:
+    parse failures can echo attacker-controlled content-stream bytes).
+
+    Args:
+        context: Short identifier of the call site (e.g.
+            ``"surgeon.replace_all"``) — included in the forensic log
+            line to localise failures.
+
+    Raises:
+        OperatorError: when any caught parse/unparse exception fires
+            inside the ``with`` block. ``__cause__`` is set to the
+            original exception so the chain is preserved.
+    """
+    try:
+        yield
+    except _CONTENT_STREAM_PARSE_EXCS as exc:
+        logger.error("content-stream boundary [%s]", context, exc_info=True)
+        raise OperatorError(f"Content stream parse/unparse failed: {type(exc).__name__}") from exc
+
+
+def _parse_content_stream(target: pikepdf.Object | pikepdf.Page, *, context: str) -> list[Any]:
+    """Parse a content stream, translating pikepdf failures to ``OperatorError``.
+
+    Thin wrapper over ``pikepdf.parse_content_stream`` that routes the
+    call through ``_with_content_stream_translation``. Returns the parsed
+    instructions as a ``list`` (callers across the package consistently
+    materialise the result, so doing it here keeps call sites uniform).
+
+    Args:
+        target: A ``pikepdf.Page`` or content-stream ``Object`` to parse.
+        context: Call-site identifier for the forensic log line.
+
+    Returns:
+        List of parsed content-stream instructions.
+
+    Raises:
+        OperatorError: If pikepdf raises a parse failure.
+    """
+    with _with_content_stream_translation(context):
+        return list(pikepdf.parse_content_stream(target))
+
+
+def _unparse_content_stream(ops: list[Any], *, context: str) -> bytes:
+    """Serialize content-stream ops, translating pikepdf failures to ``OperatorError``.
+
+    Thin wrapper over ``pikepdf.unparse_content_stream`` that routes the
+    call through ``_with_content_stream_translation``.
+
+    Args:
+        ops: The (operands, operator) instruction list to serialize.
+        context: Call-site identifier for the forensic log line.
+
+    Returns:
+        The serialized content-stream bytes.
+
+    Raises:
+        OperatorError: If pikepdf raises an unparse failure.
+    """
+    with _with_content_stream_translation(context):
+        return pikepdf.unparse_content_stream(ops)

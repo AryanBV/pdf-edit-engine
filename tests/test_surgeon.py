@@ -414,19 +414,30 @@ class TestBatchReplace:
 class TestErrorHandling:
     """Test error conditions raise appropriate exceptions."""
 
-    def test_encrypted_pdf_raises(self, tmp_path: Path) -> None:
-        """Encrypted PDF should raise PDFEditError."""
-        # Create an encrypted PDF
+    def test_encrypted_pdf_without_password_raises(self, tmp_path: Path) -> None:
+        """An encrypted PDF opened with no password raises PDFEditError.
+
+        A2.3 (INV-W-5) makes encrypted PDFs editable WHEN the caller supplies
+        the password (round-trip pinned in
+        tests/invariants/test_w_5_encryption_round_trip.py). With a NON-empty
+        user password and NO password passed, ``open_pdf`` must still translate
+        pikepdf's ``PasswordError`` into a clean ``PDFEditError`` — the v0.1.x
+        ``is_encrypted`` blanket refusal was removed by A2.3, so the honest
+        rejection now flows from the password-protected open, not a hardcoded
+        guard.
+        """
+        # Encrypt with a NON-empty user password so a no-password open fails.
         enc_path = str(tmp_path / "encrypted.pdf")
         pdf = pikepdf.Pdf.new()
         pdf.add_blank_page(page_size=(612, 792))
-        pdf.save(enc_path, encryption=pikepdf.Encryption(owner="secret", user=""))
+        pdf.save(enc_path, encryption=pikepdf.Encryption(owner="owner-pw", user="user-pw"))
         pdf.close()
 
-        # Fabricate a minimal TextMatch (won't be used — error raised early)
+        # Fabricate a minimal TextMatch (won't be used — the encrypted open
+        # raises before any match is consumed).
         dummy_match = _first_match(SIMPLE_PDF, "Test")
 
-        with pytest.raises(PDFEditError, match="encrypted"):
+        with pytest.raises(PDFEditError, match="(?i)password|protected|encrypt"):
             replace(enc_path, dummy_match, "New", str(tmp_path / "out.pdf"))
 
     def test_stale_operator_index_raises(self, tmp_path: Path) -> None:

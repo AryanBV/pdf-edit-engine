@@ -4,7 +4,7 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://github.com/AryanBV/pdf-edit-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/AryanBV/pdf-edit-engine/actions/workflows/ci.yml)
-[![Audit suite](https://img.shields.io/badge/invariants-144%20probes-blueviolet)]()
+[![Audit suite](https://img.shields.io/badge/invariants-315%20probes-blueviolet)]()
 
 Format-preserving PDF text editing. Modify text in existing PDFs at the content stream level — fonts, layout, and spacing stay intact.
 
@@ -58,33 +58,34 @@ class FidelityReport:
     overflow_detected: bool         # Text wider than available space?
     reflow_applied: bool            # Paragraph reflow triggered?
     glyphs_missing: list[str]       # Characters that triggered extension (pre-extension state)
-    degradations: list[Degradation] # v0.1.3: typed visual-fidelity events
+    degradations: list[Degradation] # typed visual-fidelity events
 
     @property
     def font_preserved(self) -> bool:
-        """Computed (v0.1.3): True iff font_substituted is None and no
+        """Computed: True iff font_substituted is None and no
         FONT_AFFECTING_KINDS Degradation was emitted."""
 ```
 
 Automated pipelines and AI agents inspect these fields to verify edit quality programmatically — no manual PDF review needed. The text-replace functions (`replace`, `replace_all`, `batch_replace`) support `dry_run=True` to preview the report without writing to disk.
 
-### Degradations (v0.1.3)
+### Degradations
 
 When the engine produces output that may differ visually from the
-original, it appends a typed `Degradation` event to
-`fidelity_report.degradations`. Each event carries `kind`, `severity`,
-and a free-form `detail`:
+original — or refuses an edit it cannot do faithfully — it appends a
+typed `Degradation` event to `fidelity_report.degradations`. Each event
+carries `kind`, `severity`, and a free-form `detail`:
 
 ```python
 @dataclass(frozen=True)
 class Degradation:
-    kind: DegradationKind                      # one of 12 canonical values
+    kind: DegradationKind                      # one of the canonical values
     detail: str = ""                           # site-specific context
     severity: Literal["info", "warning", "error"] = "info"
 ```
 
-The 12 canonical kinds (Permissive enum policy — clients should treat
-unknown kinds as opaque, not crash):
+The 30 canonical kinds (enumerable at runtime via
+`pdf_edit_engine.DEGRADATION_KINDS`; Permissive enum policy — clients
+should treat unknown kinds as opaque, not crash):
 
 | Kind | Severity | Meaning |
 |---|---|---|
@@ -97,9 +98,27 @@ unknown kinds as opaque, not crash):
 | `overflow_shift_clamped` | warning | Vertical shift was bounded by page geometry. |
 | `overflow_shift_suppressed` | warning | Vertical shift was skipped entirely (no room below). |
 | `line_height_compressed` | info | Line height was reduced to fit content. |
+| `font_size_reduced` | info | Opt-in shrink-to-fit (`fit="shrink"`): font size was binary-searched DOWN to fit a fixed-height region. Non font-affecting (glyph identity unchanged). |
 | `reflow_aborted_to_simple` | warning | Complex reflow failed; flat-replace fallback used. |
 | `font_coverage_extended` | info | Embedded font's cmap was extended (Tier 1, outlines present). |
 | `font_coverage_substituted` | warning | Glyph outlines were sourced from a system font (Tier 1.5). |
+| `positioning_adjustment_skipped` | warning | Edited run's text matrix is rotated/sheared; trailing-text horizontal compensation was skipped (wrong-axis under rotation). Non font-affecting. |
+| `rotated_text_unsupported` | warning | Edit on rotated/sheared text would route through reflow (which flattens rotation); refused instead. Non font-affecting. |
+| `line_break_quality_degraded` | info | A re-wrap left a widow — a final line holding a single short word. Detect-and-surface only (output geometry unchanged). Non font-affecting. |
+| `color_space_approximated` | warning | A non-device fill color (Separation/DeviceN/ICCBased/Pattern) could not be replayed verbatim on reflow; fell back to a device-color approximation. Non font-affecting. |
+| `indent_flattened` | info | A **multi-line** paragraph carried a genuine but un-classifiable indent (non-monotone / mutually-inconsistent continuation x-starts); fell back to flush. A plain single-line paragraph is just flush and does NOT emit this. Output geometry unchanged. Non font-affecting. |
+| `linearization_dropped` | info | A linearized (Fast Web View) input could not be re-linearized on save; fell back to a normal save. Emitted only on that fallback (never when preservation succeeds, never for a non-linearized input). Non font-affecting. |
+| `font_subset_introspection_failed` | warning | An embedded font binary could not be parsed to count glyphs (read path, e.g. `get_fonts`); `glyph_count` reported 0 (unknown) instead of fabricated from a sparse `/W` dict. Read-path only. Non font-affecting. |
+| `font_substituted_from_user_fonts` | warning | The resolved system font for Tier 1.5 came from a per-platform user-writable font directory (origin surface). The font WAS found and used. Non font-affecting. |
+| `tounicode_recovered` | error | A new-glyph replace targeted a Type0/Identity-H font whose CID→Unicode map was recovered from the embedded cmap (no `/ToUnicode`); glyph injection needs a `/ToUnicode`, so the edit refused. Font-affecting. |
+| `untextable_cidfont` | error | A Type0 font had no usable `/ToUnicode` and embedded-cmap recovery was impossible; the text is unaddressable. Font-affecting. |
+| `font_stream_too_large` | warning | An embedded font / CMap / ToUnicode stream's decompressed size exceeded the bound (Flate decompression-bomb guard); the edit was refused before any glyph surgery (companion to `font_extension_failed`). Non font-affecting. |
+| `ligature_substituted` | info | The re-encode chose a ligature CID — a mandatory ligature (always applied) or an opted-in discretionary one. A different glyph within the same embedded font (no font swap). Non font-affecting. |
+| `deletion_residual_text` | warning | A deletion left provable residual deleted text in the edited region (keep-slot emptying failed to clear a glyph, or a bbox show-text op was missed). Drives `success=False`. Non font-affecting. |
+| `inline_image_present` | info | A `BI/ID/EI` inline image lies in/near a deletion span. Advisory only — the deletion still proceeds (operator-index addressing survives). Non font-affecting. |
+| `scriptless_reflow_unsupported` | info | A spaceless paragraph in a dictionary-segmented script (Thai/Lao/Khmer/Myanmar) has no UAX#14 break opportunity; the run is left honestly unwrapped. CJK and Latin never emit it. Non font-affecting. |
+| `encryption_dropped` | warning | An encrypted input could not be re-encrypted on save; the edit fell back to an unencrypted output. Emitted only on a genuine re-encryption failure (never on the success path). Non font-affecting. |
+| `multi_match_same_operator_unsupported` | warning | Two or more matches splice into the same show-text operator with a length-changing replacement; the colliding matches were refused (`success=False`) before any mutation to avoid stale-byte-slice corruption. Matches in different operators still edit. Non font-affecting. |
 
 **`degradations` is the visual-fidelity gate, not `font_preserved`.** For
 agentic consumers building gating logic, key off `degradations` first;
@@ -117,7 +136,7 @@ preserve glyph identity).
 | **Layout preservation** | Operator-level precision | Approximate | N/A |
 | **Edit verification** | FidelityReport | None | None |
 | **dry_run preview** | Yes | No | No |
-| **Font subset extension** | 2-tier (CMap + re-embed) | No | No |
+| **Font subset extension** | 2-tier (CMap + Tier 1.5 in-place injection) | No | No |
 | **License** | MIT | AGPL-3.0 | BSD |
 
 ## Key capabilities
@@ -248,17 +267,18 @@ CI runs on Python 3.12 and 3.13. The test suite validates against PDFs from mult
 
 ## Audit suite
 
-Beyond ~660 conventional unit tests, the engine ships **81 invariant probes** under
-`tests/invariants/` covering 14 layers (encoding, content stream, font, locator,
-surgeon, structural, reflow, wrapper, annotations, fidelity contract, public API,
-error hierarchy, security, differential vs pdfminer.six). Each probe quotes the
-invariant claim verbatim in its docstring and runs as part of `make test`. The
-probes were generated by the v0.1.2 release-gate audits — see
-`docs/audit-findings-v0.1.2.md`, `docs/security-review-v0.1.2.md`, and
-`docs/comprehensive-audit-2026-05-02.md`. 15 violations surfaced across the
-audits (9 in the invariant pass, 6 in the post-audit hardening review), all
-root-fixed structurally rather than patched per call site. The probes are now
-permanent regression guards.
+Beyond ~631 conventional unit tests, the engine ships **315 invariant probes**
+across 108 files under `tests/invariants/`, covering layers from encoding,
+content stream, font, locator, surgeon, structural, and reflow through wrapper,
+annotations, the fidelity contract, public API, error hierarchy, security, and
+differential checks vs pdfminer.six. Each probe quotes the invariant claim
+verbatim in its docstring and runs as part of `make test`. The suite began with
+the v0.1.2 release-gate audits — see `docs/audit-findings-v0.1.2.md`,
+`docs/security-review-v0.1.2.md`, and `docs/comprehensive-audit-2026-05-02.md` —
+and every v0.2.0 capability and honesty fix added its own permanent probes
+(e.g. the `INV-W-*` robustness, `INV-C-*` font, and `INV-G-*` reflow series).
+Every violation surfaced was root-fixed structurally rather than patched per
+call site, and the probes are permanent regression guards.
 
 ## Error handling
 

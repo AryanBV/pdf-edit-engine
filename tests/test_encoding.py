@@ -8,13 +8,37 @@ from typing import TYPE_CHECKING
 import pikepdf
 import pytest
 
-from pdf_edit_engine.encoding import FontResolver, FontResolverCache
+from pdf_edit_engine.encoding import FontResolver, FontResolverCache, _build_reverse_map
 
 if TYPE_CHECKING:
     from collections.abc import Generator
 
 CORPUS_DIR = Path(__file__).parent / "corpus"
 RESUME_PDF = CORPUS_DIR / "Aryan_BV_Resume_2026.pdf"
+
+
+def _synth_cid_resolver(forward: dict[int, str]) -> FontResolver:
+    """Instantiate a CID FontResolver from a hand-built CID→Unicode map WITHOUT
+    a PDF (bypassing __init__). encode/decode/can_encode consult only these
+    instance dicts/flags. Used by the B.9-recharacterized ligature tests so
+    they can exercise the no-collapse default on a map that carries separate
+    component CIDs (the resume's F1 lacks a standalone 'f' CID)."""
+    r = FontResolver.__new__(FontResolver)
+    r._font_name = "T"
+    r._is_cid = True
+    r._byte_width = 2
+    r._cid_to_unicode = dict(forward)
+    built = _build_reverse_map(forward)
+    if isinstance(built, tuple):  # GREEN: (primary, ligatures)
+        r._unicode_to_cid, r._ligature_to_cid = built
+    else:  # RED-state single-dict shape
+        r._unicode_to_cid = built
+        r._ligature_to_cid = {v: k for k, v in sorted(forward.items()) if len(v) > 1}
+    r._max_ligature_len = max((len(v) for v in forward.values()), default=1)
+    r._untextable_cidfont = False
+    r._tounicode_recovered = False
+    return r
+
 
 pytestmark = pytest.mark.skipif(
     not RESUME_PDF.exists(), reason="Aryan_BV_Resume_2026.pdf not in corpus"
@@ -92,9 +116,32 @@ class TestIdentityHEncode:
     def test_encode_space(self, f1_resolver: FontResolver) -> None:
         assert f1_resolver.encode(" ") == bytes([0x00, 0x03])
 
-    def test_encode_ligature_fi(self, f1_resolver: FontResolver) -> None:
-        # 'fi' should encode as single CID 302
-        assert f1_resolver.encode("fi") == bytes([0x01, 0x2E])
+    def test_encode_ligature_fi_no_collapse_by_default(self) -> None:
+        # B.9 RECHARACTERIZED: the OLD assertion baked in the exact bug
+        # INV-B-9 fixes — greedy collapse of typed-separate 'f'+'i' into the
+        # single discretionary-ligature CID 0x012E, which corrupts glyph
+        # identity AND the width oracle (one ligature width instead of
+        # W[f]+W[i]). The CORRECT default is no-collapse: typed 'fi' encodes
+        # as the two separate component CIDs so the rendered text matches the
+        # typed text. F1 in the resume lacks a standalone 'f' CID (it only
+        # ever uses the 'fi' ligature), so per blueprint §7A this no-collapse
+        # assertion uses a synthetic forward-map resolver that DOES carry
+        # separate 'f'/'i' CIDs (the round-trip + opt-in companion below prove
+        # no fidelity and no capability were lost). Against the current greedy
+        # code this FAILS (it collapses to 0x012E) = RED for the right reason.
+        r = _synth_cid_resolver({0x66: "f", 0x69: "i", 0x12E: "fi"})
+        out = r.encode("fi")
+        assert out != bytes([0x01, 0x2E])
+        assert len(out) == 4  # two 2-byte CIDs
+        assert out == bytes([0x00, 0x66, 0x00, 0x69])
+        assert r.decode(out) == "fi"
+
+    def test_encode_ligature_fi_opt_in_collapses(self) -> None:
+        # B.9: the discretionary ligature CID is still REACHABLE when a caller
+        # explicitly opts in — proving no capability was removed, only the
+        # unsafe DEFAULT collapse. RED: the kw-only param does not yet exist.
+        r = _synth_cid_resolver({0x66: "f", 0x69: "i", 0x12E: "fi"})
+        assert r.encode("fi", allow_discretionary_ligatures=True) == bytes([0x01, 0x2E])
 
     def test_encode_unencodable_raises(self, f1_resolver: FontResolver) -> None:
         with pytest.raises(KeyError):
@@ -112,7 +159,19 @@ class TestRoundTrip:
         self,
         f1_resolver: FontResolver,
     ) -> None:
-        assert f1_resolver.decode(f1_resolver.encode("fi")) == "fi"
+        # B.9 RECHARACTERIZED: the resume's F1 maps CID 302 -> "fi" but has NO
+        # standalone 'f' CID (the font only ever uses the 'fi' ligature). Under
+        # the corrected default-OFF policy, typed "fi" no longer silently reuses
+        # the DISCRETIONARY ligature glyph, so on F1 it becomes unencodable
+        # (the 'f' component is absent) — the honest result is a KeyError that
+        # triggers font extension on the write path. The original assertion
+        # baked in the old greedy collapse; the round-trip capability is proven
+        # via the explicit opt-in below (the ligature CID is still reachable).
+        with pytest.raises(KeyError):
+            f1_resolver.encode("fi")
+        assert (
+            f1_resolver.decode(f1_resolver.encode("fi", allow_discretionary_ligatures=True)) == "fi"
+        )
 
     def test_roundtrip_winAnsi(self, f2_resolver: FontResolver) -> None:
         for text in ["A", "B", " ", "0", "z"]:
@@ -165,20 +224,42 @@ class TestCanEncode:
         self,
         f1_resolver: FontResolver,
     ) -> None:
-        """can_encode accepts ligature sequences like 'fi' that encode() handles."""
+        """can_encode stays LOCKSTEP with the default-OFF encode (B.9).
+
+        RECHARACTERIZED: the resume's F1 maps CID 302 -> "fi" via a
+        DISCRETIONARY ligature but has NO standalone 'f' CID. The old
+        assertion expected can_encode("fi") == (True, []) because the OLD
+        greedy encode collapsed typed 'f'+'i' into CID 302. Under the corrected
+        default-OFF policy can_encode shares the exact per-step decision with
+        the default encode (no discretionary collapse), so it honestly reports
+        'f' as missing — exactly matching that encode("fi") would KeyError on
+        F1. This pins the lockstep contract rather than the old collapse.
+
+        F1's EXACT glyph set (empirically probed against the resume PDF):
+        standalone 'f' is ABSENT, standalone 'i' is PRESENT at CID 0x015D, and
+        the 'fi' DISCRETIONARY ligature is PRESENT at CID 0x012E. So default-OFF
+        can_encode("fi") refuses ONLY on the missing 'f' (NOT on 'i'); the
+        missing == ["f"] result below is the direct consequence of that set.
+        """
         ok, missing = f1_resolver.can_encode("fi")
-        assert ok is True
-        assert missing == []
+        assert ok is False
+        # F1 has 'i' (CID 0x015D) but lacks standalone 'f'; only 'f' is missing.
+        assert missing == ["f"]
 
     def test_can_encode_ligature_in_context(
         self,
         f1_resolver: FontResolver,
     ) -> None:
-        """can_encode handles ligatures surrounded by normal characters."""
-        # 'A' has standalone CID, 'fi' is a ligature — both should pass
+        """can_encode handles ligatures surrounded by normal characters (B.9).
+
+        RECHARACTERIZED for the same reason as test_can_encode_ligature_sequence:
+        'A' has a standalone CID, but F1's typed 'fi' is a discretionary
+        ligature whose 'f' component is absent, so default-OFF can_encode
+        reports 'f' missing (lockstep with the default encode).
+        """
         ok, missing = f1_resolver.can_encode("Afi")
-        assert ok is True
-        assert missing == []
+        assert ok is False
+        assert missing == ["f"]
 
 
 class TestWinAnsi:

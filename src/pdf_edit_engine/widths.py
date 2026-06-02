@@ -77,25 +77,72 @@ def parse_simple_widths(font_dict: pikepdf.Dictionary) -> dict[int, float]:
     return widths
 
 
+def width_cache_key(
+    font_obj: pikepdf.Object,
+    font_name: str,
+) -> tuple[int, int, str]:
+    """Compute a width-cache key from an already-resolved font dict.
+
+    Mirrors :meth:`encoding.FontResolverCache._make_key` but takes the
+    *already-resolved* font object directly — it does NOT perform the
+    ``page['/Resources']['/Font']`` lookup itself. This keeps the helper
+    resource-scope agnostic so future per-element resource-scope work
+    (B.2) can reuse it without a second refactor.
+
+    Two distinct font dictionaries that happen to share a resource name
+    (e.g. ``/F1`` on different pages) get distinct objgen pairs and so do
+    NOT alias in the width cache. Inline/direct font dicts have no
+    ``objgen`` and fall back to ``(0, 0)``; the trailing ``font_name``
+    disambiguates two distinct inline fonts that share that fallback.
+
+    Args:
+        font_obj: The resolved font dictionary object.
+        font_name: Font resource name (e.g., 'F1').
+
+    Returns:
+        A ``(objgen[0], objgen[1], font_name)`` cache key.
+    """
+    try:
+        objgen = font_obj.objgen
+    except AttributeError:
+        objgen = (0, 0)  # inline (direct) font dict — rare
+    return (objgen[0], objgen[1], font_name)
+
+
 class GlyphWidthCache:
-    """Caches parsed font width tables for efficient per-glyph lookups."""
+    """Caches parsed font width tables for efficient per-glyph lookups.
+
+    Keyed on the font dict's object generation pair (not the bare resource
+    name), so two distinct same-named fonts (e.g. ``/F1`` on different
+    pages) do not alias. See :func:`width_cache_key`.
+    """
 
     def __init__(self) -> None:
-        self._cache: dict[str, dict[int, float]] = {}
+        self._cache: dict[tuple[int, int, str], dict[int, float]] = {}
 
     def clear(self) -> None:
         """Discard all cached width tables."""
         self._cache.clear()
 
-    def evict(self, font_name: str) -> None:
+    def evict(self, page: pikepdf.Page, font_name: str) -> None:
         """Drop cached widths for a single font (e.g. after extend_subset).
 
-        Use this when a font's ``/W`` array was mutated (new glyphs added
-        via Tier 1 or Tier 1.5 extension) so that the next ``get_width``
-        call re-parses the fresh ``/W`` data instead of returning
-        ``DEFAULT_WIDTH`` for newly-added CIDs.
+        Use this when a font's ``/W`` (or ``/Widths``) array was mutated
+        (new glyphs added via Tier 1 or Tier 1.5 extension) so that the
+        next ``get_width`` call re-parses the fresh data instead of
+        returning ``DEFAULT_WIDTH`` for newly-added CIDs. An in-place
+        array mutation does NOT change the font dict's objgen, so the
+        objgen re-key fixes aliasing but not staleness — this manual
+        eviction remains required.
+
+        Args:
+            page: The page containing the font.
+            font_name: Font resource name (e.g., 'F1').
         """
-        self._cache.pop(font_name, None)
+        font_obj = self._resolve_font_obj(page, font_name)
+        if font_obj is None:
+            return
+        self._cache.pop(width_cache_key(font_obj, font_name), None)
 
     def get_width(
         self,
@@ -113,21 +160,32 @@ class GlyphWidthCache:
         Returns:
             Width in font units. Defaults to 600 if lookup fails.
         """
-        if font_name not in self._cache:
-            self._cache[font_name] = self._load_widths(page, font_name)
-        return self._cache[font_name].get(char_code, DEFAULT_WIDTH)
+        font_obj = self._resolve_font_obj(page, font_name)
+        if font_obj is None:
+            return DEFAULT_WIDTH
+        key = width_cache_key(font_obj, font_name)
+        if key not in self._cache:
+            self._cache[key] = self._parse_widths(font_obj, font_name)
+        return self._cache[key].get(char_code, DEFAULT_WIDTH)
 
-    def _load_widths(
+    def _resolve_font_obj(
         self,
         page: pikepdf.Page,
         font_name: str,
-    ) -> dict[int, float]:
+    ) -> pikepdf.Object | None:
+        """Resolve the font dict object from page resources, or ``None``."""
         font_key = font_name if font_name.startswith("/") else f"/{font_name}"
         try:
-            font_obj = page["/Resources"]["/Font"][font_key]
+            return page["/Resources"]["/Font"][font_key]
         except (KeyError, TypeError):
             logger.warning("Font %s not found in page resources", font_name)
-            return {}
+            return None
+
+    def _parse_widths(
+        self,
+        font_obj: pikepdf.Object,
+        font_name: str,
+    ) -> dict[int, float]:
         font_dict = pikepdf.Dictionary(font_obj)  # type: ignore[arg-type]
         subtype_obj = font_dict.get("/Subtype")
         subtype = str(subtype_obj) if subtype_obj is not None else ""

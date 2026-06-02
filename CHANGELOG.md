@@ -4,6 +4,121 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — 2026-06-02
+
+Editing-depth release. v0.2.0 widens the set of PDFs the engine can edit
+faithfully (encrypted documents, CID-keyed CFF fonts, CJK text), hardens
+the honesty contract so that anything the engine *cannot* do cleanly is
+surfaced as a typed `Degradation` instead of silently corrupting output,
+and adds a programmatic surface for inspecting that contract. The public
+API is backward-compatible: every existing call signature is unchanged;
+new behaviour is opt-in or additive.
+
+**DegradationKinds: 13 → 30.** Seventeen new kinds were added since v0.1.3.
+The full canonical set is enumerable at runtime via
+`pdf_edit_engine.DEGRADATION_KINDS`.
+
+### Added
+
+- **Edit encrypted PDFs end-to-end.** An encrypted input is now opened,
+  edited, and re-saved with its encryption preserved (A2.3). When pikepdf
+  cannot re-encrypt on save, the edit still succeeds and the loss is
+  surfaced via the new `encryption_dropped` Degradation (warning) rather
+  than silently writing an unencrypted file.
+- **CID-keyed CFF / Type1C in-place glyph injection (C.3).** Identity-H
+  CIDFonts whose outlines are CFF (`/FontFile3`, Type1C) — not just
+  TrueType `glyf` — can now be extended with new glyphs. The donor outline
+  is drawn into the embedded CFF context at a collision-free `CID == GID`
+  at the additive tail; pre-existing CIDs are never renumbered.
+- **CJK / UAX#14 line-break segmentation (E.7).** New stdlib-only
+  `linebreak.py` leaf gives reflow a reduced UAX#14 break-opportunity
+  classifier, so a spaceless CJK paragraph wider than its column now wraps
+  at ideograph boundaries instead of silently overflowing. The Latin path
+  is byte-identical. Dictionary-segmented scripts (Thai/Lao/Khmer/Myanmar)
+  are left honestly unwrapped and surfaced via `scriptless_reflow_unsupported`.
+- **ToUnicode recovery (B.3).** A Type0/Identity-H font with no `/ToUnicode`
+  CMap now has its CID→Unicode map recovered from the embedded cmap so the
+  text is locatable; the recovery is surfaced via `tounicode_recovered`,
+  and a genuinely unaddressable CIDFont via `untextable_cidfont`.
+- **Opt-in shrink-to-fit (E.8).** `replace_block` / `batch_replace_block`
+  gain a keyword-only `fit="shrink"` that binary-searches the body font
+  size down to fit a fixed-height region (floor `max(4.0, original * 0.5)`),
+  surfaced via `font_size_reduced`. The default `fit="none"` is byte-identical
+  to v0.1.3.
+- **Honesty-taxonomy DX surface.** Root-level exports `DEGRADATION_KINDS`,
+  `Degradation`, `DegradationKind`, and `FONT_AFFECTING_KINDS`;
+  `FidelityReport.summary()`, `.is_clean`, `.max_severity`, and `.warnings()`;
+  and `EditResult.to_dict()` / `FidelityReport.to_dict()` for serializing the
+  contract for agentic consumers.
+
+### Changed
+
+- **Color / indent / leading preservation through reflow.** Reflow now
+  replays the verbatim fill color-setting operator subsequence (Block F
+  CORE) so spot colors (Separation/DeviceN/ICCBased/Pattern) survive a
+  re-wrap instead of collapsing to device color; preserves first-line and
+  hanging indents (E.2); and re-emits the document's declared `TL`/`TD`
+  leading (E.3) instead of synthesizing line advance from a proxy. Each
+  has an honest fallback Degradation (`color_space_approximated`,
+  `indent_flattened`) when a value cannot be confidently preserved.
+- **Widow / line-break-quality and line-height surfacing.** Reflow now
+  surfaces `line_break_quality_degraded` (info) when a re-wrap leaves a
+  widow, and `line_height_compressed` (info) is now actually emitted when
+  line height is compressed below natural (E.4 / E.6). Output geometry is
+  unchanged; these are detect-and-surface signals.
+- **Truthful embedded font introspection (C.1 / C.2).** Font outline-table
+  classification now sniffs the table the binary *actually* carries
+  (`glyf` / `CFF ` / `CFF2`) rather than the `/FontFile2` vs `/FontFile3`
+  slot, and glyph counts are read per outline type (TrueType, CFF, Type1)
+  instead of fabricated from a sparse `/W` dict. Read-path introspection
+  failures surface `font_subset_introspection_failed`.
+
+### Fixed
+
+- **Multi-match honest refusal (INV-B-12).** When two or more matches splice
+  into the same show-text operator with a length-changing replacement, the
+  engine now detects the byte-position collision before any mutation and
+  refuses exactly the colliding matches (`success=False`,
+  `multi_match_same_operator_unsupported`) instead of reading stale byte
+  slices and silently corrupting output. Matches in different operators and
+  same-length splices still edit correctly (partial success preserved).
+- **Honest content deletion (B.11).** Deletion now empties the show-text
+  operand in place (keep-slot) instead of removing operator tuples, which
+  used to shift downstream operator indices and corrupt sibling matches in
+  a batch. Provable leftover text surfaces `deletion_residual_text`
+  (`success=False`); an inline image in the span surfaces the advisory
+  `inline_image_present`.
+- **Ligature integrity (B.9).** Typed-separate text (e.g. "office") no longer
+  silently collapses to a discretionary ligature glyph, which corrupted both
+  glyph identity and the width oracle. Ligature collapse is now opt-in for
+  discretionary ligatures and always-applied only for mandatory ones, with a
+  NFC/NFD round-trip self-check and a `ligature_substituted` (info) signal
+  when a ligature is actually chosen.
+- **Rotated-text refusal (B.12 / POS-GATE).** An edit on a rotated/sheared
+  run that would route through reflow (which re-emits a fresh identity text
+  matrix and would flatten the rotation) is now refused
+  (`rotated_text_unsupported`); horizontal width-delta compensation on a
+  rotated run is skipped honestly via `positioning_adjustment_skipped`.
+- **Reflow byte-stability guard (INV-G-11).** Same-length edits that
+  previously risked a discarded splice on a reflowed page are addressed,
+  removing the most common trigger of the mixed-page batch limitation.
+
+### Security
+
+- **Graphics-state stack depth cap (A1.2 / INV-W-2).** A malformed PDF with
+  deeply nested `q` operators no longer grows the graphics-state stack
+  unboundedly; the 129th push raises `OperatorError` (memory-exhaustion DoS
+  guard).
+- **Decompression-bomb guard on font / CMap streams (A1.3 / INV-W-4).** An
+  embedded font / CMap / ToUnicode stream whose decompressed size exceeds the
+  bound (32 MiB fonts, 8 MiB ToUnicode) is now refused before the full decode
+  materializes (chunked incremental Flate decode), via the new
+  `FontStreamTooLargeError`. Surfaced on edit paths via `font_stream_too_large`.
+- **Linearization preservation (A2.2 / INV-W-3).** A linearized ("Fast Web
+  View") input is now re-linearized on save so the property round-trips; when
+  pikepdf cannot re-linearize, the edit still succeeds and the loss is
+  surfaced via `linearization_dropped` rather than silently down-converting.
+
 ## [0.1.3] — 2026-05-05
 
 ### Added
@@ -17,7 +132,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   and font coverage extension via cmap-only or system-font substitution.
   Permissive enum policy: clients should treat unknown kinds as opaque.
 - **`docs/v0.1.3-release-notes.md`** — implementation post-mortem with
-  per-phase summaries, deviation log, and v0.1.4 follow-ups.
+  per-phase summaries, deviation log, and v0.2.0 follow-ups.
 
 ### Changed (algorithm fixes)
 
@@ -57,7 +172,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   (`paragraph_width / page_width >= 0.5` ∧ `avg_row_stub_coverage <
   0.55` ∧ `x_cluster_count >= 2`), a `paragraph_detection_low_confidence`
   Degradation (info) is added to the result. The detector grouping
-  itself is unchanged in v0.1.3 — algorithm replacement is v0.1.4.
+  itself is unchanged in v0.1.3 — algorithm replacement is v0.2.0.
 - **Non-CID Tier 1.5 extension (Phase 13).** Simple TrueType WinAnsi
   fonts can now extend their glyph coverage via system-font sourcing,
   not just Type0/Identity-H. Mirrors the existing CID Tier 1.5 path
@@ -244,8 +359,8 @@ surfaced; all 9 are root-fixed structurally — see
 
 ### Known scope limits
 
-- **ARY-279** (CFF / OpenType Tier 1.5) deferred to v0.1.4. `_inject_glyph_in_place` still raises `FontNotFoundError` when the embedded font has no `glyf` table.
-- **ARY-280** (reproducible real-Chrome fixture generator) deferred to v0.1.4 alongside ARY-279. The existing `.claude/Acme Corporation —Chrome.pdf` fixture is gated behind `skipif(not present)`.
+- **ARY-279** (CFF / OpenType Tier 1.5) deferred to v0.2.0. `_inject_glyph_in_place` still raises `FontNotFoundError` when the embedded font has no `glyf` table.
+- **ARY-280** (reproducible real-Chrome fixture generator) deferred to v0.2.0 alongside ARY-279. The existing `.claude/Acme Corporation —Chrome.pdf` fixture is gated behind `skipif(not present)`.
 - **Narrow single-line paragraph with inline continuation**: when `paragraph.paragraph_width` is narrower than the replacement because the paragraph was detected from a visual span (e.g. "Sarah Johnson" in a font-change) that shares the visual line with continuing text in a different font, reflow shifts content below the paragraph but cannot move the inline continuation on the same line. The replacement widens horizontally and overlaps the continuation. The audit's INV-J-3 contract guard ensures callers see an "overflow" warning when this happens; full geometric fix tracked for v0.1.3.
 
 ### Verified

@@ -695,15 +695,43 @@ class TestTier1_5GlyphInjection:
         assert "Acme Corporation at top" in text, f"body text corrupted after injection: {text!r}"
 
     def test_glyph_width_cache_evict_public(self) -> None:
-        """GlyphWidthCache.evict drops cached widths for a single font."""
-        from pdf_edit_engine.widths import GlyphWidthCache
+        """GlyphWidthCache.evict drops cached widths for a single font.
 
-        cache = GlyphWidthCache()
-        cache._cache["F1"] = {5: 500.0}  # noqa: SLF001
-        assert "F1" in cache._cache  # noqa: SLF001
-        cache.evict("F1")
-        assert "F1" not in cache._cache  # noqa: SLF001
-        cache.evict("F99")  # no-op for missing key — must not raise
+        Post-INV-W-1 the cache keys on the font dict's objgen, so ``evict``
+        takes ``(page, font_name)`` and resolves the dict to compute the key.
+        """
+        from pdf_edit_engine.widths import GlyphWidthCache, width_cache_key
+
+        pdf = pikepdf.Pdf.new()
+        try:
+            font_dict = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    {
+                        "/Type": pikepdf.Name("/Font"),
+                        "/Subtype": pikepdf.Name("/Type1"),
+                        "/BaseFont": pikepdf.Name("/Helvetica"),
+                        "/Encoding": pikepdf.Name("/WinAnsiEncoding"),
+                        "/FirstChar": 65,
+                        "/LastChar": 65,
+                        "/Widths": pikepdf.Array([500.0]),
+                    }
+                )
+            )
+            page = pdf.add_blank_page(page_size=(200, 200))
+            page["/Resources"] = pikepdf.Dictionary(
+                {"/Font": pikepdf.Dictionary({"/F1": font_dict})}
+            )
+
+            cache = GlyphWidthCache()
+            key = width_cache_key(font_dict, "F1")
+            cache._cache[key] = {65: 500.0}  # noqa: SLF001
+            assert key in cache._cache  # noqa: SLF001
+            cache.evict(page, "F1")
+            assert key not in cache._cache  # noqa: SLF001
+            # No-op for a name not in page resources — must not raise.
+            cache.evict(page, "F99")
+        finally:
+            pdf.close()
 
     def test_tier1_extension_dedup_cmap_entries(self, tmp_path: Path) -> None:
         """Repeat extend_subset must not duplicate CMap bfchar lines on disk.

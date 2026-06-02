@@ -1,7 +1,7 @@
 # Threat Model
 
-**Status: stub for v0.1.4.** This document captures the threat model
-once formal STRIDE analysis is performed against the v0.1.4 hardened
+**Status: stub for v0.2.0.** This document captures the threat model
+once formal STRIDE analysis is performed against the v0.2.0 hardened
 API surface. v0.1.3 ships with the mitigations enumerated below and
 the open items in `LIMITATIONS.md`. The audit evidence backing each
 mitigation lives under `experiments/v013_block_3_review/` (gitignored
@@ -32,13 +32,13 @@ local artefacts) and the v0.1.3 release notes in `docs/`.
 
 - Formal denial-of-service profiling (timeouts, fuel limits).
 - Multi-process concurrency hardening (file-locking, queue).
-- Adversarial PDF fuzzing campaign — planned for v0.1.4.
+- Adversarial PDF fuzzing campaign — planned for v0.2.0.
 - Sandboxing / SECCOMP for the font-extraction subprocess.
 - A signed-release / supply-chain attestation pipeline (Sigstore /
   PEP 740 attestations).
 
-## Planned for v0.1.4
+## Planned for v0.2.0
 
-The full STRIDE table will be expanded here once the v0.1.4 hardening
+The full STRIDE table will be expanded here once the v0.2.0 hardening
 work lands. This stub exists so downstream contributors have a known
 anchor for the document.

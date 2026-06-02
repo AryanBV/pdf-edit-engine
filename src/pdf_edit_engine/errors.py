@@ -11,6 +11,10 @@ class FontNotFoundError(PDFEditError):
     """Font not found in PDF or on system."""
 
 
+class FontStreamTooLargeError(FontNotFoundError):
+    """Embedded font / CMap stream exceeds the decoded-size bound (decompression-bomb guard)."""
+
+
 class EncodingError(PDFEditError):
     """CMap parse failure or unmappable characters."""
 

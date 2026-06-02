@@ -9,13 +9,19 @@ from typing import Any, Literal
 
 import pikepdf
 
-from pdf_edit_engine._pathutil import _save_pdf, open_pdf, validate_output_path
+from pdf_edit_engine._pathutil import (
+    _parse_content_stream,
+    _save_pdf,
+    _unparse_content_stream,
+    open_pdf,
+    validate_output_path,
+)
 from pdf_edit_engine.encoding import FontResolver, FontResolverCache
 from pdf_edit_engine.errors import (
     EncodingError,
     FontNotFoundError,
+    FontStreamTooLargeError,
     OperatorError,
-    PDFEditError,
     ReflowError,
 )
 from pdf_edit_engine.fonts import _FONT_EXTEND_FAIL_EXCS
@@ -35,6 +41,293 @@ logger = logging.getLogger(__name__)
 # replace entries with (operands, operator) tuples during surgery.
 # Using Any avoids fighting pikepdf's pybind11 typing.
 _Ops = list[Any]
+
+# INV-B-12: the typed DegradationKind surfaced when colliding same-operator
+# matches are refused. Defined once so replace_all and batch_replace agree.
+_MULTI_MATCH_KIND = "multi_match_same_operator_unsupported"
+
+
+def _splice_ops(match: TextMatch) -> frozenset[int]:
+    """Operator indices the match's CHARACTERS actually splice bytes into.
+
+    INV-B-12 detection key. NOT ``operator_refs`` (which can include
+    positioning/Tf operators in the span that never receive show-text bytes);
+    only the show-text operators whose operand is mutated. Mirrors
+    ``_apply_single_replacement``'s ``chars_by_op`` grouping
+    (``ch.operator_index for ch in match.characters``), so the collision set
+    matches the actual splice surface exactly.
+
+    Args:
+        match: The text match to inspect.
+
+    Returns:
+        The frozen set of operator indices the match writes into.
+    """
+    return frozenset(ch.operator_index for ch in match.characters)
+
+
+def _is_shifting(match: TextMatch, replacement: str) -> bool:
+    """True iff this edit routes through the byte-SHIFTING rebuild path.
+
+    INV-B-12: a same-length, non-ligature replacement splices fixed-width
+    bytes at each ``byte_position`` with ZERO byte shift (``_modify_tj_*``
+    same-length path), so sibling same-operator matches stay byte-stable and
+    MUST NOT be refused. Only the rebuild path (length change OR ligature) is
+    byte-shifting and therefore corrupts later same-operand matches. This
+    mirrors ``_apply_single_replacement``'s top-level determinant
+    (``same_length = (not has_ligatures) and len(new_text) == len(matched)``).
+
+    The length test keys on the match's OWN ``matched_text`` — the exact
+    determinant ``_apply_single_replacement`` uses — NOT the call's global
+    search term, which can DIVERGE from ``matched_text`` when ``find`` returns a
+    cluster whose length differs from the NFC needle (combining marks). Keying
+    on ``matched_text`` keeps the refusal decision and the real splice path in
+    lockstep.
+
+    Args:
+        match: The match whose characters + matched_text determine the path.
+        replacement: The replacement text for this call/pair.
+
+    Returns:
+        True when the edit is length-changing or ligature-forcing.
+    """
+    cid_slots = len(
+        {(ch.operator_index, ch.tj_fragment_index, ch.byte_position) for ch in match.characters}
+    )
+    has_ligatures = cid_slots != len(match.matched_text)
+    return has_ligatures or (len(replacement) != len(match.matched_text))
+
+
+def _colliding_shifting_matches(
+    page_matches: list[TextMatch], replacement: str, *, require_shift: bool = True
+) -> tuple[set[int], dict[int, int]]:
+    """Identify matches that must be refused under INV-B-12.
+
+    A match is refused iff it is in a COLLIDING group (>=2 matches on the page
+    whose splice-op sets intersect, transitively unioned) AND, when
+    ``require_shift`` is True, the edit is byte-SHIFTING for that match
+    (``_is_shifting``). With ``require_shift=True`` (``replace_all``) a colliding
+    group under a same-length non-ligature edit is NOT refused — replace_all
+    splices all of them byte-stably in one pass. With ``require_shift=False``
+    (``batch_replace`` same-edit groups, which its one-result-per-edit /
+    used_ops architecture cannot apply byte-stably like replace_all) EVERY member
+    of a colliding group is refused regardless of length.
+
+    The decision is a pure function of the matches + the per-call replacement
+    length, computed BEFORE any mutation, so dry_run and live take the identical
+    refusal path (dry_run parity).
+
+    Args:
+        page_matches: The matches on a single page (any order).
+        replacement: The replacement text for this call/pair.
+        require_shift: When True (default), refuse only byte-shifting collisions;
+            when False, refuse every colliding-group member regardless of length.
+
+    Returns:
+        A pair ``(refused, group_size)`` where ``refused`` is the set of
+        ``id(match)`` values to refuse and ``group_size`` maps ``id(match)`` to
+        the size of its colliding group (for the detail string).
+    """
+    n = len(page_matches)
+    splice_sets = [_splice_ops(m) for m in page_matches]
+
+    # Union-find over splice-op-set intersection to build collision groups.
+    parent = list(range(n))
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a: int, b: int) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        if not splice_sets[i]:
+            continue
+        for j in range(i + 1, n):
+            if splice_sets[i] & splice_sets[j]:
+                _union(i, j)
+
+    group_members: dict[int, list[int]] = defaultdict(list)
+    for i in range(n):
+        group_members[_find(i)].append(i)
+
+    refused: set[int] = set()
+    group_size: dict[int, int] = {}
+    for members in group_members.values():
+        if len(members) < 2:
+            continue
+        for i in members:
+            m = page_matches[i]
+            if (not require_shift) or _is_shifting(m, replacement):
+                refused.add(id(m))
+                group_size[id(m)] = len(members)
+    return refused, group_size
+
+
+def _multi_match_refusal_result(match: TextMatch, replacement: str, group_size: int) -> EditResult:
+    """Build the honest INV-B-12 refusal ``EditResult`` for a colliding match.
+
+    ``font_action="kept"`` (NOT ``"failed"``): no edit was applied, so the
+    INV-J-9 construction guard does not require a font-affecting kind, and
+    ``font_preserved`` computes True (the kind is NOT in FONT_AFFECTING_KINDS).
+
+    Args:
+        match: The refused match.
+        replacement: The replacement text (recorded on the result).
+        group_size: Number of matches in the colliding group.
+
+    Returns:
+        An ``EditResult`` with ``success=False`` and the typed Degradation.
+    """
+    ops_list = sorted(_splice_ops(match))
+    return EditResult(
+        success=False,
+        original_text=match.matched_text,
+        new_text=replacement,
+        font_action="kept",
+        warnings=["Skipped: multiple matches share one content-stream operator"],
+        fidelity_report=FidelityReport(
+            font_substituted=None,
+            overflow_detected=False,
+            reflow_applied=False,
+            glyphs_missing=[],
+            degradations=[
+                Degradation(
+                    kind=_MULTI_MATCH_KIND,  # type: ignore[arg-type]
+                    detail=(
+                        f"{group_size} matches splice into shared operator(s) "
+                        f"{ops_list}; refused to avoid stale-offset corruption "
+                        "(per-match offset rewrite deferred to 0.3.0; use "
+                        "replace_all for same-length edits)"
+                    ),
+                    severity="warning",
+                )
+            ],
+        ),
+    )
+
+
+def _same_edit_colliding(
+    page_pairs: list[tuple[TextMatch, str, int]],
+) -> tuple[set[int], dict[int, int]]:
+    """INV-B-12 group refusal for batch_replace: SAME-edit operator collisions.
+
+    A single ``Edit`` whose search term matches N>1 times into ONE show-text
+    operator is the ``replace_all`` corruption surface reached via batch.
+    Unlike ``replace_all`` — which splices every same-operator match in one
+    byte-stable pass for a same-length edit — ``batch_replace``'s
+    one-result-per-edit aggregation + ``used_ops`` backstop can only apply the
+    FIRST such match and silently skips the rest. So batch refuses the WHOLE
+    same-edit same-operator group REGARDLESS of length (``require_shift=False``):
+    an honest ``success=False`` + typed kind beats a silent partial edit. A
+    CROSS-edit overlap (two DIFFERENT edits touching one operator) is NOT refused
+    here — it keeps the reactive used_ops "first edit wins" backstop.
+
+    For each ``edit_idx`` independently, the matches of that edit on the page are
+    grouped by splice-op intersection via ``_colliding_shifting_matches`` with
+    ``require_shift=False``. A match is refused iff its own edit produced a
+    colliding group of size >=2.
+
+    The decision is a pure function of the matches + per-edit lengths computed
+    pre-mutation, so dry_run parity holds.
+
+    Args:
+        page_pairs: The ``(match, replacement, edit_idx)`` tuples on one page.
+
+    Returns:
+        ``(refused_ids, group_size)`` keyed by ``id(match)``.
+    """
+    by_edit: dict[int, list[tuple[TextMatch, str]]] = defaultdict(list)
+    for m, repl, edit_idx in page_pairs:
+        by_edit[edit_idx].append((m, repl))
+
+    refused: set[int] = set()
+    group_size: dict[int, int] = {}
+    for items in by_edit.values():
+        edit_matches = [m for m, _ in items]
+        if len(edit_matches) < 2:
+            continue
+        for m, repl in items:
+            r, sizes = _colliding_shifting_matches(edit_matches, repl, require_shift=False)
+            if id(m) in r:
+                refused.add(id(m))
+                group_size[id(m)] = sizes[id(m)]
+    return refused, group_size
+
+
+def _surface_linearization_dropped(
+    results: list[EditResult] | EditResult, linearization_log: list[str]
+) -> None:
+    """Append a ``linearization_dropped`` Degradation when re-linearization failed.
+
+    A2.2 / INV-W-3: ``_pathutil._save_pdf`` appends a marker to
+    ``linearization_log`` only on the fallback path (a linearized input could
+    not be re-linearized and was saved non-linearized). When that happened,
+    surface the loss as a typed, info-severity, non-font-affecting
+    ``Degradation`` on the edit result(s) so the caller sees the dropped Fast
+    Web View layout instead of a silent down-conversion. A no-op when the log
+    is empty (preservation succeeded, or the input was not linearized).
+
+    Args:
+        results: A single ``EditResult`` or a list of them. For multi-result
+            verbs the file-level drop is surfaced on every successful result.
+        linearization_log: The list threaded into ``_save_pdf``; non-empty iff
+            the fallback fired.
+    """
+    if not linearization_log:
+        return
+    detail = linearization_log[0]
+    targets = results if isinstance(results, list) else [results]
+    for res in targets:
+        if res.success:
+            res.fidelity_report.degradations.append(
+                Degradation(
+                    kind="linearization_dropped",
+                    detail=detail,
+                    severity="info",
+                )
+            )
+
+
+def _surface_encryption_dropped(
+    results: list[EditResult] | EditResult, encryption_log: list[str]
+) -> None:
+    """Append an ``encryption_dropped`` Degradation when re-encryption failed.
+
+    A2.3 / INV-W-5: ``_pathutil._save_pdf`` appends a marker to
+    ``encryption_log`` only on the fallback path (an encrypted input could not
+    be re-encrypted and was saved unencrypted). When that happened, surface the
+    loss as a typed, warning-severity, non-font-affecting ``Degradation`` on
+    the edit result(s) so the caller sees the dropped encryption instead of a
+    silent down-conversion to plaintext. A no-op when the log is empty
+    (preservation succeeded, or the input was not encrypted). Severity
+    ``"warning"`` (a dropped encryption is a more serious fidelity/security
+    loss than a dropped Fast-Web-View layout).
+
+    Args:
+        results: A single ``EditResult`` or a list of them. For multi-result
+            verbs the file-level drop is surfaced on every successful result.
+        encryption_log: The list threaded into ``_save_pdf``; non-empty iff
+            the fallback fired.
+    """
+    if not encryption_log:
+        return
+    detail = encryption_log[0]
+    targets = results if isinstance(results, list) else [results]
+    for res in targets:
+        if res.success:
+            res.fidelity_report.degradations.append(
+                Degradation(
+                    kind="encryption_dropped",
+                    detail=detail,
+                    severity="warning",
+                )
+            )
 
 
 # ── Cache ownership policy (ARY-283) ─────────────────────────────────────
@@ -258,6 +551,325 @@ def _kerning_decision(factor: float) -> tuple[float | None, Degradation | None]:
     return (factor if needs_scaling else None, deg)
 
 
+def _matrix_is_axis_aligned(a: float, b: float, c: float, d: float, eps: float = 1e-3) -> bool:
+    """Return True iff the text-matrix linear part is the identity within ``eps``.
+
+    Pure function (no PDF state). The governing text matrix's linear part
+    ``(a, b, c, d)`` is "axis-aligned" when it is the identity
+    (``a~1, b~0, c~0, d~1``). Any rotation, shear, or non-unit scale bakes
+    a non-identity linear part, which means a horizontal width-delta in
+    text space no longer maps 1:1 to a horizontal page-space shift — the
+    trailing-text compensation would be on the wrong axis.
+
+    Args:
+        a: Text-matrix entry [0] (x-scale / cos for rotation).
+        b: Text-matrix entry [1] (shear / sin for rotation).
+        c: Text-matrix entry [2] (shear / -sin for rotation).
+        d: Text-matrix entry [3] (y-scale / cos for rotation).
+        eps: Epsilon for the identity comparison.
+
+    Returns:
+        True when the linear part is the identity within ``eps``.
+    """
+    return abs(a - 1.0) < eps and abs(b) < eps and abs(c) < eps and abs(d - 1.0) < eps
+
+
+def _positioning_decision(
+    is_axis_aligned: bool,
+    a: float,
+    b: float,
+    c: float,
+    d: float,
+    width_delta: float,
+) -> Degradation | None:
+    """Map an axis-aligned verdict to an optional ``positioning_adjustment_skipped``.
+
+    Pure function (no PDF state), mirroring ``_kerning_decision`` so the
+    decision is unit-testable and dry_run-parity-safe: it is computed
+    identically in both the dry_run and non-dry-run paths, while only the
+    ops mutation in ``_adjust_subsequent_positioning`` stays gated on
+    ``not dry_run``.
+
+    Returns a typed ``Degradation(kind="positioning_adjustment_skipped",
+    severity="warning")`` when the governing text matrix is non-axis-aligned
+    (the horizontal trailing-text compensation will be declined), else
+    ``None``.
+    """
+    if is_axis_aligned:
+        return None
+    return Degradation(
+        kind="positioning_adjustment_skipped",
+        detail=f"tm=[{a:.3f} {b:.3f} {c:.3f} {d:.3f}],width_delta={width_delta:.2f}pt",
+        severity="warning",
+    )
+
+
+_INLINE_IMAGE_OPS: frozenset[str] = frozenset({"INLINE IMAGE", "BI", "ID", "EI"})
+_SHOW_TEXT_OPS: frozenset[str] = frozenset({"Tj", "TJ", "'", '"'})
+
+
+def _op_str(inst: Any) -> str:
+    """Return the operator string for a parsed instruction or (operands, op) tuple."""
+    if hasattr(inst, "operator"):
+        return str(inst.operator)
+    return str(inst[1])
+
+
+def _inline_image_in_span(ops: _Ops, operator_refs: list[int]) -> bool:
+    """Detect a ``BI``/``ID``/``EI`` inline image in or adjacent to a deletion span.
+
+    B.11 / INV-B-10. The span runs from the enclosing ``BT`` preceding the
+    first matched operator to the next ``BT`` after the matched block's
+    ``ET`` (exclusive) — so an inline image that immediately follows the
+    deleted run's ``ET`` (between two text blocks) is treated as adjacent.
+    pikepdf collapses ``BI``/``ID``/``EI`` to ONE stable ``INLINE IMAGE``
+    operator slot (A1.4), so this is a pure scan over the parsed ops; the
+    deletion still proceeds and the caller surfaces an advisory
+    ``inline_image_present`` info Degradation.
+
+    Args:
+        ops: Parsed content-stream instruction list (read-only here).
+        operator_refs: The match's operator indices.
+
+    Returns:
+        True iff an inline-image operator lies in/adjacent to the span.
+    """
+    if not operator_refs:
+        return False
+    lo = min(operator_refs)
+    hi = max(operator_refs)
+    # Walk back to the enclosing BT (or stream start).
+    start = lo
+    for i in range(lo, -1, -1):
+        if _op_str(ops[i]) == "BT":
+            start = i
+            break
+        start = i
+    # Walk forward to the next BT after hi (exclusive), capturing the
+    # inter-block region where an adjacent inline image lives.
+    end = hi
+    seen_et = False
+    for i in range(hi, len(ops)):
+        op = _op_str(ops[i])
+        if op == "ET":
+            seen_et = True
+        elif op == "BT" and seen_et:
+            break
+        end = i
+    for i in range(start, min(end, len(ops) - 1) + 1):
+        if _op_str(ops[i]) in _INLINE_IMAGE_OPS:
+            return True
+    return False
+
+
+def _operand_bytes_after_deletion(
+    ops: _Ops, op_idx: int, op_chars: list[TextCharacter], byte_width: int
+) -> bytes:
+    """Return the concatenated string bytes the op's operand would carry post-delete.
+
+    B.11 / INV-B-10 helper for the residue predicate. Reads the CURRENT
+    operand of ``ops[op_idx]`` (already emptied when the caller mutated it,
+    or the original in a dry_run) and returns the concatenation of all its
+    string fragments. Used only to compare against the matched CID byte run.
+
+    Args:
+        ops: Parsed content-stream instruction list.
+        op_idx: Operator index to read.
+        op_chars: Match characters in this operator (unused for the read but
+            kept for signature symmetry with the residue scan).
+        byte_width: Resolver byte width (unused here; kept for symmetry).
+
+    Returns:
+        The concatenated string-operand bytes currently held by the op.
+    """
+    inst = ops[op_idx]
+    operands = inst.operands if hasattr(inst, "operands") else inst[0]
+    if not operands:
+        return b""
+    first: Any = operands[0]
+    out = bytearray()
+    if _op_str(inst) == "TJ":
+        for item in list(first):
+            if isinstance(item, pikepdf.String):
+                out += bytes(item)
+    elif isinstance(first, pikepdf.String):
+        out += bytes(first)
+    return bytes(out)
+
+
+def _matched_cid_run(
+    ops: _Ops, op_idx: int, op_chars: list[TextCharacter], byte_width: int
+) -> bytes:
+    """Extract the contiguous matched CID byte run from an operator's ORIGINAL operand.
+
+    B.11 / INV-B-10. Captured before the deletion empties the operand so the
+    residue predicate has the exact byte sub-sequence that must disappear.
+    For a ``Tj``/``'`` the operand is one string; for a ``TJ`` the matched
+    chars span string fragments — the run is the concatenation of the matched
+    bytes within each touched fragment. The width per glyph is the resolver's
+    ``byte_width`` (2 for Identity-H, 1 for simple fonts).
+
+    Args:
+        ops: Parsed content-stream instruction list (pre-emptying).
+        op_idx: Operator index of the show-text op.
+        op_chars: Match characters in this operator.
+        byte_width: Resolver byte width.
+
+    Returns:
+        The contiguous matched CID byte run, or ``b""`` when not extractable.
+    """
+    inst = ops[op_idx]
+    operands = inst.operands if hasattr(inst, "operands") else inst[0]
+    if not operands:
+        return b""
+    first: Any = operands[0]
+    bw = byte_width if byte_width > 0 else 1
+    run = bytearray()
+    if _op_str(inst) == "TJ":
+        tj_items: list[Any] = list(first)
+        chars_by_frag: dict[int, list[TextCharacter]] = defaultdict(list)
+        for ch in op_chars:
+            if ch.tj_fragment_index is not None:
+                chars_by_frag[ch.tj_fragment_index].append(ch)
+        for frag_idx in sorted(chars_by_frag):
+            try:
+                arr_idx = _nth_string_index(tj_items, frag_idx)
+            except OperatorError:
+                continue
+            raw = bytes(tj_items[arr_idx])
+            frag_chars = chars_by_frag[frag_idx]
+            lo = min(ch.byte_position for ch in frag_chars)
+            hi = max(ch.byte_position for ch in frag_chars) + bw
+            run += raw[lo : min(hi, len(raw))]
+    elif isinstance(first, pikepdf.String):
+        raw = bytes(first)
+        lo = min(ch.byte_position for ch in op_chars)
+        hi = max(ch.byte_position for ch in op_chars) + bw
+        run += raw[lo : min(hi, len(raw))]
+    return bytes(run)
+
+
+def _deletion_residue_proven(
+    ops: _Ops,
+    chars_by_op: dict[int, list[TextCharacter]],
+    op_replacement_map: dict[int, str],
+    matched_cid_bytes: dict[int, bytes],
+    original_operand_bytes: dict[int, bytes],
+) -> bool:
+    """Prove whether a keep-slot deletion left the deleted occurrence behind.
+
+    B.11 / INV-B-10, over-fire root-fix. Position/count-accurate predicate:
+    for every operator whose matched chars were fully deleted
+    (``op_replacement_map`` empty for that op), count how many times the exact
+    contiguous matched CID byte run occurs in the operand BEFORE emptying vs
+    AFTER. A correct deletion of THIS occurrence must drop that count by at
+    least one (the byte slot the deletion emptied no longer carries the run).
+    Residue is proven only when the count did NOT decrease — i.e. the matched
+    run is still present at the SAME multiplicity, so the specific deleted
+    occurrence was not actually cleared.
+
+    This replaces the prior GLOBAL ``run in current`` substring search, which
+    mis-fired when a byte-IDENTICAL run sat at an UNRELATED, untouched position
+    in the same operand: the deletion correctly emptied its own slot, but the
+    surviving identical repeat made ``run in current`` True, falsely flipping
+    ``success=False`` and (because the surgeon gates the save on success)
+    writing NO output for a CORRECT delete — silent data loss. Counting
+    occurrences before/after makes a correct single-occurrence delete among
+    identical repeats report no residue (count drops by exactly one → output
+    written), while a genuinely un-cleared run (count unchanged) is still
+    caught. As a bonus this surfaces an honest ``success=False`` for a
+    multi-match-same-operator deletion that left survivors instead of
+    silently corrupting (see the deferred follow-up note below).
+
+    The check is a pure function of the captured-before and current operand
+    bytes, so it yields the same verdict in dry_run (where the modify loop
+    mutated the in-memory ops identically and only the save is gated) and in
+    the live path → dry_run parity.
+
+    NOTE (the multi-match-SAME-operator REPLACE corruption, NOT a deletion bug):
+    this predicate does not repair the pre-existing stale-byte-position
+    corruption on the reverse-order multi-match REPLACE path (it predates B.11
+    and reproduces identically for a non-empty replacement, so it is general,
+    not deletion-specific). The count-delta here surfaces the DELETION variant
+    honestly (success=False). As of INV-B-12 (v0.2.0) the engine now REFUSES the
+    colliding same-operator + byte-shifting matches up front in ``replace_all`` /
+    ``batch_replace`` (typed ``multi_match_same_operator_unsupported``
+    Degradation, ``success=False``) rather than silently corrupting — see
+    ``_colliding_shifting_matches``. The full reverse-order
+    offset-rederivation rewrite (re-deriving each match's offsets against the
+    mutated operand) remains the 0.3.0 stretch.
+
+    Args:
+        ops: Parsed content-stream instruction list (post-emptying state).
+        chars_by_op: Match characters grouped by operator index.
+        op_replacement_map: Per-operator replacement text (empty => deleted).
+        matched_cid_bytes: Per-operator contiguous CID byte run that was
+            matched, captured from the ORIGINAL operand before emptying.
+        original_operand_bytes: Per-operator full concatenated operand bytes
+            captured from the ORIGINAL operand before emptying.
+
+    Returns:
+        True iff any deleted operator's matched-run occurrence count did not
+        decrease (the specific deleted occurrence still renders).
+    """
+    for op_idx, op_chars in chars_by_op.items():
+        if op_replacement_map.get(op_idx, ""):
+            continue  # not a full deletion of this op's span
+        run = matched_cid_bytes.get(op_idx, b"")
+        if not run:
+            continue
+        before = original_operand_bytes.get(op_idx, b"")
+        current = _operand_bytes_after_deletion(ops, op_idx, op_chars, len(run))
+        before_count = before.count(run)
+        after_count = current.count(run)
+        # A correct deletion of this occurrence drops the count by >= 1. Residue
+        # only when the count is unchanged (the deleted occurrence survived).
+        if after_count >= before_count:
+            return True
+    return False
+
+
+def _governing_tm_linear(
+    ops: _Ops, first_op_index: int
+) -> tuple[float, float, float, float] | None:
+    """Recover the governing text matrix's linear part for an edited run.
+
+    Scans BACKWARD from ``first_op_index`` to the nearest preceding ``Tm``
+    operator, stopping at the block-start ``BT`` operator. Returns the
+    ``Tm`` operands ``[0..3]`` as ``(a, b, c, d)``. When ``BT`` is reached
+    with no intervening ``Tm`` (the matrix is the BT-reset identity), or no
+    ``Tm`` is found before the start of the stream, returns ``None`` — the
+    caller treats ``None`` as axis-aligned (identity).
+
+    Args:
+        ops: Parsed content stream instruction list.
+        first_op_index: Index of the first operator in the match
+            (``min(match.operator_refs)``); the scan starts just before it.
+
+    Returns:
+        ``(a, b, c, d)`` linear part of the governing ``Tm``, or ``None``
+        when no governing ``Tm`` precedes the run within its text block.
+    """
+    for i in range(first_op_index, -1, -1):
+        inst = ops[i]
+        op_str = str(inst.operator) if hasattr(inst, "operator") else str(inst[1])
+        if op_str == "Tm":
+            operands = inst.operands if hasattr(inst, "operands") else inst[0]
+            if len(operands) >= 4:
+                return (
+                    float(operands[0]),
+                    float(operands[1]),
+                    float(operands[2]),
+                    float(operands[3]),
+                )
+            return None
+        if op_str == "BT":
+            # Block start with no preceding Tm — text matrix is the
+            # BT-reset identity (axis-aligned).
+            return None
+    return None
+
+
 @dataclass(frozen=True)
 class KerningEncoding:
     """Result of ``_encode_with_kerning``.
@@ -291,6 +903,7 @@ def _encode_with_kerning(
     width_cache: GlyphWidthCache,
     page: pikepdf.Page,
     font_name: str,
+    observed: list[str] | None = None,
 ) -> KerningEncoding:
     """Encode text into TJ items with horizontal Tz scaling (Algo A, v0.1.3).
 
@@ -309,6 +922,9 @@ def _encode_with_kerning(
         width_cache: Glyph width cache.
         page: PDF page for width lookup.
         font_name: Font resource name.
+        observed: B.9 out-param threaded to ``encode`` — collects any source
+            substring collapsed into a ligature CID so the caller can surface a
+            ``ligature_substituted`` Degradation. None on width-only probes.
 
     Returns:
         KerningEncoding with tj_items (flat single-string list when
@@ -320,7 +936,7 @@ def _encode_with_kerning(
 
     bw = resolver.byte_width
     glyph_widths_fu: list[float] = []
-    full_encoded = resolver.encode(text)
+    full_encoded = resolver.encode(text, _observed=observed)
     for i in range(0, len(full_encoded), bw):
         glyph_bytes = full_encoded[i : i + bw]
         char_code = (glyph_bytes[0] << 8) | glyph_bytes[1] if bw == 2 else glyph_bytes[0]
@@ -352,6 +968,7 @@ def _rebuild_tj_array(
     tj_items: list[object],
     match_chars: list[TextCharacter],
     replacement_items: list[object],
+    byte_width: int = 0,
 ) -> pikepdf.Array:
     """Rebuild a TJ array replacing the matched span with new items.
 
@@ -364,6 +981,19 @@ def _rebuild_tj_array(
         match_chars: Characters from the match that fall in this operator.
         replacement_items: Pre-built TJ items (pikepdf.String and/or numeric
             kerning values) to insert in place of the matched span.
+        byte_width: B.11 / INV-B-10 — the resolver's KNOWN per-glyph byte
+            width (2 for Identity-H, 1 for simple fonts). When > 0, the
+            last-fragment suffix boundary is computed as
+            ``max(byte_position) + byte_width`` so it lands EXACTLY on a CID
+            boundary. The pre-B.11 default (0) falls back to the per-fragment
+            ``_infer_byte_width`` heuristic, which mis-inferred the boundary
+            on a SHARED TJ fragment carrying a matched glyph + an unmatched
+            in-operator neighbour (the "Software" delete eating "Developer"'s
+            leading "D" — the fragment was ``<011e 0003 0018>`` and a
+            single matched char at byte 0 made ``_infer_byte_width`` return
+            ``len(raw)//1 == 6``, swallowing the trailing space + neighbour).
+            Threading the exact width is the root fix; the simple-font path
+            keeps the heuristic byte-for-byte by leaving ``byte_width`` 0.
 
     Returns:
         New pikepdf.Array for the TJ operand.
@@ -393,10 +1023,16 @@ def _rebuild_tj_array(
     # Suffix: bytes in the last fragment after the match
     last_frag_raw = bytes(tj_items[max_arr_idx])  # type: ignore[call-overload]
     last_chars = chars_by_frag[max_frag]
-    # Determine byte_width from character data
+    # Determine byte_width from character data. B.11 / INV-B-10: prefer the
+    # resolver's KNOWN byte_width (threaded by the caller) so the suffix
+    # boundary lands exactly on a CID boundary; only fall back to the
+    # per-fragment heuristic when the caller did not supply it (the
+    # simple-font path keeps its pre-B.11 behaviour byte-for-byte).
     if len(last_frag_raw) > 0 and last_chars:
-        inferred_bw = _infer_byte_width(last_frag_raw, last_chars)
-        max_byte_end = max(ch.byte_position for ch in last_chars) + inferred_bw
+        effective_bw = (
+            byte_width if byte_width > 0 else _infer_byte_width(last_frag_raw, last_chars)
+        )
+        max_byte_end = max(ch.byte_position for ch in last_chars) + effective_bw
     else:
         max_byte_end = len(last_frag_raw)
     suffix_bytes = last_frag_raw[max_byte_end:] if max_byte_end < len(last_frag_raw) else b""
@@ -490,6 +1126,7 @@ def _adjust_subsequent_positioning(
     match_y: float,
     font_size: float,
     y_tolerance: float = 2.0,
+    is_axis_aligned: bool = True,
 ) -> None:
     """Adjust positioning of subsequent text to compensate for width change.
 
@@ -503,7 +1140,18 @@ def _adjust_subsequent_positioning(
         match_y: Y-coordinate of the match for same-line detection.
         font_size: Current font size for TJ unit conversion.
         y_tolerance: Maximum y-difference for same-line detection.
+        is_axis_aligned: When False (the governing text matrix is rotated
+            or sheared), skip the horizontal compensation entirely — the
+            ``-width_delta`` shift is along the wrong axis and would
+            visibly mis-place the trailing text. Defaults to True so every
+            existing caller's axis-aligned behaviour stays byte-identical.
     """
+    # POS-GATE: a non-axis-aligned governing matrix means the horizontal
+    # width-delta no longer maps 1:1 to a horizontal page shift. Decline the
+    # compensation (the caller surfaces a positioning_adjustment_skipped
+    # Degradation) rather than mutate the trailing operand on the wrong axis.
+    if not is_axis_aligned:
+        return
     for i in range(last_op_index + 1, len(ops)):
         inst = ops[i]
         op_str = str(inst.operator) if hasattr(inst, "operator") else str(inst[1])
@@ -599,6 +1247,35 @@ def _apply_single_replacement(
     pre_extension_missing: list[str] = []
 
     if not can_enc:
+        # B.3 WRITE-path refusal (M0 Rank-2.5 verdict: WRITE = refuse-on-gap).
+        # When the match's font had its CID→Unicode map RECOVERED from the
+        # embedded cmap (no /ToUnicode), a new-glyph extension would have to
+        # write a /ToUnicode CMap — out of scope for B.3 (the fonts.py
+        # _append_to_unicode_cmap KeyError blocker). The same-subset case
+        # never reaches here (can_enc is True), so this branch is strictly
+        # the new-glyph path: refuse cleanly with a typed Degradation rather
+        # than crashing on the missing /ToUnicode.
+        if resolver.is_tounicode_recovered:
+            return EditResult(
+                success=False,
+                original_text=match.matched_text,
+                new_text=new_text,
+                font_action="failed",
+                fidelity_report=FidelityReport(
+                    font_substituted=None,
+                    overflow_detected=False,
+                    reflow_applied=False,
+                    glyphs_missing=missing,
+                    degradations=[
+                        Degradation(
+                            kind="tounicode_recovered",
+                            detail="new_glyph_extension_unsupported_on_recovered_font",
+                            severity="error",
+                        ),
+                    ],
+                ),
+            ), resolver
+
         # Attempt automatic font extension
         try:
             from pdf_edit_engine.fonts import extend_subset
@@ -615,8 +1292,10 @@ def _apply_single_replacement(
             resolver_cache.evict(page, font_name)
             # Evict stale width cache entry: extend_subset adds new CIDs
             # to /W, but width_cache holds the pre-extension dict and
-            # would return DEFAULT_WIDTH (600) for newly-added CIDs.
-            width_cache.evict(font_name)
+            # would return DEFAULT_WIDTH (600) for newly-added CIDs. The
+            # in-place /W mutation does not change objgen, so this manual
+            # eviction is still required after the objgen re-key (INV-W-1).
+            width_cache.evict(page, font_name)
             resolver = _get_font_resolver(page, font_name, resolver_cache)
             can_enc_after, still_missing = resolver.can_encode(new_text)
             if not can_enc_after:
@@ -675,6 +1354,26 @@ def _apply_single_replacement(
             # replace() unhandled. PLAN_AMENDMENTS M.6 test 12 documents
             # the contract that TTLibError surfaces as a Degradation, not
             # a raised exception.
+            # A1.3 / INV-W-4: a Flate decompression bomb in the embedded
+            # font / CMap surfaces a SECOND, specific-cause
+            # font_stream_too_large Degradation (warning) alongside the
+            # font_extension_failed (error) that already drives success=False
+            # and font_preserved=False.
+            degs = [
+                Degradation(
+                    kind="font_extension_failed",
+                    detail=type(exc).__name__,
+                    severity="error",
+                ),
+            ]
+            if isinstance(exc, FontStreamTooLargeError):
+                degs.append(
+                    Degradation(
+                        kind="font_stream_too_large",
+                        detail=type(exc).__name__,
+                        severity="warning",
+                    )
+                )
             return EditResult(
                 success=False,
                 original_text=match.matched_text,
@@ -685,13 +1384,7 @@ def _apply_single_replacement(
                     overflow_detected=False,
                     reflow_applied=False,
                     glyphs_missing=missing,
-                    degradations=[
-                        Degradation(
-                            kind="font_extension_failed",
-                            detail=type(exc).__name__,
-                            severity="error",
-                        ),
-                    ],
+                    degradations=degs,
                 ),
             ), resolver
 
@@ -718,6 +1411,34 @@ def _apply_single_replacement(
     chars_by_op: dict[int, list[TextCharacter]] = defaultdict(list)
     for ch in match.characters:
         chars_by_op[ch.operator_index].append(ch)
+
+    # B.11 / INV-B-10: a full deletion is new_text == "". Capture the exact
+    # contiguous matched CID byte run per operator FROM THE ORIGINAL operand
+    # (before the modify loop empties it) so the post-emptying residue
+    # predicate can prove whether the run survived. Pure read; runs in both
+    # dry_run and live paths (the modify loop mutates the in-memory ops
+    # identically in both — only the save is gated), so the residue verdict
+    # has dry_run parity. Also detect an inline image in/adjacent to the span
+    # (advisory; A1.4 stable slot).
+    is_deletion = new_text == ""
+    matched_cid_bytes: dict[int, bytes] = {}
+    # B.11 over-fire root-fix: capture the per-op ORIGINAL operand bytes (the
+    # full concatenated string content BEFORE emptying) alongside the matched
+    # run, so the residue predicate can compare the occurrence COUNT of the
+    # matched run before vs after emptying — a position/count-accurate check —
+    # instead of a GLOBAL substring search that mis-fires on an IDENTICAL but
+    # untouched repeat elsewhere in the same operand. Empty in the non-deletion
+    # path (no residue surfacing then).
+    original_operand_bytes: dict[int, bytes] = {}
+    if is_deletion:
+        for op_idx, op_chars in chars_by_op.items():
+            run = _matched_cid_run(ops, op_idx, op_chars, byte_width)
+            if run:
+                matched_cid_bytes[op_idx] = run
+                original_operand_bytes[op_idx] = _operand_bytes_after_deletion(
+                    ops, op_idx, op_chars, len(run)
+                )
+    inline_image_present = is_deletion and _inline_image_in_span(ops, match.operator_refs)
 
     # Build a map: for each operator, which replacement characters go there
     op_replacement_map: dict[int, str] = {}
@@ -818,6 +1539,13 @@ def _apply_single_replacement(
     # is skipped further up the call chain).
     op_tz_factors: dict[int, float] = {}
     kerning_degradations: list[Degradation] = []
+    # B.9 (INV-B-9): collect every source substring that encode() collapsed
+    # into a ligature CID (mandatory always, opted-in discretionary). The
+    # collapse decision is a pure function of the input text + font and is
+    # computed in BOTH the dry_run and non-dry-run passes (this loop runs in
+    # both), so the resulting ligature_substituted Degradation has dry_run
+    # parity. Empty on the default typed-separate path.
+    ligature_observed: list[str] = []
 
     for op_idx in sorted(chars_by_op.keys()):
         inst = ops[op_idx]
@@ -860,6 +1588,7 @@ def _apply_single_replacement(
                 font_name=match.characters[0].font_name,
                 font_size=match.characters[0].font_size,
                 width_bonus=wb,
+                observed=ligature_observed,
             )
         elif op_str in ("Tj", "'"):
             op_tz, op_deg = _modify_tj_single_operator(
@@ -875,6 +1604,7 @@ def _apply_single_replacement(
                 font_name=match.characters[0].font_name,
                 font_size=match.characters[0].font_size,
                 width_bonus=wb,
+                observed=ligature_observed,
             )
 
         if op_tz is not None:
@@ -905,17 +1635,54 @@ def _apply_single_replacement(
     )
     width_delta = new_width - old_width
 
-    # Adjust subsequent positioning if needed
-    if not dry_run and abs(width_delta) > 0.5:
-        last_op_idx = max(match.operator_refs)
-        match_y = match.characters[0].page_y
-        _adjust_subsequent_positioning(
-            ops,
-            last_op_idx,
-            width_delta,
-            match_y,
-            match.characters[0].font_size,
-        )
+    # Adjust subsequent positioning if needed.
+    #
+    # POS-GATE: the horizontal width-delta compensation only maps 1:1 to a
+    # page-space shift when the edited run's governing text matrix is
+    # axis-aligned (identity linear part). Under a rotated/sheared matrix the
+    # shift is on the wrong axis and silently mis-places the trailing text;
+    # we skip it and surface a typed positioning_adjustment_skipped
+    # Degradation instead. Design-doc §4c locks dry_run/non-dry-run
+    # degradation PARITY, so the gate DECISION + Degradation are computed in
+    # BOTH paths (mirroring the _kerning_decision pattern); only the ops
+    # mutation in _adjust_subsequent_positioning stays gated on `not dry_run`.
+    positioning_degradations: list[Degradation] = []
+    if abs(width_delta) > 0.5:
+        linear = _governing_tm_linear(ops, min(match.operator_refs))
+        if linear is None:
+            # No governing Tm before BT — text matrix is the BT-reset
+            # identity, i.e. axis-aligned.
+            is_axis_aligned = True
+            tm_a, tm_b, tm_c, tm_d = 1.0, 0.0, 0.0, 1.0
+        else:
+            tm_a, tm_b, tm_c, tm_d = linear
+            is_axis_aligned = _matrix_is_axis_aligned(tm_a, tm_b, tm_c, tm_d)
+
+        pos_deg = _positioning_decision(is_axis_aligned, tm_a, tm_b, tm_c, tm_d, width_delta)
+        if pos_deg is not None:
+            positioning_degradations.append(pos_deg)
+
+        # B.11 / INV-B-10: a FULL DELETION leaves the trailing text at its
+        # ABSOLUTE position (no gap-collapse / no reclaim). The empty show-text
+        # operand advances the text cursor by ZERO, and a following relative
+        # `Td` is line-matrix-relative (NOT cursor-relative), so trailing
+        # same-line text already lands at its original x WITHOUT compensation.
+        # Applying the replacement-era `-width_delta` here would shove it RIGHT
+        # by the deleted run's advance (the empirically-confirmed mis-shift).
+        # So decline the horizontal compensation for the deletion case on the
+        # axis-aligned path; the non-axis-aligned path keeps emitting
+        # positioning_adjustment_skipped via _positioning_decision above.
+        if not dry_run and not is_deletion:
+            last_op_idx = max(match.operator_refs)
+            match_y = match.characters[0].page_y
+            _adjust_subsequent_positioning(
+                ops,
+                last_op_idx,
+                width_delta,
+                match_y,
+                match.characters[0].font_size,
+                is_axis_aligned=is_axis_aligned,
+            )
 
     # Overflow detection
     page_width = float(page.MediaBox[2]) if page.MediaBox else 612.0
@@ -942,8 +1709,71 @@ def _apply_single_replacement(
             )
         )
 
+    # B.9 (INV-B-9): surface a ligature_substituted info Degradation when
+    # encode() actually chose a ligature CID (mandatory or opted-in
+    # discretionary). Empty on the default typed-separate path → no Degradation.
+    ligature_degradations: list[Degradation] = []
+    if ligature_observed:
+        ligature_degradations.append(
+            Degradation(
+                kind="ligature_substituted",
+                severity="info",
+                detail=f"applied ligature(s) {sorted(set(ligature_observed))} during re-encode",
+            )
+        )
+
+    # B.11 / INV-B-10: deletion-cleanup surfacing. The keep-slot emptying loop
+    # already mutated the in-memory ops in BOTH dry_run and live paths (only
+    # the save is gated), so the residue predicate reads the post-emptying
+    # operands identically in both → dry_run parity. Provable residue (the
+    # count-accurate predicate: the matched run's occurrence count did NOT
+    # decrease) flips success=False with a deletion_residual_text (warning); an
+    # inline image in/adjacent to the span is an advisory inline_image_present
+    # (info) that does NOT fail the edit (A1.4 stable slot). Both kinds are NOT
+    # in FONT_AFFECTING_KINDS, so font_preserved stays True.
+    #
+    # INV-B-12 (v0.2.0): the multi-match-SAME-operator path (e.g.
+    # replace_all("cat dog cat bird cat fish", "cat", "")) corrupts via STALE
+    # byte-positions — replace_all routes each match through an independent
+    # _apply_single_replacement on the SHARED, already-mutated operand; a match's
+    # byte_position was recorded against the ORIGINAL operand, so after the first
+    # byte-SHIFTING splice every later same-operator match reads the WRONG slice.
+    # The non-deletion replacement (.., "X") corrupts IDENTICALLY, confirming a
+    # general reverse-order multi-match REPLACE bug (NOT deletion-specific, NOT
+    # introduced by B.11). The count-delta below cannot surface it: the stale
+    # offset corrupts the matched-run CAPTURE itself, so each per-call check
+    # honestly sees its (wrong) run drop by one. As of INV-B-12 the engine
+    # REFUSES these colliding same-operator + byte-shifting matches up front in
+    # replace_all / batch_replace (see _colliding_shifting_matches; typed
+    # multi_match_same_operator_unsupported Degradation, success=False) so the
+    # corrupt path is never reached. The full reverse-order offset-rederivation
+    # rewrite (re-deriving each match's offsets against the mutated operand)
+    # remains the 0.3.0 stretch.
+    deletion_degradations: list[Degradation] = []
+    success = True
+    if is_deletion:
+        if _deletion_residue_proven(
+            ops, chars_by_op, op_replacement_map, matched_cid_bytes, original_operand_bytes
+        ):
+            success = False
+            deletion_degradations.append(
+                Degradation(
+                    kind="deletion_residual_text",
+                    detail=f"residual deleted text remains in op(s) {sorted(matched_cid_bytes)}",
+                    severity="warning",
+                )
+            )
+        if inline_image_present:
+            deletion_degradations.append(
+                Degradation(
+                    kind="inline_image_present",
+                    detail=f"inline image in/adjacent to deletion span {match.operator_refs}",
+                    severity="info",
+                )
+            )
+
     return EditResult(
-        success=True,
+        success=success,
         original_text=match.matched_text,
         new_text=new_text,
         font_action=font_action,
@@ -960,6 +1790,9 @@ def _apply_single_replacement(
                 *coverage_degradations,
                 *kerning_degradations,
                 *overflow_degradations,
+                *positioning_degradations,
+                *ligature_degradations,
+                *deletion_degradations,
             ],
         ),
     ), resolver
@@ -978,6 +1811,7 @@ def _modify_tj_operator(
     font_name: str | None = None,
     font_size: float | None = None,
     width_bonus: float = 0.0,
+    observed: list[str] | None = None,
 ) -> tuple[float | None, Degradation | None]:
     """Modify a TJ operator's array to apply replacement text.
 
@@ -1032,15 +1866,23 @@ def _modify_tj_operator(
                 width_cache,
                 page,
                 font_name,
+                observed=observed,
             )
             replacement_items = enc.tj_items
             tz_factor = enc.tz_factor
             degradation = enc.degradation
         elif replacement_text:
-            replacement_items = [pikepdf.String(resolver.encode(replacement_text))]
+            replacement_items = [
+                pikepdf.String(resolver.encode(replacement_text, _observed=observed))
+            ]
         else:
             replacement_items = []
-        new_array = _rebuild_tj_array(tj_items, op_chars, replacement_items)
+        # B.11 / INV-B-10: thread the EXACT Identity-H byte width (2) so the
+        # shared-fragment suffix boundary is CID-exact; the simple-font path
+        # (byte_width == 1) passes 0 to keep the pre-B.11 _infer_byte_width
+        # heuristic byte-for-byte.
+        rebuild_bw = byte_width if byte_width == 2 else 0
+        new_array = _rebuild_tj_array(tj_items, op_chars, replacement_items, rebuild_bw)
         ops[op_idx] = ([new_array], operator)
         return tz_factor, degradation
 
@@ -1058,6 +1900,7 @@ def _modify_tj_single_operator(
     font_name: str | None = None,
     font_size: float | None = None,
     width_bonus: float = 0.0,
+    observed: list[str] | None = None,
 ) -> tuple[float | None, Degradation | None]:
     """Modify a Tj (or ') operator's string to apply replacement text.
 
@@ -1093,6 +1936,7 @@ def _modify_tj_single_operator(
                 width_cache,
                 page,
                 font_name,
+                observed=observed,
             )
             tj_items: list[object] = []
             if prefix_bytes:
@@ -1105,7 +1949,7 @@ def _modify_tj_single_operator(
         else:
             min_pos = min(ch.byte_position for ch in op_chars)
             max_pos = max(ch.byte_position for ch in op_chars) + byte_width
-            encoded = resolver.encode(replacement_text)
+            encoded = resolver.encode(replacement_text, _observed=observed)
             new_raw = raw[:min_pos] + encoded + raw[max_pos:]
             ops[op_idx] = ([pikepdf.String(new_raw)], operator)
             return None, None
@@ -1129,6 +1973,7 @@ def replace(
     *,
     dry_run: bool = False,
     reflow: bool = True,
+    password: str | bytes | None = None,
 ) -> EditResult:
     """Replace a single text match in a PDF.
 
@@ -1139,18 +1984,23 @@ def replace(
         output_path: Path for the output PDF.
         dry_run: If True, simulate the edit without writing output.
         reflow: If True and replacement is wider, reflow the paragraph.
+        password: Optional password to open an encrypted input. When supplied,
+            the in-memory document is decrypted, the edit applied, and the
+            output RE-ENCRYPTED with the same password (A2.3 / INV-W-5) so the
+            protection round-trips.
 
     Returns:
         EditResult with fidelity report.
 
     Raises:
-        PDFEditError: If the PDF is encrypted.
+        PDFEditError: If the PDF is password-protected and no/wrong password
+            is supplied.
         OperatorError: If operator references are stale or invalid.
     """
     if not dry_run:
         validate_output_path(output_path)
 
-    pdf = open_pdf(pdf_path)
+    pdf = open_pdf(pdf_path, password=password)
     try:
         # Per-call caches (ARY-283): every public entrypoint owns its caches
         # and threads them to helpers; no module-level shared state. The
@@ -1160,9 +2010,6 @@ def replace(
         # threading is required.
         resolver_cache = FontResolverCache()
         width_cache = GlyphWidthCache()
-
-        if pdf.is_encrypted:
-            raise PDFEditError("Cannot edit encrypted PDF")
 
         if match.page_number >= len(pdf.pages):
             raise OperatorError(
@@ -1180,7 +2027,7 @@ def replace(
         # unrelated text — silently splicing over them would corrupt
         # the output. The parsed ops are reused below for the simple-
         # replace path, so this validation is essentially free.
-        ops = list(pikepdf.parse_content_stream(page))
+        ops = _parse_content_stream(page, context="surgeon.replace")
         _assert_match_addressable(ops, match, resolver)
 
         # v0.1.3 Phase 6: track if reflow was attempted but threw, so we can
@@ -1201,7 +2048,12 @@ def replace(
                     width_cache,
                 )
                 # Only reflow if meaningfully wider (>1pt avoids trivial diffs).
-                needs_reflow = new_width > old_width + 1.0
+                # INV-G-11: a byte-stable (same-length, non-ligature) edit has no
+                # length change and MUST take the in-place splice path even when the
+                # same-count glyphs are wider — _is_shifting gates the width check so
+                # the byte-stable case routes to the clean splice (POS-GATE handles
+                # any trailing same-line shift), never a whole-paragraph re-wrap.
+                needs_reflow = _is_shifting(match, new_text) and new_width > old_width + 1.0
             except (KeyError, EncodingError, FontNotFoundError):
                 # Encoding failure (KeyError from resolver.encode when the
                 # replacement needs glyphs outside the embedded subset) or
@@ -1240,7 +2092,17 @@ def replace(
                             resolver_cache,
                         )
                         if result.success and not dry_run:
-                            _save_pdf(pdf, output_path)
+                            lin_log: list[str] = []
+                            enc_log: list[str] = []
+                            _save_pdf(
+                                pdf,
+                                output_path,
+                                linearization_log=lin_log,
+                                reencrypt_password=password,
+                                encryption_log=enc_log,
+                            )
+                            _surface_linearization_dropped(result, lin_log)
+                            _surface_encryption_dropped(result, enc_log)
                         _invalidate_locator_cache()
                         return result
                 except (ReflowError, OperatorError, EncodingError, KeyError, ValueError) as exc:
@@ -1286,9 +2148,19 @@ def replace(
             )
 
         if result.success and not dry_run:
-            new_stream = pikepdf.unparse_content_stream(ops)
+            new_stream = _unparse_content_stream(ops, context="surgeon.replace")
             page.Contents = pdf.make_stream(new_stream)
-            _save_pdf(pdf, output_path)
+            simple_lin_log: list[str] = []
+            simple_enc_log: list[str] = []
+            _save_pdf(
+                pdf,
+                output_path,
+                linearization_log=simple_lin_log,
+                reencrypt_password=password,
+                encryption_log=simple_enc_log,
+            )
+            _surface_linearization_dropped(result, simple_lin_log)
+            _surface_encryption_dropped(result, simple_enc_log)
 
         # Invalidate locator cache since PDF content changed
         _invalidate_locator_cache()
@@ -1319,8 +2191,12 @@ def _try_reflow_match(
             resolver,
             width_cache,
         )
-        if new_width <= old_width + 1.0:
-            return None  # not meaningfully wider
+        # INV-G-11: a byte-stable (same-length, non-ligature) edit must take the
+        # in-place splice path even when the same-count glyphs are wider — never a
+        # whole-paragraph re-wrap; the clean splice handles it (POS-GATE shifts any
+        # trailing same-line text).
+        if not _is_shifting(match, new_text) or new_width <= old_width + 1.0:
+            return None  # byte-stable, or not meaningfully wider
 
         from pdf_edit_engine.locator import _build_index
         from pdf_edit_engine.reflow import (
@@ -1354,6 +2230,7 @@ def replace_all(
     *,
     dry_run: bool = False,
     reflow: bool = True,
+    password: str | bytes | None = None,
 ) -> list[EditResult]:
     """Find and replace all occurrences of text in a PDF.
 
@@ -1364,26 +2241,31 @@ def replace_all(
         output_path: Path for the output PDF.
         dry_run: If True, simulate edits without writing output.
         reflow: If True and replacement is wider, attempt paragraph reflow.
+        password: Optional password to open an encrypted input. When supplied,
+            the in-memory document is decrypted, the edits applied, and the
+            output RE-ENCRYPTED with the same password (A2.3 / INV-W-5).
 
     Returns:
-        List of EditResult objects, one per match.
+        List of EditResult objects, one per match. When two or more matches
+        splice into the SAME show-text operator AND the replacement changes
+        length (or forces a ligature), those matches are refused
+        (``success=False`` + ``multi_match_same_operator_unsupported``) rather
+        than risk stale-offset corruption; same-length matches sharing one
+        operator are applied normally (INV-B-12).
     """
     if not dry_run:
         validate_output_path(output_path)
     from pdf_edit_engine.locator import find
 
-    matches = find(pdf_path, search)
+    matches = find(pdf_path, search, password=password)
     if not matches:
         return []
 
-    pdf = open_pdf(pdf_path)
+    pdf = open_pdf(pdf_path, password=password)
     try:
         # Per-call caches (ARY-283); pdf threaded for ARY-349 cache key.
         resolver_cache = FontResolverCache()
         width_cache = GlyphWidthCache()
-
-        if pdf.is_encrypted:
-            raise PDFEditError("Cannot edit encrypted PDF")
 
         results: list[EditResult] = []
 
@@ -1396,7 +2278,7 @@ def replace_all(
 
         for page_num in sorted(matches_by_page.keys()):
             page = pdf.pages[page_num]
-            ops = list(pikepdf.parse_content_stream(page))
+            ops = _parse_content_stream(page, context="surgeon.replace_all")
             resolver = _get_font_resolver(
                 page,
                 matches_by_page[page_num][0].characters[0].font_name,
@@ -1410,10 +2292,22 @@ def replace_all(
                 reverse=True,
             )
 
+            # INV-B-12: refuse colliding same-operator + byte-shifting matches
+            # BEFORE any mutation (pure decision → dry_run parity). A refused
+            # match is neither reflowed nor spliced; non-colliding matches and
+            # byte-stable same-length edits still process normally.
+            refused_ids, group_size = _colliding_shifting_matches(page_matches, replacement)
+
             page_results: list[EditResult] = []
             page_reflowed = False
             simple_success = False
             for m in page_matches:
+                if id(m) in refused_ids:
+                    page_results.append(
+                        _multi_match_refusal_result(m, replacement, group_size[id(m)])
+                    )
+                    continue
+
                 # Attempt reflow for the first qualifying match per page
                 if reflow and not dry_run and not page_reflowed:
                     reflow_result = _try_reflow_match(
@@ -1430,7 +2324,7 @@ def replace_all(
                         any_success = True
                         page_reflowed = True
                         # Re-parse ops since reflow wrote to page directly
-                        ops = list(pikepdf.parse_content_stream(page))
+                        ops = _parse_content_stream(page, context="surgeon.replace_all")
                         continue
 
                 try:
@@ -1460,7 +2354,7 @@ def replace_all(
 
             # Write modified content stream for this page
             if simple_success and not dry_run:
-                new_stream = pikepdf.unparse_content_stream(ops)
+                new_stream = _unparse_content_stream(ops, context="surgeon.replace_all")
                 page.Contents = pdf.make_stream(new_stream)
 
             # Reverse back to original order (we processed in reverse)
@@ -1468,7 +2362,17 @@ def replace_all(
             results.extend(page_results)
 
         if any_success and not dry_run:
-            _save_pdf(pdf, output_path)
+            lin_log: list[str] = []
+            enc_log: list[str] = []
+            _save_pdf(
+                pdf,
+                output_path,
+                linearization_log=lin_log,
+                reencrypt_password=password,
+                encryption_log=enc_log,
+            )
+            _surface_linearization_dropped(results, lin_log)
+            _surface_encryption_dropped(results, enc_log)
 
         _invalidate_locator_cache()
         return results
@@ -1483,6 +2387,7 @@ def batch_replace(
     *,
     dry_run: bool = False,
     reflow: bool = True,
+    password: str | bytes | None = None,
 ) -> list[EditResult]:
     """Apply multiple find-and-replace operations to a PDF in a single pass.
 
@@ -1492,22 +2397,28 @@ def batch_replace(
         output_path: Path for the output PDF.
         dry_run: If True, simulate edits without writing output.
         reflow: If True and replacement is wider, attempt paragraph reflow.
+        password: Optional password to open an encrypted input. When supplied,
+            the in-memory document is decrypted, the edits applied, and the
+            output RE-ENCRYPTED with the same password (A2.3 / INV-W-5).
 
     Returns:
-        List of EditResult objects, one per edit.
+        List of EditResult objects, one per edit. When a single edit's search
+        term matches two or more times within the SAME show-text operator, that
+        edit is refused (``success=False`` + ``multi_match_same_operator_unsupported``)
+        regardless of length — ``batch_replace``'s one-result-per-edit model
+        cannot apply same-operator siblings byte-stably the way ``replace_all``
+        can, so it refuses honestly rather than silently under-replace; use
+        ``replace_all`` for repeated same-operator matches (INV-B-12).
     """
     if not dry_run:
         validate_output_path(output_path)
     from pdf_edit_engine.locator import find
 
-    pdf = open_pdf(pdf_path)
+    pdf = open_pdf(pdf_path, password=password)
     try:
         # Per-call caches (ARY-283); pdf threaded for ARY-349 cache key.
         resolver_cache = FontResolverCache()
         width_cache = GlyphWidthCache()
-
-        if pdf.is_encrypted:
-            raise PDFEditError("Cannot edit encrypted PDF")
 
         results: list[EditResult] = []
         used_ops_by_page: dict[int, set[int]] = defaultdict(set)
@@ -1516,7 +2427,7 @@ def batch_replace(
         # Collect all (match, replacement) pairs with dedup
         all_pairs: list[tuple[TextMatch, str, int]] = []
         for edit_idx, edit in enumerate(edits):
-            matches = find(pdf_path, edit.find)
+            matches = find(pdf_path, edit.find, password=password)
             for m in matches:
                 all_pairs.append((m, edit.replace, edit_idx))
 
@@ -1529,7 +2440,7 @@ def batch_replace(
         edit_results: dict[int, list[EditResult]] = defaultdict(list)
         for page_num in sorted(pairs_by_page.keys()):
             page = pdf.pages[page_num]
-            ops = list(pikepdf.parse_content_stream(page))
+            ops = _parse_content_stream(page, context="surgeon.batch_replace")
 
             # Sort in reverse operator order
             page_pairs = sorted(
@@ -1538,21 +2449,48 @@ def batch_replace(
                 reverse=True,
             )
 
+            # INV-B-12: refuse the colliding same-operator + byte-shifting
+            # matches that belong to the SAME edit (one Edit whose search term
+            # matched N>1 times into one show-text operator — the replace_all
+            # corruption surface, here reached via a single batch edit). These
+            # are refused UP FRONT as a group (pure, pre-mutation → dry_run
+            # parity). A CROSS-edit overlap (two DIFFERENT edits touching one
+            # operator, e.g. "Test"->"X" and "Test Document"->"Y") keeps the
+            # existing reactive "first edit wins, rest skipped" partial-success
+            # behavior via the used_ops guard below; when such a skip is itself
+            # a same show-text operator + byte-shifting collision it surfaces the
+            # typed kind instead of the generic "overlapping" warning.
+            same_edit_refused, group_size = _same_edit_colliding(page_pairs)
+            spliced_ops_by_page: dict[int, set[int]] = defaultdict(set)
+
             page_changed = False
             page_reflowed = False
             for m, repl, edit_idx in page_pairs:
+                # INV-B-12: same-edit multi-match-into-one-operator group refusal.
+                if id(m) in same_edit_refused:
+                    edit_results[edit_idx].append(
+                        _multi_match_refusal_result(m, repl, group_size[id(m)])
+                    )
+                    continue
+
                 # Skip if operators overlap with already-processed match on same page
                 op_set = set(m.operator_refs)
                 if op_set & used_ops_by_page[page_num]:
-                    edit_results[edit_idx].append(
-                        EditResult(
-                            success=False,
-                            original_text=m.matched_text,
-                            new_text=repl,
-                            font_action="kept",
-                            warnings=["Skipped: overlapping with previous edit"],
+                    # INV-B-12: a same show-text operator + byte-shifting skip is
+                    # the multi-match collision — surface it as the typed kind.
+                    splice = _splice_ops(m)
+                    if splice & spliced_ops_by_page[page_num] and _is_shifting(m, repl):
+                        edit_results[edit_idx].append(_multi_match_refusal_result(m, repl, 2))
+                    else:
+                        edit_results[edit_idx].append(
+                            EditResult(
+                                success=False,
+                                original_text=m.matched_text,
+                                new_text=repl,
+                                font_action="kept",
+                                warnings=["Skipped: overlapping with previous edit"],
+                            )
                         )
-                    )
                     continue
 
                 # Attempt reflow for the first qualifying match per page
@@ -1565,7 +2503,7 @@ def batch_replace(
                         used_ops_by_page[page_num].update(m.operator_refs)
                         any_success = True
                         page_reflowed = True
-                        ops = list(pikepdf.parse_content_stream(page))
+                        ops = _parse_content_stream(page, context="surgeon.batch_replace")
                         continue
 
                 resolver = _get_font_resolver(page, m.characters[0].font_name, resolver_cache)
@@ -1592,23 +2530,43 @@ def batch_replace(
                 edit_results[edit_idx].append(result)
                 if result.success:
                     used_ops_by_page[page_num].update(m.operator_refs)
+                    # INV-B-12: record the show-text operators this match
+                    # actually spliced bytes into, so a later same-operator
+                    # byte-shifting skip is recognised as the typed collision.
+                    spliced_ops_by_page[page_num].update(_splice_ops(m))
                     any_success = True
                     page_changed = True
 
             if page_changed and not dry_run:
-                new_stream = pikepdf.unparse_content_stream(ops)
+                new_stream = _unparse_content_stream(ops, context="surgeon.batch_replace")
                 page.Contents = pdf.make_stream(new_stream)
 
+        lin_log: list[str] = []
+        enc_log: list[str] = []
         if any_success and not dry_run:
-            _save_pdf(pdf, output_path)
+            _save_pdf(
+                pdf,
+                output_path,
+                linearization_log=lin_log,
+                reencrypt_password=password,
+                encryption_log=enc_log,
+            )
 
         _invalidate_locator_cache()
 
-        # Flatten results: one per edit (aggregate per edit_idx)
+        # Flatten results: one per edit (aggregate per edit_idx).
         for edit_idx in range(len(edits)):
             if edit_idx in edit_results:
-                # Use the first result for this edit
-                results.append(edit_results[edit_idx][0])
+                # INV-B-12: surface a REFUSED/failed sub-result over a successful
+                # one so a partial edit is never reported as clean success. A
+                # single edit can produce a mix — e.g. a refused same-operator
+                # colliding group PLUS a disjoint match that succeeds — and the
+                # plain first-result flatten would HIDE the refusal whenever the
+                # disjoint match sorts first (higher operator index). Preferring
+                # the first non-success result keeps batch_replace's verdict
+                # honest; an all-success edit is unchanged (returns the first).
+                edit_res = edit_results[edit_idx]
+                results.append(next((r for r in edit_res if not r.success), edit_res[0]))
             else:
                 results.append(
                     EditResult(
@@ -1620,6 +2578,8 @@ def batch_replace(
                     )
                 )
 
+        _surface_linearization_dropped(results, lin_log)
+        _surface_encryption_dropped(results, enc_log)
         return results
     finally:
         pdf.close()

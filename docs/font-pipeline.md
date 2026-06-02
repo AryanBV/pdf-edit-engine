@@ -132,10 +132,21 @@ resolver together.
 
 ## Known limitations
 
-- **CFF / OpenType outlines are not supported.** `_inject_glyph_in_place`
-  at `fonts.py` raises `FontNotFoundError` when the embedded
-  font's `/FontFile3` carries Type1C charstrings rather than a `glyf`
-  table. Tracked in ARY-279 for v0.1.4.
+- **CFF / OpenType outlines are not supported.** Extension refuses
+  honestly via outline-table classification (INV-C-9, C.1). The pure
+  `_classify_outline_table` at `fonts.py` sniffs the table the embedded
+  binary ACTUALLY carries (`glyf` / `CFF ` / `CFF2`), not the
+  `/FontFile2` vs `/FontFile3` slot; `classify_embedded_outline` maps it
+  to the truthful `embedded_type` and is the single source both
+  `_extract_font_bytes` and `locator._detect_embedded_type` route
+  through. `_extend_tier2` gates on this BEFORE any glyph surgery: a
+  Type0/CID font whose embedded outline is not `glyf`-in-`/FontFile2`
+  raises `FontNotFoundError` (in `_FONT_EXTEND_FAIL_EXCS`), so every
+  write path surfaces an honest `font_extension_failed` Degradation
+  (`success=False`) instead of leaking a raw `KeyError('/FontFile2')`
+  from the old unconditional `fd["/FontFile2"]` read. The simple-font
+  path (`_extend_simple_tier_one_five`) already rejected `/FontFile3`.
+  CFF *injection* remains deferred to C.3 (tracked in ARY-279).
 - **Type 3 fonts (bitmap/procedural) are not supported** for extension.
 - **unitsPerEm mismatch** between the embedded and system font is
   treated as a hard failure (no rescaling).

@@ -6,6 +6,7 @@ import contextlib
 import logging
 from typing import TYPE_CHECKING
 
+from pdf_edit_engine.errors import OperatorError
 from pdf_edit_engine.models import GraphicsStateSnapshot
 
 if TYPE_CHECKING:
@@ -14,6 +15,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _IDENTITY: tuple[float, float, float, float, float, float] = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+# Legitimate PDFs nest q a handful deep; the cap bounds an adversarial
+# unbounded-q stream; raising OperatorError reuses the existing
+# malformed-content-stream contract -- root fix, not a patch. Mirrors the
+# MAX_COMPOSITE_DEPTH=64 precedent in fonts.py.
+MAX_GRAPHICS_STATE_DEPTH = 128
 
 
 def _mat_mult(
@@ -63,12 +70,33 @@ class GraphicsStateTracker:
         # was never read in production; removed in v0.1.2 cleanup.
         self._ctm: tuple[float, float, float, float, float, float] = _IDENTITY
         self._fill_color: tuple[float, ...] | None = None
+        # Block F CORE (v0.2.0): verbatim fill color-setting operator
+        # subsequence kept in lockstep with _fill_color. Each entry is
+        # (operands, operator_name); operands are the ORIGINAL pikepdf objects
+        # (pikepdf.Name for cs color-space names, numerics for sc/scn/g/rg/k)
+        # — NOT routed through _safe_floats/_f, so non-device color-space
+        # identity survives for verbatim replay in reflow.
+        self._fill_color_ops: list[tuple[list[object], str]] | None = None
         self._font_name: str | None = None
         self._font_size: float = 0.0
         self._char_spacing: float = 0.0  # Tc
         self._word_spacing: float = 0.0  # Tw
         self._horiz_scaling: float = 1.0  # Th (Tz/100)
         self._leading: float = 0.0  # TL
+        # E.3 (v0.2.0): declared-leading authority. ``_leading_active`` is the
+        # AUTHORITATIVE signal snapshotted for reflow: True iff the CURRENT text
+        # line was positioned by a freshly-declared leading — either an absolute
+        # ``Tm`` that committed a TL/TD declared since the previous line, or a
+        # leading-mechanism advance (``T*`` / ``'`` / ``"``). A stale ``TL``
+        # value left in the graphics state by an EARLIER paragraph (no fresh
+        # TL/TD before this line's ``Tm``) is NOT authoritative, so reflow keeps
+        # such paragraphs byte-identical. ``_pending_tl`` remembers that a
+        # TL/TD was declared but not yet committed by a ``Tm``/``T*``; the next
+        # absolute ``Tm`` commits it into ``_leading_active``. Both are saved/
+        # restored on the q/Q stack alongside ``_leading`` so an in-q ``TL``
+        # cannot leak its authority to text drawn after the matching ``Q``.
+        self._leading_active: bool = False
+        self._pending_tl: bool = False
         self._text_render_mode: int = 0  # Tr
 
         # Graphics state stack for q/Q
@@ -80,8 +108,11 @@ class GraphicsStateTracker:
 
         # Operator dispatch table. Stroke-state operators (G, RG, K,
         # SC, SCN) are intentionally absent — the engine does not
-        # consume stroke color anywhere. cs/CS color-space-name
-        # operators are also absent (no color-space resolution today).
+        # consume stroke color anywhere. The FILL color-space select
+        # ``cs`` IS handled (Block F CORE) to capture the verbatim fill
+        # color-setting subsequence; the STROKE color-space select ``CS``
+        # is an explicit no-op (stroke is out of scope, but registering it
+        # documents that it is consciously ignored for fill capture).
         self._handlers: dict[str, Callable[[list[object]], None]] = {
             "q": lambda ops: self.save(),
             "Q": lambda ops: self.restore(),
@@ -97,11 +128,13 @@ class GraphicsStateTracker:
             "Tz": self._handle_tz,
             "TL": self._handle_tl,
             "Tr": self._handle_tr,
+            "cs": self._handle_cs,
+            "CS": self._handle_cs_noop,
             "g": self._handle_g,
             "rg": self._handle_rg,
             "k": self._handle_k,
-            "sc": self._handle_sc,
-            "scn": self._handle_sc,
+            "sc": lambda ops: self._handle_sc(ops, "sc"),
+            "scn": lambda ops: self._handle_sc(ops, "scn"),
         }
 
     # ── Public API ──────────────────────────────────────────────────────
@@ -118,17 +151,31 @@ class GraphicsStateTracker:
             handler(operands)
 
     def save(self) -> None:
-        """Push current state onto the graphics state stack (q operator)."""
+        """Push current state onto the graphics state stack (q operator).
+
+        Raises:
+            OperatorError: If the stack is already at ``MAX_GRAPHICS_STATE_DEPTH``
+                (a malformed deeply-nested ``q`` stream). The cap is inclusive:
+                filling exactly to the cap succeeds, the next push raises.
+        """
+        if len(self._state_stack) >= MAX_GRAPHICS_STATE_DEPTH:
+            raise OperatorError(
+                f"graphics-state stack depth exceeds {MAX_GRAPHICS_STATE_DEPTH} "
+                f"(malformed deeply-nested q operator)"
+            )
         self._state_stack.append(
             {
                 "ctm": self._ctm,
                 "fill_color": self._fill_color,
+                "fill_color_ops": self._fill_color_ops,
                 "font_name": self._font_name,
                 "font_size": self._font_size,
                 "char_spacing": self._char_spacing,
                 "word_spacing": self._word_spacing,
                 "horiz_scaling": self._horiz_scaling,
                 "leading": self._leading,
+                "leading_active": self._leading_active,
+                "pending_tl": self._pending_tl,
                 "text_render_mode": self._text_render_mode,
             }
         )
@@ -141,12 +188,15 @@ class GraphicsStateTracker:
         state = self._state_stack.pop()
         self._ctm = state["ctm"]  # type: ignore[assignment]
         self._fill_color = state["fill_color"]  # type: ignore[assignment]
+        self._fill_color_ops = state["fill_color_ops"]  # type: ignore[assignment]
         self._font_name = state["font_name"]  # type: ignore[assignment]
         self._font_size = state["font_size"]  # type: ignore[assignment]
         self._char_spacing = state["char_spacing"]  # type: ignore[assignment]
         self._word_spacing = state["word_spacing"]  # type: ignore[assignment]
         self._horiz_scaling = state["horiz_scaling"]  # type: ignore[assignment]
         self._leading = state["leading"]  # type: ignore[assignment]
+        self._leading_active = state["leading_active"]  # type: ignore[assignment]
+        self._pending_tl = state["pending_tl"]  # type: ignore[assignment]
         self._text_render_mode = state["text_render_mode"]  # type: ignore[assignment]
 
     def get_text_position(self) -> tuple[float, float]:
@@ -200,12 +250,26 @@ class GraphicsStateTracker:
         Returns:
             A GraphicsStateSnapshot with all current state values.
         """
+        # Block F CORE: snapshot the verbatim fill color-setting subsequence
+        # as an immutable point-in-time record. A shallow copy of the outer
+        # list plus per-entry (list-copy, name) is enough — the inner operand
+        # objects are immutable pikepdf scalars / Names — so a later mutation
+        # of self._fill_color_ops does not alias this snapshot.
+        fill_color_ops: list[tuple[list[object], str]] | None
+        if self._fill_color_ops is None:
+            fill_color_ops = None
+        else:
+            fill_color_ops = [(list(operands), name) for operands, name in self._fill_color_ops]
+
         return GraphicsStateSnapshot(
             ctm=self._ctm,
             fill_color=self._fill_color,
             font_name=self._font_name,
             font_size=self._font_size if self._font_name is not None else None,
             text_matrix=self._text_matrix,
+            fill_color_ops=fill_color_ops,
+            leading=self._leading,
+            leading_authoritative=self._leading_active,
         )
 
     # ── Properties ──────────────────────────────────────────────────────
@@ -263,6 +327,12 @@ class GraphicsStateTracker:
         )
         self._text_matrix = m
         self._text_line_matrix = m
+        # E.3: an absolute Tm COMMITS the declared-leading authority. The new
+        # line is authoritative iff a fresh TL/TD was declared since the last
+        # line was committed (``_pending_tl``); a stale leading inherited from
+        # an earlier paragraph (no fresh TL before this Tm) is NOT authoritative.
+        self._leading_active = self._pending_tl
+        self._pending_tl = False
 
     def _handle_td(self, operands: list[object]) -> None:
         tx, ty = _f(operands[0]), _f(operands[1])
@@ -280,10 +350,20 @@ class GraphicsStateTracker:
 
     def _handle_td_upper(self, operands: list[object]) -> None:
         self._leading = -_f(operands[1])
+        # E.3: TD declares a leading (via -ty) AND moves to the next line by
+        # that leading in one operator, so the resulting line IS positioned by a
+        # freshly-declared leading — authoritative immediately (no separate Tm
+        # commit needed).
+        self._pending_tl = False
+        self._leading_active = True
         self._handle_td(operands)
 
     def _handle_tstar(self, operands: list[object]) -> None:
+        # E.3: T* advances to the next line BY the current leading, so the new
+        # line is positioned by the declared leading — authoritative.
         self._handle_td([0.0, -self._leading])
+        self._pending_tl = False
+        self._leading_active = True
 
     def _handle_tf(self, operands: list[object]) -> None:
         name = str(operands[0])
@@ -303,15 +383,37 @@ class GraphicsStateTracker:
 
     def _handle_tl(self, operands: list[object]) -> None:
         self._leading = _f(operands[0])
+        # E.3: an explicit TL DECLARES a leading but does not itself position a
+        # line. Arm it as pending; the next absolute Tm commits it into
+        # _leading_active (or a T* advance consumes it). This distinguishes a
+        # fresh TL issued for THIS paragraph from a stale TL value inherited
+        # from an earlier paragraph in the same content stream.
+        self._pending_tl = True
 
     def _handle_tr(self, operands: list[object]) -> None:
         self._text_render_mode = int(_f(operands[0]))
 
+    def _handle_cs(self, operands: list[object]) -> None:
+        # Block F CORE: ``cs`` selects the FILL color space and STARTS a fresh
+        # captured subsequence. It does not by itself change _fill_color (the
+        # following sc/scn supplies the components); we only begin recording
+        # the verbatim op list so a subsequent scn appends to the right cs.
+        self._fill_color_ops = [(list(operands), "cs")]
+
+    def _handle_cs_noop(self, operands: list[object]) -> None:
+        # ``CS`` selects the STROKE color space — out of scope for fill
+        # capture. Explicit no-op so the dispatch table documents that it is
+        # consciously ignored rather than accidentally omitted.
+        return
+
     def _handle_g(self, operands: list[object]) -> None:
         self._fill_color = (_f(operands[0]),)
+        # Device fill resets any prior cs: REPLACE the captured subsequence.
+        self._fill_color_ops = [(list(operands), "g")]
 
     def _handle_rg(self, operands: list[object]) -> None:
         self._fill_color = (_f(operands[0]), _f(operands[1]), _f(operands[2]))
+        self._fill_color_ops = [(list(operands), "rg")]
 
     def _handle_k(self, operands: list[object]) -> None:
         self._fill_color = (
@@ -320,11 +422,22 @@ class GraphicsStateTracker:
             _f(operands[2]),
             _f(operands[3]),
         )
+        self._fill_color_ops = [(list(operands), "k")]
 
-    def _handle_sc(self, operands: list[object]) -> None:
+    def _handle_sc(self, operands: list[object], op_name: str) -> None:
         values = self._safe_floats(operands)
         if values:
             self._fill_color = values
+        # Block F CORE: append the verbatim sc/scn op to the current
+        # subsequence (the cs that preceded it), preserving the exact operator
+        # name so a stream using ``sc`` replays ``sc`` and one using ``scn``
+        # replays ``scn``. If no cs was seen the op is implicitly in the
+        # current device space; start a one-entry list so the verbatim tint
+        # still replays.
+        if self._fill_color_ops is None:
+            self._fill_color_ops = [(list(operands), op_name)]
+        else:
+            self._fill_color_ops = [*self._fill_color_ops, (list(operands), op_name)]
 
     @staticmethod
     def _safe_floats(operands: list[object]) -> tuple[float, ...]:
