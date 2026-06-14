@@ -267,7 +267,7 @@ CI runs on Python 3.12 and 3.13. The test suite validates against PDFs from mult
 
 ## Audit suite
 
-Beyond ~631 conventional unit tests, the engine ships **315 invariant probes**
+Beyond ~801 conventional unit tests, the engine ships **414 invariant probes**
 across 108 files under `tests/invariants/`, covering layers from encoding,
 content stream, font, locator, surgeon, structural, and reflow through wrapper,
 annotations, the fidelity contract, public API, error hierarchy, security, and
