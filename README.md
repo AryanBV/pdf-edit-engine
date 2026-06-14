@@ -227,19 +227,19 @@ For structural editing, annotations, reflow, and all 15 PDF operations, see the 
 
 ## AI agent integration
 
-pdf-edit-engine powers [@aryanbv/pdf-edit-mcp](https://github.com/AryanBV/pdf-edit-mcp) — a TypeScript MCP server that exposes 38 tools for AI agents to edit PDFs through the [Model Context Protocol](https://modelcontextprotocol.io).
+pdf-edit-engine powers [pdf-edit-mcp](https://github.com/AryanBV/pdf-edit-mcp) — a Python MCP server (FastMCP) that exposes 38 tools for AI agents to edit PDFs through the [Model Context Protocol](https://modelcontextprotocol.io).
 
 ```
 AI Agent (Claude, GPT, etc.)
     ↓  MCP protocol (stdio)
-pdf-edit-mcp  (TypeScript, 38 tools)
-    ↓  JSON-RPC bridge
+pdf-edit-mcp  (Python / FastMCP, 38 tools)
+    ↓  in-process import
 pdf-edit-engine  ← you are here
 ```
 
 Several design choices in the engine exist specifically for programmatic consumers: `FidelityReport` lets agents verify edit quality without visual inspection, `dry_run=True` lets agents preview before committing, and the structured error hierarchy (`FontNotFoundError`, `EncodingError`, `OperatorError`, `ReflowError`) enables targeted recovery logic.
 
-Install the MCP server: `npx -y @aryanbv/pdf-edit-mcp`
+Install the MCP server: `pip install pdf-edit-mcp` (or run it with `uvx pdf-edit-mcp`).
 
 ## Performance
 
