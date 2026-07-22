@@ -1,10 +1,12 @@
 # pdf-edit-engine
 
+> 💼 Available for freelance MCP/AI integration work — DM [@aryansalian03](https://x.com/aryansalian03) or via [aryanbv.com](https://aryanbv.com)
+
 [![PyPI](https://img.shields.io/pypi/v/pdf-edit-engine)](https://pypi.org/project/pdf-edit-engine/)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://github.com/AryanBV/pdf-edit-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/AryanBV/pdf-edit-engine/actions/workflows/ci.yml)
-[![Audit suite](https://img.shields.io/badge/invariants-315%20probes-blueviolet)]()
+[![Audit suite](https://img.shields.io/badge/invariants-414%20probes-blueviolet)]()
 
 Format-preserving PDF text editing. Modify text in existing PDFs at the content stream level — fonts, layout, and spacing stay intact.
 
