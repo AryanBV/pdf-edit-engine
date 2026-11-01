@@ -195,7 +195,7 @@ class FontResolver:
                 # an explicit width when first_char + i == b for some i in
                 # range(len(widths)) AND widths[i] is non-zero (zero typically
                 # means the slot is reserved but unmapped).
-                widths_list = list(widths)  # type: ignore[call-overload]
+                widths_list = list(widths)
                 self._widths_keys = frozenset(
                     self._first_char + i for i, w in enumerate(widths_list) if float(w) != 0.0
                 )
@@ -506,7 +506,7 @@ class FontResolver:
         if "/Differences" in encoding_dict:
             diffs = encoding_dict["/Differences"]
             code = 0
-            for item in list(diffs):  # type: ignore[call-overload]
+            for item in list(diffs):
                 item_str = str(item)
                 if not item_str.startswith("/"):
                     code = int(item)

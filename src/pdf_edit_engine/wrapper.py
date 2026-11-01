@@ -422,7 +422,7 @@ def fill_form(pdf_path: str, field_values: dict[str, str], output_path: str) -> 
             raise PDFEditError(msg)
 
         def _fill_fields(fields: pikepdf.Object) -> None:
-            for field in list(fields):  # type: ignore[call-overload]
+            for field in list(fields):
                 name = str(field.get("/T", ""))
                 if name in field_values:
                     field["/V"] = pikepdf.String(field_values[name])

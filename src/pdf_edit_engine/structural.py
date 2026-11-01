@@ -583,7 +583,7 @@ def _is_annotation_orphaned(annot: pikepdf.Object, new_lower: str) -> bool:
     if not new_lower:
         return False
     a_dict = annot.get("/A")
-    uri = str(a_dict.get("/URI", "")) if a_dict else ""  # type: ignore[call-overload]
+    uri = str(a_dict.get("/URI", "")) if a_dict else ""
     if not uri:
         return False
     path = uri.rstrip("/").rsplit("/", 1)[-1]
@@ -613,13 +613,13 @@ def _remove_orphaned_annotations(
     annots_obj = page_obj.get("/Annots")
     if not annots_obj:
         return
-    annots: list[pikepdf.Object] = list(annots_obj)  # type: ignore[call-overload]
+    annots: list[pikepdf.Object] = list(annots_obj)
     new_lower = new_text.lower()
     kept: list[pikepdf.Object] = []
     removed = False
     for annot in annots:
         try:
-            rect = [float(r) for r in annot["/Rect"]]  # type: ignore[attr-defined]
+            rect = [float(r) for r in annot["/Rect"]]
         except (KeyError, TypeError):
             kept.append(annot)
             continue
@@ -661,7 +661,7 @@ def _sync_annotations_in_bbox(
     annots_obj = page_obj.get("/Annots")
     if not annots_obj:
         return
-    for annot in list(annots_obj):  # type: ignore[call-overload]
+    for annot in list(annots_obj):
         try:
             rect = [float(r) for r in annot["/Rect"]]
         except (KeyError, TypeError):
@@ -846,7 +846,7 @@ def _shift_content_below_inplace(
     annots_key = pikepdf.Name("/Annots")
     if annots_key in page_obj:
         try:
-            annots: list[Any] = list(page_obj[annots_key])  # type: ignore[call-overload]
+            annots: list[Any] = list(page_obj[annots_key])
             for annot_ref in annots:
                 annot = annot_ref.resolve() if hasattr(annot_ref, "resolve") else annot_ref
                 rect_key = pikepdf.Name("/Rect")
@@ -2478,7 +2478,7 @@ def delete_block(
         annots_key = pikepdf.Name("/Annots")
         if annots_key in page_obj:
             try:
-                annots: list[Any] = list(page_obj[annots_key])  # type: ignore[call-overload]
+                annots: list[Any] = list(page_obj[annots_key])
                 kept: list[Any] = []
                 for annot_ref in annots:
                     annot = annot_ref.resolve() if hasattr(annot_ref, "resolve") else annot_ref
