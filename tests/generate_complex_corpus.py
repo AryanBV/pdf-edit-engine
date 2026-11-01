@@ -549,7 +549,11 @@ def make_cidfont_pdf(path: Path) -> bool:
             "/ItalicAngle": 0,
             "/Ascent": ascent_1000,
             "/Descent": descent_1000,
-            "/CapHeight": round(font["OS/2"].sCapHeight * 1000 / units_per_em),
+            "/CapHeight": round(
+                getattr(font["OS/2"], "sCapHeight", font["OS/2"].sTypoAscender)
+                * 1000
+                / units_per_em
+            ),
             "/StemV": 80,
             "/FontFile2": font_stream,
         }

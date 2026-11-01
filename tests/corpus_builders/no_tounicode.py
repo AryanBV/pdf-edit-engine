@@ -143,7 +143,9 @@ def _build_consistent_subset(ttf_path: Path, *, pua: bool) -> _ConsistentSubset:
         bbox_1000 = [round(v * 1000 / units_per_em) for v in bbox]
         ascent_1000 = round(full["OS/2"].sTypoAscender * 1000 / units_per_em)
         descent_1000 = round(full["OS/2"].sTypoDescender * 1000 / units_per_em)
-        cap_height_1000 = round(full["OS/2"].sCapHeight * 1000 / units_per_em)
+        cap_height_1000 = round(
+            getattr(full["OS/2"], "sCapHeight", full["OS/2"].sTypoAscender) * 1000 / units_per_em
+        )
     finally:
         full.close()
 

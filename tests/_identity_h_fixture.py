@@ -234,7 +234,11 @@ def _build_identity_h_pdf(
             "/ItalicAngle": 0,
             "/Ascent": round(full["OS/2"].sTypoAscender * 1000 / units_per_em),
             "/Descent": round(full["OS/2"].sTypoDescender * 1000 / units_per_em),
-            "/CapHeight": round(full["OS/2"].sCapHeight * 1000 / units_per_em),
+            "/CapHeight": round(
+                getattr(full["OS/2"], "sCapHeight", full["OS/2"].sTypoAscender)
+                * 1000
+                / units_per_em
+            ),
             "/StemV": 80,
             "/FontFile2": font_stream,
         }
