@@ -497,7 +497,7 @@ def _get_font_objects(
 
     if subtype == "/Type0":
         desc_fonts = font_obj.get("/DescendantFonts")
-        if desc_fonts is None or len(list(desc_fonts)) == 0:  # type: ignore[call-overload]
+        if desc_fonts is None or len(list(desc_fonts)) == 0:
             msg = f"Type0 font {font_name} has no DescendantFonts"
             raise FontNotFoundError(msg)
         cid_font = desc_fonts[0]
@@ -944,7 +944,7 @@ def _append_w_entries(
 
     existing: list[object] = []
     if "/W" in cid_font:
-        existing = list(cid_font["/W"])  # type: ignore[call-overload]
+        existing = list(cid_font["/W"])
 
     for cid, width in sorted(deduped.items()):
         existing.append(cid)
@@ -2292,7 +2292,7 @@ def _extend_simple_tier_one_five(
         diffs_obj = enc_pre.get("/Differences")
         if diffs_obj is not None:
             cur = 0
-            for item in list(diffs_obj):  # type: ignore[call-overload]
+            for item in list(diffs_obj):
                 s = str(item)
                 if not s.startswith("/"):
                     cur = int(item)
@@ -2302,7 +2302,7 @@ def _extend_simple_tier_one_five(
 
     raw_widths: list[object] = []
     if "/Widths" in font_dict:
-        raw_widths = list(font_dict["/Widths"])  # type: ignore[call-overload]
+        raw_widths = list(font_dict["/Widths"])
     widths_pre: list[float] = [float(w) for w in raw_widths]  # type: ignore[arg-type]
 
     # Per-char categorization with dedup. Prior code passed
@@ -2456,7 +2456,7 @@ def _used_bytes_in_encoding(font_dict: pikepdf.Object) -> set[int]:
     enc = font_dict.get("/Encoding")
     if isinstance(enc, pikepdf.Dictionary) and "/Differences" in enc:
         cur = 0
-        for item in list(enc["/Differences"]):  # type: ignore[call-overload]
+        for item in list(enc["/Differences"]):
             s = str(item)
             if not s.startswith("/"):
                 cur = int(item)
@@ -2531,7 +2531,7 @@ def _extend_simple_encoding(
         )
         enc = font_dict["/Encoding"]
 
-    diffs: list[object] = list(enc.get("/Differences") or [])  # type: ignore[arg-type]
+    diffs: list[object] = list(enc.get("/Differences") or [])
     # PDF /Differences format: [byte_start /name1 /name2 ... byte_start2 /name3 ...]
     # Consecutive bytes can share a single byte_start prefix. We emit
     # one prefix per assignment for simplicity (no correctness risk;
@@ -2585,7 +2585,7 @@ def _extend_simple_widths(
 
     raw_widths: list[object] = []
     if "/Widths" in font_dict:
-        raw_widths = list(font_dict["/Widths"])  # type: ignore[call-overload]
+        raw_widths = list(font_dict["/Widths"])
     widths: list[float] = [float(w) for w in raw_widths]  # type: ignore[arg-type]
 
     # Sort assignments by byte to handle the 127-skip case (allocation
@@ -2666,7 +2666,7 @@ def _build_simple_effective_byte_to_unicode(font_dict: pikepdf.Object) -> dict[i
         diffs_obj = enc.get("/Differences")
         if diffs_obj is not None:
             cur = 0
-            for item in list(diffs_obj):  # type: ignore[call-overload]
+            for item in list(diffs_obj):
                 s = str(item)
                 if not s.startswith("/"):
                     cur = int(item)
@@ -2719,7 +2719,7 @@ def _heal_simple_widths(
 
     raw_widths: list[object] = []
     if "/Widths" in font_dict:
-        raw_widths = list(font_dict["/Widths"])  # type: ignore[call-overload]
+        raw_widths = list(font_dict["/Widths"])
     widths: list[float] = [float(w) for w in raw_widths]  # type: ignore[arg-type]
 
     for byte_slot, _glyph_name, width in healed:

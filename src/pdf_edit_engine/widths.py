@@ -32,7 +32,7 @@ def parse_cid_widths(cid_font: pikepdf.Dictionary) -> dict[int, float]:
     if "/W" not in cid_font:
         return widths
     w_array: pikepdf.Array = cid_font["/W"]  # type: ignore[assignment]
-    w_items: list[pikepdf.Object] = list(w_array)  # type: ignore[call-overload]
+    w_items: list[pikepdf.Object] = list(w_array)
     i = 0
     while i < len(w_items):
         cid_start = int(w_items[i])

@@ -137,13 +137,13 @@ def delete_annotation(
         if "/Annots" not in page_obj:
             _save_pdf(pdf, out)
             return
-        annots_list: list[Any] = list(page_obj["/Annots"])  # type: ignore[call-overload]
+        annots_list: list[Any] = list(page_obj["/Annots"])
         if 0 <= annot.index < len(annots_list):
             annots_list.pop(annot.index)
         if annots_list:
             page_obj["/Annots"] = pdf.make_indirect(pikepdf.Array(annots_list))
         else:
-            del page_obj["/Annots"]  # type: ignore[operator]
+            del page_obj["/Annots"]
         _save_pdf(pdf, out)
 
 
