@@ -29,11 +29,16 @@ divergence.
 * :func:`build_encrypted_pdf_distinct` — distinct owner!=user passwords, for
   the documented owner-collapse boundary probe.
 * :func:`build_unencrypted_pdf` — the unencrypted control.
+* :func:`build_encrypted_pdf_with` — any scheme pikepdf can write.
+* :func:`build_rc4_pdf_pikepdf_cannot_write` — RC4 R 2 / 3 key lengths and
+  ``/P`` values pikepdf's writer cannot produce.
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
+import struct
 from typing import TYPE_CHECKING
 
 import pikepdf
@@ -173,3 +178,127 @@ def build_unencrypted_pdf(out_path: Path | None = None) -> bytes:
     buf = io.BytesIO()
     pdf.save(buf, static_id=True)
     return emit_or_write(buf.getvalue(), out_path)
+
+
+def build_encrypted_pdf_with(
+    encryption: pikepdf.Encryption, *, linearize: bool = False, out_path: Path | None = None
+) -> bytes:
+    """Build the fixture encrypted with exactly ``encryption``.
+
+    Covers the schemes :func:`build_encrypted_pdf` does not (RC4 R 2 / 3 / 4,
+    AES-128 R 4, ``/EncryptMetadata false``, an empty user password beside an
+    owner password, restricted permissions) for the re-encryption mirror
+    probes.
+
+    Args:
+        encryption: The encryption to save with.
+        linearize: Save linearized ("Fast Web View") as well.
+        out_path: Optional destination; when given the bytes are written
+            there before being returned.
+
+    Returns:
+        The encrypted PDF bytes. Never ``None``.
+    """
+    pdf = _build_base_pdf()
+    buf = io.BytesIO()
+    pdf.save(buf, static_id=True, encryption=encryption, linearize=linearize)
+    return emit_or_write(buf.getvalue(), out_path)
+
+
+# ISO 32000-1 7.6.3.3 Algorithm 2 step (a) password padding string.
+_RC4_PAD = bytes.fromhex("28BF4E5E4E758A4164004E56FFFA01082E2E00B6D0683E802F0CA9FE6453697A")
+
+
+def _rc4(key: bytes, data: bytes) -> bytes:
+    state = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + state[i] + key[i % len(key)]) & 0xFF
+        state[i], state[j] = state[j], state[i]
+    out = bytearray()
+    i = j = 0
+    for byte in data:
+        i = (i + 1) & 0xFF
+        j = (j + state[i]) & 0xFF
+        state[i], state[j] = state[j], state[i]
+        out.append(byte ^ state[(state[i] + state[j]) & 0xFF])
+    return bytes(out)
+
+
+def _rc4_owner_and_user_entries(
+    owner: bytes, user: bytes, revision: int, key_bytes: int, permissions: int, id0: bytes
+) -> tuple[bytes, bytes]:
+    padded_user = (user + _RC4_PAD)[:32]
+    digest = hashlib.md5((owner + _RC4_PAD)[:32]).digest()
+    if revision >= 3:
+        for _ in range(50):
+            digest = hashlib.md5(digest[:key_bytes]).digest()
+    o_entry = _rc4(digest[:key_bytes], padded_user)
+    if revision >= 3:
+        for i in range(1, 20):
+            o_entry = _rc4(bytes(b ^ i for b in digest[:key_bytes]), o_entry)
+    digest = hashlib.md5(padded_user + o_entry + struct.pack("<i", permissions) + id0).digest()
+    if revision >= 3:
+        for _ in range(50):
+            digest = hashlib.md5(digest[:key_bytes]).digest()
+    file_key = digest[:key_bytes]
+    if revision == 2:
+        return o_entry, _rc4(file_key, _RC4_PAD)
+    u_entry = _rc4(file_key, hashlib.md5(_RC4_PAD + id0).digest())
+    for i in range(1, 20):
+        u_entry = _rc4(bytes(b ^ i for b in file_key), u_entry)
+    return o_entry, u_entry + bytes(16)
+
+
+def build_rc4_pdf_pikepdf_cannot_write(
+    *, revision: int, key_bits: int, permissions: int, owner: str, user: str
+) -> bytes:
+    """Build the fixture under an RC4 R 2 / 3 scheme pikepdf's writer cannot produce.
+
+    pikepdf writes R 3 only with a 128-bit key and sets the ``/P`` bits a
+    reader ignores at R 2, so a 40- or 64-bit R 3 key, or an R 2 ``/P`` with
+    bits 9-12 clear, needs the Standard security handler written by hand (ISO
+    32000-1 7.6.3, Algorithms 2, 3, 4 and 5). Only an empty document is
+    written by hand; qpdf then encrypts the copied pages under that key with
+    ``encryption=True``.
+
+    Args:
+        revision: 2 or 3.
+        key_bits: The key length in bits (40 for R 2).
+        permissions: The signed ``/P`` value.
+        owner: The owner password (ASCII).
+        user: The user password (ASCII).
+
+    Returns:
+        The encrypted PDF bytes. Never ``None``.
+    """
+    id0 = hashlib.md5(b"build_rc4_pdf_pikepdf_cannot_write").digest()
+    o_entry, u_entry = _rc4_owner_and_user_entries(
+        owner.encode("ascii"), user.encode("ascii"), revision, key_bits // 8, permissions, id0
+    )
+    version = 1 if revision == 2 else 2
+    objects = [
+        b"<</Type /Catalog /Pages 2 0 R>>",
+        b"<</Type /Pages /Kids [] /Count 0>>",
+        f"<</Filter /Standard /V {version} /R {revision} /Length {key_bits} /P {permissions} "
+        f"/O <{o_entry.hex()}> /U <{u_entry.hex()}>>>".encode(),
+    ]
+    shell = io.BytesIO()
+    shell.write(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(shell.tell())
+        shell.write(f"{number} 0 obj\n".encode() + body + b"\nendobj\n")
+    xref_at = shell.tell()
+    shell.write(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode())
+    for offset in offsets:
+        shell.write(f"{offset:010d} 00000 n \n".encode())
+    shell.write(
+        f"trailer\n<</Size {len(objects) + 1} /Root 1 0 R /Encrypt 3 0 R "
+        f"/ID [<{id0.hex()}> <{id0.hex()}>]>>\nstartxref\n{xref_at}\n%%EOF\n".encode()
+    )
+    with pikepdf.open(io.BytesIO(shell.getvalue()), password=user) as pdf:
+        pdf.pages.extend(_build_base_pdf().pages)
+        buf = io.BytesIO()
+        pdf.save(buf, encryption=True)
+    return buf.getvalue()

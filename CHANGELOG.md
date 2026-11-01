@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Edits of RC4-encrypted PDFs land, and an edited encrypted PDF opens
+  with the passwords that opened it.** Every edit of an RC4 revision 2 or 3
+  input (for example an owner password with an empty user password) failed
+  with `ValueError: Cannot encrypt metadata when R < 4`, because the output
+  was re-encrypted with pikepdf's AES and encrypt-metadata defaults. The
+  output is now saved with the input's own encryption (pikepdf
+  `encryption=True`: the same key, `/O`, `/U`, `/P`, key length and
+  `/EncryptMetadata`). An owner password and a user password both keep
+  working, each with its own rights, whichever one the edit used, where
+  both used to collapse to the caller's password; an owner-only file still
+  opens with no password; and a non-ASCII password still opens the output.
+  The one scheme change is qpdf's: an R 4 file whose crypt filters use RC4
+  is written with AES-128 under the same key.
+
 ## [0.2.0] — 2026-06-02
 
 Editing-depth release. v0.2.0 widens the set of PDFs the engine can edit
